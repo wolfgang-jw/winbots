@@ -1,3 +1,4 @@
 .bun/
 .vscode/
 node_modules/
+.env
