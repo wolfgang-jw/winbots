@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bots AI 对话</title>
+    <!-- jQuery -->
+    <script src="js/jquery-3.7.1.min.js"></script>
+    <!-- 复用系统样式 -->
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <!-- ==================== 顶部标题栏 ==================== -->
+    <header class="header">
+        <div class="container">
+            <div class="header__inner">
+                <div class="header__logo">
+                    <span class="header__emoji">🤖</span>
+                    <h1 class="header__title">Bots AI 对话</h1>
+                </div>
+                <p class="header__subtitle">
+                    西红柿炒鸡蛋配色 · 流式对话
+                    <span style="margin-left:12px;opacity:0.7;">
+                        <a href="status.html" style="color:inherit;text-decoration:underline;">系统状态</a>
+                    </span>
+                </p>
+            </div>
+        </div>
+    </header>
+
+    <!-- ==================== 聊天主区域 ==================== -->
+    <div class="chat-layout">
+        <!-- 消息列表 -->
+        <div class="chat-messages" id="chat-messages">
+            <!-- 空状态 -->
+            <div class="chat-empty" id="chat-empty">
+                <div class="chat-empty__icon">🍳</div>
+                <div class="chat-empty__title">开始对话</div>
+                <div class="chat-empty__desc">
+                    在下方输入你的问题，AI 助手会实时流式回复。<br>
+                    支持代码块、Markdown 格式。
+                </div>
+            </div>
+        </div>
+
+        <!-- 快捷提示词 -->
+        <div class="chat-suggestions" id="chat-suggestions" style="display:none;">
+            <button class="chat-suggestion-btn" data-prompt="用 Python 写一个快速排序">快速排序</button>
+            <button class="chat-suggestion-btn" data-prompt="解释什么是 RESTful API">RESTful API</button>
+            <button class="chat-suggestion-btn" data-prompt="给我一个 CSS Flexbox 布局示例">Flexbox 示例</button>
+            <button class="chat-suggestion-btn" data-prompt="什么是异步编程？">异步编程</button>
+        </div>
+
+        <!-- 状态提示 -->
+        <div class="chat-status" id="chat-status"></div>
+
+        <!-- 使用统计 -->
+        <div class="chat-usage" id="chat-usage"></div>
+
+        <!-- 输入区域 -->
+        <div class="chat-input-area">
+            <div class="chat-input-wrapper">
+                <textarea class="chat-input" id="chat-input" rows="1"
+                    placeholder="输入你的问题，按 Enter 发送，Shift+Enter 换行..."
+                    disabled></textarea>
+                <button class="chat-send-btn" id="chat-send-btn" disabled>
+                    发送
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== 底部页脚 ==================== -->
+    <footer class="footer">
+        <div class="container">
+            <p class="footer__text">
+                Bots AI Chat &copy; 2024 &middot;
+                Powered by Bun + Hono + AI SDK
+            </p>
+        </div>
+    </footer>
+
+    <!-- 聊天页面 JS -->
+    <script src="js/chat.js"></script>
+</body>
+
+</html>

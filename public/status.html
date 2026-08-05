@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bots 系统状态监控</title>
+    <!-- jQuery CDN -->
+    <script src="js/jquery-3.7.1.min.js"></script>
+    <!-- 自定义样式 -->
+    <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body>
+    <!-- ==================== 顶部标题栏 ==================== -->
+    <header class="header">
+        <div class="container">
+            <div class="header__inner">
+                <div class="header__logo">
+                    <span class="header__emoji">🍳</span>
+                    <h1 class="header__title">Bots 系统状态监控</h1>
+                </div>
+                <p class="header__subtitle">西红柿炒鸡蛋配色 · 实时健康检查</p>
+            </div>
+        </div>
+    </header>
+
+    <!-- ==================== 主内容区域 ==================== -->
+    <main class="container">
+        <!-- 系统概览卡片 -->
+        <section class="overview" id="overview">
+            <div class="overview__card" id="overview-status">
+                <div class="overview__label">系统状态</div>
+                <div class="overview__value" id="system-status">检测中...</div>
+            </div>
+            <div class="overview__card">
+                <div class="overview__label">运行时间</div>
+                <div class="overview__value" id="uptime">-</div>
+            </div>
+            <div class="overview__card">
+                <div class="overview__label">总延迟</div>
+                <div class="overview__value" id="total-latency">-</div>
+            </div>
+            <div class="overview__card">
+                <div class="overview__label">最后更新</div>
+                <div class="overview__value" id="update-time">-</div>
+            </div>
+        </section>
+
+        <!-- 服务状态卡片 -->
+        <section class="services" id="services">
+            <!-- LLM 卡片（唯一保留的服务） -->
+            <div class="service-card service-card--full" data-service="llm">
+                <div class="service-card__header">
+                    <span class="service-card__icon">🤖</span>
+                    <h2 class="service-card__name">LLM</h2>
+                    <span class="service-card__badge" id="llm-badge">检测中</span>
+                </div>
+                <div class="service-card__body">
+                    <div class="service-card__row">
+                        <span class="service-card__label">延迟</span>
+                        <span class="service-card__value" id="llm-latency">-</span>
+                    </div>
+                    <div class="service-card__row">
+                        <span class="service-card__label">模型</span>
+                        <span class="service-card__value" id="llm-model">-</span>
+                    </div>
+                    <div class="service-card__row">
+                        <span class="service-card__label">API</span>
+                        <span class="service-card__value" id="llm-api-base">-</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 底部刷新信息 -->
+        <div class="refresh-bar">
+            <span class="refresh-bar__text" id="refresh-text">⏱️ 自动刷新中...</span>
+            <button class="refresh-bar__btn" id="refresh-btn">🔄 手动刷新</button>
+        </div>
+    </main>
+
+    <!-- ==================== 底部页脚 ==================== -->
+    <footer class="footer">
+        <div class="container">
+            <p class="footer__text">
+                Bots System Monitor &copy; 2024 &middot;
+                Powered by Bun + Hono
+            </p>
+        </div>
+    </footer>
+
+    <!-- 自定义 JS -->
+    <script src="js/app.js"></script>
+</body>
+
+</html>
