@@ -19,6 +19,10 @@ export interface EnvConfig {
   LLM_API_BASE: string;
   LLM_API_KEY: string;
   LLM_MODEL: string;
+  // 思考模式配置（可选）
+  LLM_THINKING: boolean;
+  LLM_REASONING_EFFORT: string;
+
 }
 
 /** 必需的环境变量列表 */
@@ -82,6 +86,8 @@ function validateEnv(): EnvConfig {
     LLM_API_BASE: Bun.env.LLM_API_BASE!,
     LLM_API_KEY: Bun.env.LLM_API_KEY!,
     LLM_MODEL: Bun.env.LLM_MODEL!,
+    LLM_THINKING: Bun.env.LLM_THINKING === "true",
+    LLM_REASONING_EFFORT: Bun.env.LLM_REASONING_EFFORT || "high",
   };
 }
 
@@ -95,8 +101,10 @@ export const env = validateEnv();
 console.log("=".repeat(60));
 console.log("✅ 环境变量校验通过");
 console.log("-".repeat(60));
-console.log(`  APP_PORT:        ${env.APP_PORT}`);
-console.log(`  LLM_API_BASE:    ${env.LLM_API_BASE}`);
-console.log(`  LLM_MODEL:       ${env.LLM_MODEL}`);
-console.log(`  LLM_API_KEY:     ${env.LLM_API_KEY ? "******" : "未设置"}`);
+console.log(`  APP_PORT:              ${env.APP_PORT}`);
+console.log(`  LLM_API_BASE:          ${env.LLM_API_BASE}`);
+console.log(`  LLM_MODEL:             ${env.LLM_MODEL}`);
+console.log(`  LLM_API_KEY:           ${env.LLM_API_KEY ? "******" : "未设置"}`);
+console.log(`  LLM_THINKING:          ${env.LLM_THINKING ? "开启" : "关闭"}`);
+console.log(`  LLM_REASONING_EFFORT:  ${env.LLM_REASONING_EFFORT}`);
 console.log("=".repeat(60));

@@ -18,6 +18,7 @@
  * }
  *
  * 响应 (SSE):
+ * data: {"type":"think","content":"思考过程..."} 
  * data: {"type":"text","content":"你"}
  * data: {"type":"text","content":"好"}
  * data: {"type":"text","content":"！"}
@@ -83,7 +84,16 @@ router.post("/stream", async (c) => {
                     content: m.content,
                 })),
                 stream: true,
+                // DeepSeek 思考模式控制（官方文档）：
+                // - 开启: thinking.type = "enabled"（默认即开启）
+                // - 关闭: thinking.type = "disabled"
+                // - 强度: reasoning_effort = "low"/"high"/"max"
+                reasoning_effort: env.LLM_REASONING_EFFORT,
+                ...(env.LLM_THINKING
+                    ? { thinking: { type: "enabled" } }
+                    : { thinking: { type: "disabled" } }),
             }),
+
         });
 
         // 检查 API 响应状态
@@ -153,6 +163,17 @@ router.post("/stream", async (c) => {
                                         // 提取文本内容（Delta 模式）
                                         const delta =
                                             parsed.choices?.[0]?.delta?.content || "";
+                                        const thinking =
+                                            parsed.choices?.[0]?.delta?.reasoning_content || "";
+                                        if (thinking) {
+                                            const thinkPayload = JSON.stringify({
+                                                type: "think",
+                                                content: thinking,
+                                            });
+                                            controller.enqueue(
+                                                encoder.encode(`data: ${thinkPayload}\n\n`)
+                                            );
+                                        }
                                         if (delta) {
                                             completionTokens++;
                                             const payload = JSON.stringify({

@@ -47,6 +47,10 @@
         currentAssistantContent: "",
         /** @type {HTMLElement|null} 当前助手的消息气泡元素 */
         currentBubbleEl: null,
+        /** @type {HTMLElement|null} 当前思考块元素（无思考内容时为 null） */
+        currentThinkEl: null,
+        /** @type {string} 当前正在累积的思考内容 */
+        currentThinkContent: "",
     };
 
     // ============================================
@@ -210,6 +214,73 @@
     }
 
     /**
+     * 更新当前思考块的内容（无思考块时自动创建）
+     * @param {string} text - 追加的思考文本片段
+     */
+    function updateThinkContent(text) {
+        if (!state.currentBubbleEl) return;
+
+        // 累积思考内容
+        state.currentThinkContent += text;
+
+        // 首次收到思考内容时，创建思考块（插入到气泡最前面）
+        if (!state.currentThinkEl) {
+            const thinkEl = document.createElement("div");
+            thinkEl.className = "message__think";
+
+            // 思考块标题（可点击折叠）
+            const header = document.createElement("div");
+            header.className = "message__think-header";
+            header.innerHTML = '<span class="message__think-icon">💭</span> 思考过程'
+                + '<span class="message__think-arrow">▾</span>';
+            header.addEventListener("click", () => {
+                const body = thinkEl.querySelector(".message__think-body");
+                const arrow = thinkEl.querySelector(".message__think-arrow");
+                if (body.style.display === "none") {
+                    body.style.display = "block";
+                    arrow.textContent = "▾";
+                } else {
+                    body.style.display = "none";
+                    arrow.textContent = "▸";
+                }
+            });
+            thinkEl.appendChild(header);
+
+            // 思考内容主体
+            const body = document.createElement("div");
+            body.className = "message__think-body";
+            thinkEl.appendChild(body);
+
+            // 插入到气泡的最前面（在正文内容之前）
+            state.currentBubbleEl.insertBefore(thinkEl, state.currentBubbleEl.firstChild);
+            state.currentThinkEl = thinkEl;
+        }
+
+        // 更新思考内容（纯文本，避免 Markdown 干扰）
+        const body = state.currentThinkEl.querySelector(".message__think-body");
+        if (body) {
+            body.textContent = state.currentThinkContent;
+        }
+
+        scrollToBottom();
+    }
+
+    /**
+     * 完成思考块（收起思考块，保持可展开）
+     */
+    function finishThink() {
+        // 保留思考块（默认收起，用户可点击展开查看）
+        if (state.currentThinkEl) {
+            const body = state.currentThinkEl.querySelector(".message__think-body");
+            const arrow = state.currentThinkEl.querySelector(".message__think-arrow");
+            if (body) body.style.display = "none";
+            if (arrow) arrow.textContent = "▸";
+        }
+        state.currentThinkEl = null;
+        state.currentThinkContent = "";
+    }
+
+    /**
      * 完成流式响应（移除光标）
      */
     function finishStream() {
@@ -221,6 +292,8 @@
         }
         state.currentBubbleEl = null;
         state.currentAssistantContent = "";
+
+        finishThink();
     }
 
     /**
@@ -285,6 +358,10 @@
             state.currentAssistantContent = "";
             state.currentBubbleEl = addMessage("assistant", "");
 
+            // 重置思考状态
+            state.currentThinkEl = null;
+            state.currentThinkContent = "";
+
             // 发起流式请求
             const response = await fetch(CONFIG.API_ENDPOINT, {
                 method: "POST",
@@ -330,6 +407,10 @@
                         const data = JSON.parse(trimmed.slice(6));
 
                         switch (data.type) {
+                            case "think":
+                                // 思考内容（自适应显示，无则不渲染）
+                                updateThinkContent(data.content);
+                                break;
                             case "text":
                                 updateStreamContent(data.content);
                                 fullContent += data.content; // 同步累积到 fullContent
@@ -381,6 +462,8 @@
                 state.currentBubbleEl.remove();
                 state.currentBubbleEl = null;
                 state.currentAssistantContent = "";
+                state.currentThinkEl = null;
+                state.currentThinkContent = "";
             }
 
             // 显示错误消息

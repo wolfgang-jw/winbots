@@ -499,6 +499,55 @@ body {
     border-bottom-left-radius: 4px;
 }
 
+/* ---------- 思考块（Thinking Mode） ---------- */
+.message__think {
+    background: var(--gray-100);
+    border: 1px solid var(--gray-200);
+    border-left: 3px solid var(--egg-yellow-dark);
+    border-radius: 8px;
+    margin-bottom: 10px;
+    overflow: hidden;
+    font-size: 0.85rem;
+}
+
+.message__think-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--gray-600);
+    font-weight: 600;
+    font-size: 0.8rem;
+    transition: background 0.2s;
+}
+
+.message__think-header:hover {
+    background: var(--gray-200);
+}
+
+.message__think-icon {
+    font-size: 0.9rem;
+}
+
+.message__think-arrow {
+    margin-left: auto;
+    color: var(--gray-600);
+    font-size: 0.75rem;
+    transition: transform 0.2s;
+}
+
+.message__think-body {
+    padding: 4px 12px 10px;
+    color: var(--gray-600);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    border-top: 1px dashed var(--gray-200);
+    font-size: 0.82rem;
+}
+
 /* ---------- 流式输出光标 ---------- */
 .message__cursor {
     display: inline-block;
