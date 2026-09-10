@@ -7,12 +7,54 @@ echo  ============================================================
 echo.
 echo   [Info] This script will:
 echo          1. Build the Bots-Portable green folder
-echo          2. Compress it into BotsAI-Portable.zip
+echo          2. Compress it into BotsAI-Portable-v{version}-win-x64.zip
 echo.
 echo   [Info] Target machine needs NO extra software installed.
 echo          Delete the folder to fully uninstall.
 echo.
 cd /d "%~dp0"
+
+REM ---------- Version input ----------
+echo.
+set "APP_VERSION="
+set /p "APP_VERSION=  [Input] Please enter the version number (e.g. 1.0.0): "
+if not defined APP_VERSION (
+    echo   [ERROR] Version number cannot be empty!
+    pause
+    exit /b 1
+)
+
+REM Validate version format (x.y.z) - reliable method (no set /a)
+REM Split into 3 parts by "."
+set "V1="
+set "V2="
+set "V3="
+for /f "tokens=1,2,3 delims=." %%a in ("%APP_VERSION%") do (
+    set "V1=%%a"
+    set "V2=%%b"
+    set "V3=%%c"
+)
+REM All three parts must exist
+if not defined V1 goto :VER_INVALID
+if not defined V2 goto :VER_INVALID
+if not defined V3 goto :VER_INVALID
+REM Each part must be a pure non-negative integer
+echo %V1%| findstr /r "^[0-9][0-9]*$" >nul
+if errorlevel 1 goto :VER_INVALID
+echo %V2%| findstr /r "^[0-9][0-9]*$" >nul
+if errorlevel 1 goto :VER_INVALID
+echo %V3%| findstr /r "^[0-9][0-9]*$" >nul
+if errorlevel 1 goto :VER_INVALID
+goto :VER_OK
+
+:VER_INVALID
+echo   [ERROR] Invalid version format! Expected x.y.z (e.g. 1.0.0)
+pause
+exit /b 1
+
+:VER_OK
+set "ZIP_NAME=BotsAI-Portable-v%APP_VERSION%-win-x64.zip"
+echo   [OK] Output package: %ZIP_NAME%
 
 REM ---------- Step 0: Check runtime ----------
 echo.
@@ -33,7 +75,8 @@ if exist "%OUTPUT_DIR%" rmdir /s /q "%OUTPUT_DIR%"
 mkdir "%OUTPUT_DIR%"
 
 REM Remove old zip BEFORE building to avoid stale artifacts
-if exist "BotsAI-Portable.zip" del /q "BotsAI-Portable.zip"
+if exist "%ZIP_NAME%" del /q "%ZIP_NAME%"
+if exist "BotsAI-Portable-*.zip" del /q "BotsAI-Portable-*.zip"
 
 REM ---------- Copy folders (per .gitignore, with exceptions) ----------
 echo   - Copying folders ...
@@ -93,12 +136,12 @@ echo   [OK] Bots-Portable folder built.
 REM ---------- Step 2: Compress to zip ----------
 echo.
 echo  [2/4] Removing old zip file (double check)...
-if exist "BotsAI-Portable.zip" del /q "BotsAI-Portable.zip"
+if exist "%ZIP_NAME%" del /q "%ZIP_NAME%"
 
 echo.
-echo  [3/4] Compressing to BotsAI-Portable.zip ...
+echo  [3/4] Compressing to %ZIP_NAME% ...
 echo   [INFO] This may take a few minutes. Please wait...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%OUTPUT_DIR%' -DestinationPath '%~dp0BotsAI-Portable.zip' -CompressionLevel Optimal -Force"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%OUTPUT_DIR%' -DestinationPath '%~dp0%ZIP_NAME%' -CompressionLevel Optimal -Force"
 
 if errorlevel 1 (
     echo.
@@ -118,10 +161,13 @@ echo.
 echo  ============================================================
 echo    Packaging SUCCESS!
 echo  ============================================================
-echo    Generated: %~dp0BotsAI-Portable.zip
+echo    Generated: %~dp0%ZIP_NAME%
+echo.
+echo   [SHA256] Generating checksum...
+certutil -hashfile "%~dp0%ZIP_NAME%" SHA256 | findstr /v "hash"
 echo.
 echo    Deployment:
-echo    1. Copy BotsAI-Portable.zip to target Windows machine
+echo    1. Copy %ZIP_NAME% to target Windows machine
 echo    2. Extract to any location (e.g. D:\BotsAI)
 echo    3. Double-click start.bat to start the server
 echo    4. Open browser at http://localhost:3001
