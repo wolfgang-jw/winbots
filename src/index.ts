@@ -8,8 +8,6 @@
  * 4. 配置静态文件服务（前端页面）
  * 5. 注册 SIGINT/SIGTERM 优雅关闭
  * 6. 启动 HTTP 服务器
- * 
- * 注意：已去除 MySQL 和 Redis 模块
  */
 import { Hono } from "hono";
 import { resolve } from "path";
@@ -18,6 +16,7 @@ import { env } from "@/infra/env";
 import { errorHandler, notFoundHandler } from "@/middleware/error";
 import healthRoute from "@/routes/health";
 import chatRoute from "@/routes/chat";
+import { originGuard } from "@/middleware/origin";
 
 // ============================================
 // 创建应用实例
@@ -29,6 +28,7 @@ const app = new Hono();
 // ============================================
 app.onError(errorHandler);
 app.notFound(notFoundHandler);
+app.use("*", originGuard);
 
 // ============================================
 // API 路由
@@ -63,6 +63,7 @@ const port = env.APP_PORT;
 console.log("\n" + "=".repeat(60));
 console.log("🚀 Bots 服务启动成功！");
 console.log("=".repeat(60));
+console.log(`   监听:      127.0.0.1:${port}（仅本机可访问）`);
 console.log(`   地址:      http://localhost:${port}`);
 console.log(`   健康检查:  http://localhost:${port}/api/health`);
 console.log(`   对话接口:  http://localhost:${port}/api/chat/stream`);
@@ -72,5 +73,6 @@ console.log("=".repeat(60) + "\n");
 
 export default {
     port,
+    hostname: "127.0.0.1",
     fetch: app.fetch,
 };
