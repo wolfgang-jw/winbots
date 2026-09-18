@@ -450,6 +450,7 @@ body {
     font-size: 1.1rem;
     flex-shrink: 0;
     margin-top: 4px;
+    align-self: flex-start;
 }
 
 .message--user .message__avatar {
@@ -476,6 +477,10 @@ body {
     line-height: 1.6;
     word-wrap: break-word;
     white-space: pre-wrap;
+    /* R3 修复：气泡内三段（思考/回答/信息栏）纵向堆叠，头像仍在气泡左侧 */
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
 }
 
 .message--user .message__bubble {
@@ -505,7 +510,7 @@ body {
     border: 1px solid var(--gray-200);
     border-left: 3px solid var(--egg-yellow-dark);
     border-radius: 8px;
-    margin-bottom: 10px;
+    margin-bottom: 0;
     overflow: hidden;
     font-size: 0.85rem;
 }
@@ -762,4 +767,120 @@ body {
     .chat-suggestions {
         display: none;
     }
+}
+
+/* ============================================
+   R3 回答可观测性：三段结构（思考 / 回答 / 信息栏）
+   ============================================ */
+
+/* ---------- 回答段（三段总开关） ---------- */
+.message__answer {
+    display: flex;
+    flex-direction: column;
+}
+
+.message__answer-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 0 8px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--gray-600);
+    font-weight: 600;
+    font-size: 0.8rem;
+}
+
+.message__answer-header:hover {
+    color: var(--gray-800);
+}
+
+.message__answer-icon {
+    font-size: 0.9rem;
+}
+
+.message__answer-arrow {
+    margin-left: auto;
+    color: var(--gray-600);
+    font-size: 0.75rem;
+}
+
+.message__answer-body {
+    display: block;
+}
+
+/* ---------- 单条信息栏（第 3 段） ---------- */
+.message__info {
+    margin-top: 0;
+    border-top: 1px dashed var(--gray-200);
+    font-size: 0.8rem;
+}
+
+.message__info-summary {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 0 4px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--gray-600);
+    font-weight: 600;
+    font-size: 0.78rem;
+}
+
+.message__info-summary:hover {
+    color: var(--gray-800);
+}
+
+.message__info-icon {
+    font-size: 0.85rem;
+}
+
+.message__info-arrow {
+    margin-left: auto;
+    color: var(--gray-600);
+    font-size: 0.75rem;
+}
+
+.message__info-body {
+    margin: 6px 0 0;
+    padding: 10px 12px;
+    background: var(--gray-900);
+    color: var(--egg-yellow-light);
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 0.75rem;
+    line-height: 1.5;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+/* ============================================
+   R3 布局兜底：强制气泡内三段纵向堆叠（最高优先级）
+   说明：置于文件末尾 + !important，确保不被缓存旧规则或
+   其它选择器覆盖，彻底解决“思考/回答/信息栏”横排问题。
+   头像 .message__avatar 是 .message 的直接子项，位于气泡之外，
+   不受此规则影响，仍固定在气泡左侧。
+   ============================================ */
+.message__bubble {
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: stretch !important;
+    gap: 10px !important;
+}
+
+/* 三段各自占满整行，杜绝任何横向并排 */
+.message__bubble > .message__think,
+.message__bubble > .message__answer,
+.message__bubble > .message__info {
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 0 auto !important;
+}
+
+/* 回答段内部同样纵向 */
+.message__answer {
+    display: flex !important;
+    flex-direction: column !important;
 }

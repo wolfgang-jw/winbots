@@ -7,6 +7,7 @@
  * 3. 实时渲染流式文本到消息气泡
  * 4. 支持 Markdown 风格的代码块渲染
  * 5. 显示使用统计信息
+ * 6. R3 回答可观测性：三段结构（思考 / 回答 / 信息栏）+ 会话汇总
  */
 
 (function () {
@@ -45,12 +46,31 @@
         abortController: null,
         /** @type {string} 当前正在累积的助手消息 */
         currentAssistantContent: "",
-        /** @type {HTMLElement|null} 当前助手的消息气泡元素 */
+        /**
+         * @type {HTMLElement|null} 当前助手消息的根元素（.message）
+         * 注意：这是 .message 根节点，真正的气泡是它内部的 .message__bubble。
+         * 插入思考段/信息栏时必须下钻到 .message__bubble，否则会插到 .message
+         * 上，与头像、气泡一起被 .message 的横向 flex 排成一行。
+         */
         currentBubbleEl: null,
         /** @type {HTMLElement|null} 当前思考块元素（无思考内容时为 null） */
         currentThinkEl: null,
         /** @type {string} 当前正在累积的思考内容 */
         currentThinkContent: "",
+        /** @type {HTMLElement|null} 当前信息栏元素 */
+        currentInfoEl: null,
+        /** @type {HTMLElement|null} 当前回答段容器（总开关） */
+        currentAnswerEl: null,
+        /** @type {number} 本次回答开始时间（performance.now()） */
+        currentStartTime: 0,
+        /** @type {{count:number, promptTokens:number, completionTokens:number, totalTokens:number, elapsedMs:number}} 会话累计统计 */
+        sessionStats: {
+            count: 0,
+            promptTokens: 0,
+            completionTokens: 0,
+            totalTokens: 0,
+            elapsedMs: 0,
+        },
     };
 
     // ============================================
@@ -116,6 +136,99 @@
         return new Date().toLocaleTimeString("zh-CN");
     }
 
+    /**
+     * 格式化时刻为 时:分:秒
+     * @param {Date} date
+     * @returns {string} 如 "14:32:05"
+     */
+    function formatClock(date) {
+        const p = (n) => String(n).padStart(2, "0");
+        return `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+    }
+
+    /**
+     * 格式化耗时为 X.XXs
+     * @param {number} ms - 毫秒
+     * @returns {string} 如 "3.21s"
+     */
+    function formatElapsed(ms) {
+        return (ms / 1000).toFixed(2) + "s";
+    }
+
+    /**
+     * 获取指定 .message 根元素内真正的气泡元素（.message__bubble）
+     * 思考段 / 回答段 / 信息栏三段都必须挂在气泡内部，才能随气泡纵向堆叠；
+     * 若挂到 .message 上，会与头像、气泡一起被 .message 的横向 flex 排成一行。
+     * @param {HTMLElement} messageEl - .message 根元素
+     * @returns {HTMLElement} - .message__bubble 元素（找不到时回退为 messageEl）
+     */
+    function getBubbleOf(messageEl) {
+        if (!messageEl) return null;
+        return messageEl.querySelector(".message__bubble") || messageEl;
+    }
+
+    /**
+     * 渲染单条信息栏（第 3 段，默认折叠）
+     * @param {HTMLElement} messageEl - 目标消息根元素（.message）
+     * @param {{model:string, startTime:Date, elapsedMs:number, usage:object, raw:object}} info
+     * @returns {HTMLElement} - 信息栏元素
+     */
+    function renderInfoBar(messageEl, info) {
+        const el = document.createElement("div");
+        el.className = "message__info";
+
+        // 摘要行（折叠态可见）
+        const summary = document.createElement("div");
+        summary.className = "message__info-summary";
+        summary.innerHTML =
+            `<span class="message__info-icon">🤖</span> ${escapeHtml(info.model || "unknown")}`
+            + ` · ${formatClock(info.startTime)}`
+            + ` · ${formatElapsed(info.elapsedMs)}`
+            + ` · 📊 ${info.usage.totalTokens} tokens`
+            + `<span class="message__info-arrow">▸</span>`;
+        el.appendChild(summary);
+
+        // 详情体（展开态显示全部字段，格式化 JSON）
+        const body = document.createElement("pre");
+        body.className = "message__info-body";
+        body.style.display = "none";
+        body.textContent = JSON.stringify(info.raw || {}, null, 2);
+        el.appendChild(body);
+
+        // 折叠交互（独立生效，不影响其他两段）
+        summary.addEventListener("click", () => {
+            const arrow = summary.querySelector(".message__info-arrow");
+            if (body.style.display === "none") {
+                body.style.display = "block";
+                arrow.textContent = "▾";
+            } else {
+                body.style.display = "none";
+                arrow.textContent = "▸";
+            }
+        });
+
+        // 关键修复：下钻到真正的 .message__bubble 再追加，确保信息栏位于气泡内部（第 3 段）
+        const bubble = getBubbleOf(messageEl);
+        bubble.appendChild(el);
+        return el;
+    }
+
+    /**
+     * 渲染会话汇总栏（宏观度量，R3.3）
+     * 数据来源：state.sessionStats（与单条信息栏同口径）
+     */
+    function renderSessionSummary() {
+        const s = state.sessionStats;
+        if (s.count === 0) {
+            $dom.usage.textContent = "";
+            return;
+        }
+        $dom.usage.textContent =
+            `📊 会话累计 · ${s.count} 次回答`
+            + ` · 输入 ${s.promptTokens} / 输出 ${s.completionTokens} / 共计 ${s.totalTokens} tokens`
+            + ` · 总耗时 ${(s.elapsedMs / 1000).toFixed(1)}s`;
+    }
+
     // ============================================
     // DOM 操作函数
     // ============================================
@@ -147,16 +260,42 @@
         bubble.className = "message__bubble";
 
         if (role === "assistant") {
-            // 助手消息：先放内容占位，后续流式追加
+            // R3 布局兜底：内联样式强制气泡纵向堆叠，避免 CSS 缓存/优先级导致三段横排
+            bubble.style.display = "flex";
+            bubble.style.flexDirection = "column";
+            bubble.style.alignItems = "stretch";
+            bubble.style.gap = "10px";
+            bubble.style.width = "100%";
+
+            // 回答段容器（总开关）：标题 + 正文 + 光标
+            const answerEl = document.createElement("div");
+            answerEl.className = "message__answer";
+            answerEl.style.display = "flex";
+            answerEl.style.flexDirection = "column";
+            answerEl.style.width = "100%";
+
+            // 回答段标题（可点击折叠，作为三段总开关）
+            const answerHeader = document.createElement("div");
+            answerHeader.className = "message__answer-header";
+            answerHeader.innerHTML = '<span class="message__answer-icon">📝</span> 回答内容'
+                + '<span class="message__answer-arrow">▾</span>';
+            answerEl.appendChild(answerHeader);
+
+            // 回答段主体（正文 + 光标）
+            const answerBody = document.createElement("div");
+            answerBody.className = "message__answer-body";
+
             const contentSpan = document.createElement("span");
             contentSpan.className = "message__content";
             contentSpan.innerHTML = renderMarkdown(content || "");
-            bubble.appendChild(contentSpan);
+            answerBody.appendChild(contentSpan);
 
-            // 添加闪烁光标
             const cursor = document.createElement("span");
             cursor.className = "message__cursor";
-            bubble.appendChild(cursor);
+            answerBody.appendChild(cursor);
+
+            answerEl.appendChild(answerBody);
+            bubble.appendChild(answerEl);
         } else {
             // 用户/错误消息：直接渲染
             bubble.innerHTML = renderMarkdown(content);
@@ -180,6 +319,35 @@
 
         const el = createMessageEl(role, content);
         $dom.messages.appendChild(el);
+
+        // 助手消息：为回答段标题绑定折叠联动（回答段为三段总开关）
+        if (role === "assistant") {
+            const answerHeader = el.querySelector(".message__answer-header");
+            const answerBody = el.querySelector(".message__answer-body");
+            if (answerHeader && answerBody) {
+                answerHeader.addEventListener("click", () => {
+                    const arrow = answerHeader.querySelector(".message__answer-arrow");
+                    const collapsed = answerBody.style.display === "none";
+                    if (collapsed) {
+                        // 展开回答段：仅展开回答段，思考段与信息栏保持各自状态
+                        answerBody.style.display = "block";
+                        arrow.textContent = "▾";
+                    } else {
+                        // 折叠回答段：思考段 + 信息栏段一并折叠（三段全收起）
+                        answerBody.style.display = "none";
+                        arrow.textContent = "▸";
+                        const thinkBody = el.querySelector(".message__think-body");
+                        const thinkArrow = el.querySelector(".message__think-arrow");
+                        if (thinkBody) thinkBody.style.display = "none";
+                        if (thinkArrow) thinkArrow.textContent = "▸";
+                        const infoBody = el.querySelector(".message__info-body");
+                        const infoArrow = el.querySelector(".message__info-arrow");
+                        if (infoBody) infoBody.style.display = "none";
+                        if (infoArrow) infoArrow.textContent = "▸";
+                    }
+                });
+            }
+        }
 
         // 滚动到底部
         scrollToBottom();
@@ -227,6 +395,8 @@
         if (!state.currentThinkEl) {
             const thinkEl = document.createElement("div");
             thinkEl.className = "message__think";
+            // R3 布局兜底：思考段占满整行
+            thinkEl.style.width = "100%";
 
             // 思考块标题（可点击折叠）
             const header = document.createElement("div");
@@ -251,8 +421,10 @@
             body.className = "message__think-body";
             thinkEl.appendChild(body);
 
-            // 插入到气泡的最前面（在正文内容之前）
-            state.currentBubbleEl.insertBefore(thinkEl, state.currentBubbleEl.firstChild);
+            // 关键修复：下钻到真正的 .message__bubble 再插入最前面，
+            // 确保思考段位于气泡内部（第 1 段），而非挂在 .message 上与头像横排。
+            const bubble = getBubbleOf(state.currentBubbleEl);
+            bubble.insertBefore(thinkEl, bubble.firstChild);
             state.currentThinkEl = thinkEl;
         }
 
@@ -290,10 +462,10 @@
         if (cursor) {
             cursor.remove();
         }
-        state.currentBubbleEl = null;
         state.currentAssistantContent = "";
 
         finishThink();
+        // 注意：currentBubbleEl 不在此处置空，由 finish 分支生成信息栏后再清理
     }
 
     /**
@@ -362,6 +534,9 @@
             state.currentThinkEl = null;
             state.currentThinkContent = "";
 
+            // 记录本次回答开始时间（前端计时，R3.4）
+            state.currentStartTime = performance.now();
+
             // 发起流式请求
             const response = await fetch(CONFIG.API_ENDPOINT, {
                 method: "POST",
@@ -420,7 +595,37 @@
                                 // 完成
                                 finishStream();
                                 if (data.usage) {
-                                    setUsage(formatUsage(data.usage));
+                                    // 计算耗时（前端计时，R3.4）
+                                    const elapsedMs = state.currentStartTime
+                                        ? performance.now() - state.currentStartTime
+                                        : 0;
+                                    const startTime = new Date(Date.now() - elapsedMs);
+
+                                    // 生成单条信息栏（第 3 段，默认折叠）
+                                    if (state.currentBubbleEl) {
+                                        state.currentInfoEl = renderInfoBar(state.currentBubbleEl, {
+                                            model: data.raw?.model || "",
+                                            startTime,
+                                            elapsedMs,
+                                            usage: data.usage,
+                                            raw: data.raw,
+                                        });
+                                    }
+
+                                    // 累加会话统计（与单条信息栏同口径，R3.3.3）
+                                    state.sessionStats.count += 1;
+                                    state.sessionStats.promptTokens += data.usage.promptTokens || 0;
+                                    state.sessionStats.completionTokens += data.usage.completionTokens || 0;
+                                    state.sessionStats.totalTokens += data.usage.totalTokens || 0;
+                                    state.sessionStats.elapsedMs += elapsedMs;
+
+                                    // 刷新会话汇总栏
+                                    renderSessionSummary();
+
+                                    // 信息栏生成后清理当前气泡引用
+                                    state.currentBubbleEl = null;
+                                    state.currentInfoEl = null;
+                                    state.currentStartTime = 0;
                                 }
                                 setStatus(`✅ 完成 (${getTimeStr()})`);
                                 break;
@@ -504,8 +709,7 @@
             state.history = state.history.slice(-CONFIG.MAX_HISTORY);
         }
 
-        // 清空使用统计
-        clearUsage();
+        // 会话累计汇总栏由 renderSessionSummary 维护，此处不再清空
 
         // 发送请求，并将助手的回复加入历史
         state.isStreaming = true;

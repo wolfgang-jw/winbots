@@ -22,7 +22,7 @@
  * data: {"type":"text","content":"你"}
  * data: {"type":"text","content":"好"}
  * data: {"type":"text","content":"！"}
- * data: {"type":"finish","reason":"stop","usage":{"promptTokens":10,"completionTokens":5,"totalTokens":15}}
+ * data: {"type":"finish","reason":"stop","usage":{"promptTokens":10,"completionTokens":5,"totalTokens":15},"raw":{...}}
  * data: {"type":"error","message":"错误信息"}
  */
 import { Hono } from "hono";
@@ -198,6 +198,8 @@ router.post("/stream", async (c) => {
                                                     completionTokens: usage.completion_tokens ?? completionTokens,
                                                     totalTokens: usage.total_tokens ?? (usage.prompt_tokens ?? 0) + completionTokens,
                                                 },
+                                                // 新增：透传上游返回的完整字段，供前端信息栏展示全部信息
+                                                raw: parsed,
                                             });
                                             controller.enqueue(
                                                 encoder.encode(`data: ${finishPayload}\n\n`)
