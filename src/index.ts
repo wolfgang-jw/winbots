@@ -16,6 +16,7 @@ import { env } from "@/infra/env";
 import { errorHandler, notFoundHandler } from "@/middleware/error";
 import healthRoute from "@/routes/health";
 import chatRoute from "@/routes/chat";
+import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 
 // ============================================
@@ -71,8 +72,15 @@ console.log(`   聊天页面:  http://localhost:${port}/`);
 console.log(`   状态监控:  http://localhost:${port}/status.html`);
 console.log("=".repeat(60) + "\n");
 
-export default {
+// 显式启动 HTTP 服务器（返回即代表已开始监听）
+const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
     fetch: app.fetch,
-};
+});
+
+// 启动成功后，自动打开系统默认浏览器（仅触发一次，失败静默降级）
+openBrowser(`http://localhost:${port}`);
+
+// 保留默认导出，指向已启动的 server 实例，兼容既有引用方式
+export default server;
