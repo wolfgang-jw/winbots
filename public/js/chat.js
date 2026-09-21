@@ -8,6 +8,7 @@
  * 4. 支持 Markdown 风格的代码块渲染
  * 5. 显示使用统计信息
  * 6. R3 回答可观测性：三段结构（思考 / 回答 / 信息栏）+ 会话汇总
+ * 7. R1 工具调用可见：新增第 4 段「工具调用」（默认收起）
  */
 
 (function () {
@@ -59,6 +60,8 @@
         currentThinkContent: "",
         /** @type {HTMLElement|null} 当前信息栏元素 */
         currentInfoEl: null,
+        /** @type {HTMLElement|null} 当前工具调用段元素（第 4 段） */
+        currentToolEl: null,
         /** @type {HTMLElement|null} 当前回答段容器（总开关） */
         currentAnswerEl: null,
         /** @type {number} 本次回答开始时间（performance.now()） */
@@ -210,6 +213,73 @@
         // 关键修复：下钻到真正的 .message__bubble 再追加，确保信息栏位于气泡内部（第 3 段）
         const bubble = getBubbleOf(messageEl);
         bubble.appendChild(el);
+        return el;
+    }
+
+    /**
+     * 渲染工具调用段（第 4 段，默认折叠）
+     * 插入到气泡内、回答段之前（思考段之后），不破坏三段纵向堆叠
+     * @param {HTMLElement} messageEl - .message 根元素
+     * @param {{name:string, arguments:object, result?:string}} info
+     * @returns {HTMLElement}
+     */
+    function renderToolCall(messageEl, info) {
+        // 复用同一个工具段（同一次回答可能多次 tool_call 事件）
+        let el = state.currentToolEl;
+        if (!el) {
+            el = document.createElement("div");
+            el.className = "message__tool";
+
+            const header = document.createElement("div");
+            header.className = "message__tool-header";
+            header.innerHTML =
+                '<span class="message__tool-icon">🔧</span> 工具调用'
+                + '<span class="message__tool-arrow">▸</span>';
+            el.appendChild(header);
+
+            const body = document.createElement("div");
+            body.className = "message__tool-body";
+            body.style.display = "none"; // 默认收起
+            el.appendChild(body);
+
+            // 折叠交互（独立生效）
+            header.addEventListener("click", () => {
+                const arrow = header.querySelector(".message__tool-arrow");
+                if (body.style.display === "none") {
+                    body.style.display = "block";
+                    arrow.textContent = "▾";
+                } else {
+                    body.style.display = "none";
+                    arrow.textContent = "▸";
+                }
+            });
+
+            // 插入到气泡内、回答段之前
+            const bubble = getBubbleOf(messageEl);
+            const answerEl = bubble.querySelector(".message__answer");
+            if (answerEl) {
+                bubble.insertBefore(el, answerEl);
+            } else {
+                bubble.appendChild(el);
+            }
+            state.currentToolEl = el;
+        }
+
+        // 追加本次调用信息（名称 + 参数 + 结果）
+        const body = el.querySelector(".message__tool-body");
+        const line = document.createElement("div");
+        line.className = "message__tool-item";
+
+        let text = `调用：${info.name}`;
+        if (info.arguments && Object.keys(info.arguments).length > 0) {
+            text += `\n参数：${JSON.stringify(info.arguments)}`;
+        }
+        if (info.result !== undefined) {
+            text += `\n结果：${info.result}`;
+        }
+        line.textContent = text;
+        body.appendChild(line);
+
         return el;
     }
 
@@ -533,6 +603,7 @@
             // 重置思考状态
             state.currentThinkEl = null;
             state.currentThinkContent = "";
+            state.currentToolEl = null; // R1：重置工具段引用，避免串到上一条消息
 
             // 记录本次回答开始时间（前端计时，R3.4）
             state.currentStartTime = performance.now();
@@ -582,6 +653,16 @@
                         const data = JSON.parse(trimmed.slice(6));
 
                         switch (data.type) {
+                            case "tool_call":
+                                // R1：工具调用发生/结果（默认收起，可展开）
+                                if (state.currentBubbleEl) {
+                                    renderToolCall(state.currentBubbleEl, {
+                                        name: data.name,
+                                        arguments: data.arguments,
+                                        result: data.result, // 执行前为 undefined
+                                    });
+                                }
+                                break;
                             case "think":
                                 // 思考内容（自适应显示，无则不渲染）
                                 updateThinkContent(data.content);
@@ -669,6 +750,7 @@
                 state.currentAssistantContent = "";
                 state.currentThinkEl = null;
                 state.currentThinkContent = "";
+                state.currentToolEl = null; // R1：一并清理工具段引用
             }
 
             // 显示错误消息

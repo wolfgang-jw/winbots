@@ -884,3 +884,70 @@ body {
     display: flex !important;
     flex-direction: column !important;
 }
+
+/* ============================================
+   R1 工具调用段（第 4 段，默认收起）
+   用「葱花绿」与思考段（蛋黄色）区分
+   ============================================ */
+.message__tool {
+    background: #F1F8E9;
+    border: 1px solid var(--green-onion-light);
+    border-left: 3px solid var(--green-onion);
+    border-radius: 8px;
+    overflow: hidden;
+    font-size: 0.85rem;
+    width: 100%;
+}
+
+.message__tool-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--gray-600);
+    font-weight: 600;
+    font-size: 0.8rem;
+    transition: background 0.2s;
+}
+
+.message__tool-header:hover {
+    background: #DCEDC8;
+}
+
+.message__tool-icon {
+    font-size: 0.9rem;
+}
+
+.message__tool-arrow {
+    margin-left: auto;
+    color: var(--gray-600);
+    font-size: 0.75rem;
+}
+
+.message__tool-body {
+    padding: 4px 12px 10px;
+    border-top: 1px dashed var(--green-onion-light);
+}
+
+.message__tool-item {
+    padding: 6px 0;
+    color: var(--gray-700);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 0.8rem;
+    border-bottom: 1px dashed var(--gray-200);
+}
+
+.message__tool-item:last-child {
+    border-bottom: none;
+}
+
+/* 工具段整行占满，纳入气泡纵向堆叠 */
+.message__bubble > .message__tool {
+    width: 100% !important;
+    max-width: 100% !important;
+    flex: 0 0 auto !important;
+}

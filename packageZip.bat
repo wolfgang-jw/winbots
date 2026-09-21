@@ -97,6 +97,10 @@ REM Copy public (frontend assets)
 echo     public ...
 xcopy /e /i /q /h /y "public" "%OUTPUT_DIR%\public" >nul
 
+REM Copy etc (customizable tools/agents/skills, loaded at runtime)
+echo     etc ...
+xcopy /e /i /q /h /y "etc" "%OUTPUT_DIR%\etc" >nul
+
 REM NOTE: .vscode, docs, .git are NOT copied (ignored / not for distribution)
 
 REM ---------- Copy files ----------
