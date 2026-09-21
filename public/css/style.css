@@ -412,9 +412,10 @@ body {
 
 /* ---------- 消息气泡 ---------- */
 .message {
-    display: flex;
-    margin-bottom: 20px;
-    animation: fadeInUp 0.3s ease-out;
+   display: flex;
+    width: 100%;          /* 修正：显式撑满 .chat-messages，避免气泡百分比 max-width 基准异常 */
+   margin-bottom: 20px;
+   animation: fadeInUp 0.3s ease-out;
 }
 
 @keyframes fadeInUp {
@@ -495,6 +496,11 @@ body {
     border-bottom-left-radius: 4px;
     box-shadow: var(--shadow);
     border: 1px solid var(--gray-200);
+   /* R2-2 固定行宽：占满头像右侧剩余空间，流式过程中宽度恒定不跳动 */
+   flex: 0 0 auto;
+    width: calc(100% - 48px);   /* 100% - (头像36px + 右边距12px) */
+    min-width: 0;
+    max-width: calc(100% - 48px) !important;  /* 压掉基础规则的 max-width:75% */
 }
 
 .message--error .message__bubble {
@@ -714,29 +720,7 @@ body {
 }
 
 /* ---------- 快捷提示词 ---------- */
-.chat-suggestions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-    padding: 12px 0 4px;
-}
-
-.chat-suggestion-btn {
-    background: var(--white);
-    border: 1px solid var(--gray-200);
-    padding: 6px 14px;
-    border-radius: 20px;
-    font-size: 0.8rem;
-    color: var(--gray-700);
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.chat-suggestion-btn:hover {
-    border-color: var(--tomato-red);
-    color: var(--tomato-red);
-    background: #FFF5F5;
-}
+/* R2-1：默认问题行已删除，相关 .chat-suggestions / .chat-suggestion-btn 样式一并移除 */
 
 /* ---------- 使用统计 ---------- */
 .chat-usage {
@@ -754,18 +738,14 @@ body {
         padding: 0 12px;
     }
 
+    /* R2-2：气泡宽度由 flex 自适应，删除原 max-width:85% 以免与固定宽度规则冲突 */
     .message__bubble {
-        max-width: 85%;
         font-size: 0.9rem;
     }
 
     .chat-send-btn {
         padding: 12px 16px;
         font-size: 0.85rem;
-    }
-
-    .chat-suggestions {
-        display: none;
     }
 }
 
@@ -869,6 +849,14 @@ body {
     align-items: stretch !important;
     gap: 10px !important;
 }
+
+/* R2-2 兜底：助手气泡强制撑满，置于末尾确保最终生效 */
+.message--assistant .message__bubble {
+  flex: 0 0 auto !important;
+   width: calc(100% - 48px) !important;
+  min-width: 0 !important;
+  max-width: calc(100% - 48px) !important;
+    }
 
 /* 三段各自占满整行，杜绝任何横向并排 */
 .message__bubble > .message__think,

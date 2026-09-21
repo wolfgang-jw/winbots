@@ -9,6 +9,7 @@
  * 5. 显示使用统计信息
  * 6. R3 回答可观测性：三段结构（思考 / 回答 / 信息栏）+ 会话汇总
  * 7. R1 工具调用可见：新增第 4 段「工具调用」（默认收起）
+ * 8. R2 界面细节修正：删除默认问题行、固定行宽、折叠联动修正
  */
 
 (function () {
@@ -32,7 +33,7 @@
         sendBtn: document.getElementById("chat-send-btn"),
         status: document.getElementById("chat-status"),
         usage: document.getElementById("chat-usage"),
-        suggestions: document.getElementById("chat-suggestions"),
+        // R2-1：已删除默认问题行（#chat-suggestions），此处不再缓存其引用
     };
 
     // ============================================
@@ -335,7 +336,8 @@
             bubble.style.flexDirection = "column";
             bubble.style.alignItems = "stretch";
             bubble.style.gap = "10px";
-            bubble.style.width = "100%";
+            // R2-2 固定行宽：不再设置内联 width，交由 CSS 的 flex:1 1 auto; width:0; 控制，
+            // 避免内联样式覆盖 CSS 导致固定宽度失效或溢出。
 
             // 回答段容器（总开关）：标题 + 正文 + 光标
             const answerEl = document.createElement("div");
@@ -384,8 +386,7 @@
     function addMessage(role, content) {
         // 隐藏空状态
         $dom.empty.style.display = "none";
-        // 显示快捷提示词
-        $dom.suggestions.style.display = "flex";
+        // R2-1：默认问题行已删除，此处不再操作 #chat-suggestions 的显隐
 
         const el = createMessageEl(role, content);
         $dom.messages.appendChild(el);
@@ -399,21 +400,35 @@
                     const arrow = answerHeader.querySelector(".message__answer-arrow");
                     const collapsed = answerBody.style.display === "none";
                     if (collapsed) {
-                        // 展开回答段：仅展开回答段，思考段与信息栏保持各自状态
+                        // 展开回答段：仅展开回答段；思考段/工具段/信息栏恢复"区块可见"，
+                        // 但保持各自 body 的原有展开/收起状态（不强制展开）
                         answerBody.style.display = "block";
                         arrow.textContent = "▾";
+
+                        const thinkEl = el.querySelector(".message__think");
+                        if (thinkEl) thinkEl.style.display = "";
+
+                        const toolEl = el.querySelector(".message__tool");
+                        if (toolEl) toolEl.style.display = "";
+
+                        const infoEl = el.querySelector(".message__info");
+                        if (infoEl) infoEl.style.display = "";
                     } else {
-                        // 折叠回答段：思考段 + 信息栏段一并折叠（三段全收起）
+                        // 折叠回答段：思考段 + 工具段 + 信息栏段整体不可见（含标题行）
                         answerBody.style.display = "none";
                         arrow.textContent = "▸";
-                        const thinkBody = el.querySelector(".message__think-body");
-                        const thinkArrow = el.querySelector(".message__think-arrow");
-                        if (thinkBody) thinkBody.style.display = "none";
-                        if (thinkArrow) thinkArrow.textContent = "▸";
-                        const infoBody = el.querySelector(".message__info-body");
-                        const infoArrow = el.querySelector(".message__info-arrow");
-                        if (infoBody) infoBody.style.display = "none";
-                        if (infoArrow) infoArrow.textContent = "▸";
+
+                        // 隐藏思考段整个区块（含标题行）
+                        const thinkEl = el.querySelector(".message__think");
+                        if (thinkEl) thinkEl.style.display = "none";
+
+                        // 隐藏工具调用段整个区块（含标题行，R1 第 4 段）
+                        const toolEl = el.querySelector(".message__tool");
+                        if (toolEl) toolEl.style.display = "none";
+
+                        // 隐藏信息栏整个区块（含摘要行）
+                        const infoEl = el.querySelector(".message__info");
+                        if (infoEl) infoEl.style.display = "none";
                     }
                 });
             }
@@ -833,17 +848,7 @@
         // 发送按钮点击
         $dom.sendBtn.addEventListener("click", sendMessage);
 
-        // 快捷提示词点击
-        $dom.suggestions.addEventListener("click", (e) => {
-            const btn = e.target.closest(".chat-suggestion-btn");
-            if (!btn) return;
-            const prompt = btn.dataset.prompt;
-            if (prompt) {
-                $dom.input.value = prompt;
-                autoResizeInput();
-                sendMessage();
-            }
-        });
+        // R2-1：默认问题行已删除，此处不再绑定 #chat-suggestions 的点击事件
 
         // 启用输入
         setInputEnabled(true);
