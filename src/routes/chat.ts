@@ -29,6 +29,13 @@
  *   - [问题 3] 阶段一降级重试保留上游 usage，分支 B 回吐时不再返回空 usage/raw。
  *   - [问题 4] pipeStream 精确统计 token：优先采用上游 usage.completion_tokens，
  *     上游未返回时才用「累计字符数」作为兜底（不再用 chunk 计数冒充 token 数）。
+ *   - [US-1.1] 统一流式输出：移除分支 B「探测拿到文本后整段回吐」，
+ *     无工具调用的回答一律改走流式请求，消除一次性整段输出路径。
+ *   - [US-1.2] 保留工具场景流式：确认分支 A（工具调用 → 阶段二流式）不受 US-1.1 影响，
+ *     阶段二请求保持 stream:true 并经 pipeStream 逐字推送，工具场景与普通问答体验一致。
+ *   - [US-1.3] 上游不支持工具时的流式兼容：新增 supportsTools 状态记录探测结论，
+ *     探测失败即判定「不支持工具」并移除已失效的非流式降级重试；
+ *     后续流式请求据 supportsTools 去除工具参数，避免上游 400，回答仍正常逐字返回。
  *
  * 请求体 (JSON):
  * {
@@ -227,8 +234,11 @@ router.post("/stream", async (c) => {
             function: { name: string; arguments: string };
         }> = [];
         let probeContent = "";
-        // [问题 3 修复] 保存探测/降级重试拿到的 usage，供分支 B 回吐时使用
-        let probeUsage: RawUsage = {};
+        // [US-1.3] 记录「上游是否支持 tools」的判断结果：
+        //   - 探测成功（含上游静默忽略 tools）→ true
+        //   - 探测因 tools 失败（非 2xx）→ false
+        // 后续流式请求据此决定是否携带工具参数（F4-6）。
+        let supportsTools = true;
 
         try {
             const probeResp = await fetch(apiUrl, {
@@ -246,35 +256,21 @@ router.post("/stream", async (c) => {
                 const choice = probeJson.choices?.[0];
                 toolCalls = choice?.message?.tool_calls || [];
                 probeContent = choice?.message?.content || "";
-                probeUsage = probeJson.usage || {};
+                // [US-1.3] 探测成功 → 上游接受 tools 参数，标记为支持工具
+                supportsTools = true;
             } else {
                 // 上游可能不支持 tools 参数 → 打印错误正文并降级（不抛错）
                 const errText = await probeResp.text().catch(() => "");
                 console.warn(
-                    `⚠️ 阶段一探测失败 (${probeResp.status})，降级为纯文本对话。上游返回: ${errText || "(空)"}`
+                    `⚠️ 阶段一探测失败 (${probeResp.status})，降级为纯文本流式对话。上游返回: ${errText || "(空)"}`
                 );
 
-                // 若疑似「不支持 tools」，去掉 tools 重试一次非流式探测
-                // 目的：命中则直接回吐文本，避免再发起一次流式请求
-                try {
-                    const retryResp = await fetch(apiUrl, {
-                        method: "POST",
-                        headers,
-                        body: JSON.stringify({ ...baseBody, stream: false }),
-                    });
-                    if (retryResp.ok) {
-                        const retryJson = await retryResp.json();
-                        probeContent = retryJson.choices?.[0]?.message?.content || "";
-                        probeUsage = retryJson.usage || {};   // [问题 3] 保留 usage
-                    } else {
-                        const retryErr = await retryResp.text().catch(() => "");
-                        console.warn(
-                            `⚠️ 阶段一降级重试仍失败 (${retryResp.status})。上游返回: ${retryErr || "(空)"}`
-                        );
-                    }
-                } catch (retryErr) {
-                    console.warn("⚠️ 阶段一降级重试异常", retryErr);
-                }
+                // [US-1.3] 探测失败（疑似上游不支持 tools）→ 标记为不支持工具。
+                // 说明：US-1.1 已移除「整段回吐」分支，此处原先的「非流式降级重试」
+                // 所拿到的文本已无人使用（其 toolCalls 必为空，不会进入分支 A），
+                // 属于多余请求，故移除；「上游不支持工具」的兜底统一交由分支 B 的
+                // 流式请求完成（分支 B 不携带 tools，天然兼容）。
+                supportsTools = false;
             }
         } catch (err) {
             console.warn("⚠️ 阶段一探测异常，降级为纯文本对话", err);
@@ -296,6 +292,8 @@ router.post("/stream", async (c) => {
 
                     try {
                         // 分支 A：模型请求了工具调用
+                        // [US-1.2] 工具场景保持流式：阶段二请求 stream:true 并调用 pipeStream 逐字推送，
+                        // 与分支 B 的流式行为一致；本分支不因 US-1.1 的改动而改变。
                         if (toolCalls.length > 0) {
                             // 4.1 逐个执行工具，推送 tool_call 事件，并构造回灌消息
                             const toolResultMessages: Array<Record<string, unknown>> = [];
@@ -374,30 +372,21 @@ router.post("/stream", async (c) => {
                             return;
                         }
 
-                        // 分支 B：无工具调用 → 降级为纯文本流式
-                        // 若探测已拿到完整文本，直接以流式回吐；否则重新发起流式请求
-                        if (probeContent) {
-                            send({ type: "text", content: probeContent });
-                            // [问题 3 修复] 回吐真实 usage/raw，避免信息栏显示 0 tokens / unknown
-                            const p = probeUsage.prompt_tokens ?? 0;
-                            const cTok = probeUsage.completion_tokens ?? probeContent.length;
-                            send({
-                                type: "finish",
-                                reason: "stop",
-                                usage: {
-                                    promptTokens: p,
-                                    completionTokens: cTok,
-                                    totalTokens: probeUsage.total_tokens ?? p + cTok,
-                                },
-                                raw: { model: env.LLM_MODEL, usage: probeUsage },
-                            });
-                            return;
-                        }
-
+                        // 分支 B：无工具调用 → 一律走流式请求（US-1.1：消除一次性整段输出）
+                        // 说明：不再判断 probeContent 是否已有文本，统一发起流式请求，
+                        // 保证所有回答均具备逐字过程，输出方式一致，且可被打断。
+                        // [US-1.3] 上游不支持工具时（supportsTools === false），流式请求去除工具参数，
+                        // 避免上游因无法识别 tools 而返回 400；上游支持工具时才按需携带。
                         const fallbackResp = await fetch(apiUrl, {
                             method: "POST",
                             headers,
-                            body: JSON.stringify({ ...baseBody, stream: true }),
+                            body: JSON.stringify({
+                                ...baseBody,
+                                stream: true,
+                                ...(supportsTools && toolDefs.length > 0
+                                    ? { tools: toolDefs }
+                                    : {}),
+                            }),
                         });
                         if (!fallbackResp.ok || !fallbackResp.body) {
                             const t = await fallbackResp.text().catch(() => "");
