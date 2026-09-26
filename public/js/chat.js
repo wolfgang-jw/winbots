@@ -10,6 +10,9 @@
  * 6. R3 回答可观测性：三段结构（思考 / 回答 / 信息栏）+ 会话汇总
  * 7. R1 工具调用可见：新增第 4 段「工具调用」（默认收起）
  * 8. R2 界面细节修正：删除默认问题行、固定行宽、折叠联动修正
+ * 9. US-2.1 会话唯一标识：新建会话时获取唯一 sessionId 并随请求携带
+ * 10. US-2.2 服务端持有会话历史：发送单条 message，历史由服务端持有
+ * 11. US-2.3 会话隔离：当前会话 ID 用 sessionStorage 做标签页级隔离
  */
 
 (function () {
@@ -20,7 +23,13 @@
     // ============================================
     const CONFIG = {
         API_ENDPOINT: "/api/chat/stream",
-        MAX_HISTORY: 20, // 保留的最大消息历史数
+        SESSION_ENDPOINT: "/api/chat/session",   // [US-2.1] 会话 ID 获取接口
+        MAX_HISTORY: 20, // 保留的最大消息历史数（US-2.2 起仅用于本地渲染）
+        // [US-2.2] 请求体改为 { sessionId, message }，历史由服务端持有
+        // [US-2.3] 当前活跃会话 ID 的存储键。
+        // 使用 sessionStorage（标签页级隔离）而非 localStorage（跨标签页共享），
+        // 确保同一浏览器多标签页各自持有独立会话，避免串会话（F1-3）。
+        SESSION_STORAGE_KEY: "winbots.currentSessionId",
     };
 
     // ============================================
@@ -40,6 +49,8 @@
     // 状态管理
     // ============================================
     const state = {
+        /** @type {string|null} 当前会话的唯一标识（US-2.1） */
+        sessionId: null,
         /** @type {Array<{role:string, content:string}>} 消息历史 */
         history: [],
         /** @type {boolean} 是否正在接收流式响应 */
@@ -595,11 +606,66 @@
     // ============================================
 
     /**
-     * 发送消息并接收流式响应
-     * @param {Array<{role:string, content:string}>} messages - 消息历史
+     * [US-2.3] 将当前会话 ID 保存到本标签页（sessionStorage）。
+     * 使用 sessionStorage 而非 localStorage，保证标签页之间互不共享，避免串会话。
+     * @param {string} id
+     */
+    function persistSessionId(id) {
+        try {
+            sessionStorage.setItem(CONFIG.SESSION_STORAGE_KEY, id);
+        } catch (e) {
+            console.warn("保存本标签页会话 ID 失败:", e);
+        }
+    }
+
+    /**
+     * 获取（或初始化）当前会话的唯一 ID（US-2.1）
+     * 调用服务端 /api/chat/session 接口分配一个全局唯一 ID。
+     * 失败时降级为本地生成，保证对话不因会话接口异常而中断。
+     * [US-2.3] 优先复用本标签页已保存的会话 ID（sessionStorage 标签页级隔离）。
+     * @returns {Promise<string>} 会话 ID
+     */
+    async function ensureSessionId() {
+        if (state.sessionId) return state.sessionId;
+
+        // [US-2.3] 优先复用本标签页已保存的会话 ID（sessionStorage 标签页级隔离）。
+        try {
+            const cached = sessionStorage.getItem(CONFIG.SESSION_STORAGE_KEY);
+            if (cached) {
+                state.sessionId = cached;
+                return state.sessionId;
+            }
+        } catch (e) {
+            console.warn("读取本标签页会话 ID 失败:", e);
+        }
+
+        try {
+            const resp = await fetch(CONFIG.SESSION_ENDPOINT, { method: "POST" });
+            if (resp.ok) {
+                const data = await resp.json();
+                if (data && typeof data.sessionId === "string") {
+                    state.sessionId = data.sessionId;
+                    persistSessionId(state.sessionId);   // [US-2.3] 写回本标签页
+                    return state.sessionId;
+                }
+            }
+        } catch (e) {
+            console.warn("获取会话 ID 失败，降级为本地生成:", e);
+        }
+        // 降级：本地生成，格式与服务端保持一致（sess_<ts36>_<uuid>），
+        // 以便降级 ID 亦能通过服务端 isValidSessionId 校验。
+        // crypto.randomUUID 为浏览器内置，现代浏览器均支持。
+        state.sessionId = "sess_" + Date.now().toString(36) + "_" + crypto.randomUUID();
+        persistSessionId(state.sessionId);               // [US-2.3] 写回本标签页
+        return state.sessionId;
+    }
+
+    /**
+     * 发送单条消息并接收流式响应（US-2.2：历史由服务端持有）
+     * @param {string} message - 本次用户消息内容（单条）
      * @returns {Promise<string>} - 返回助手的完整回复内容
      */
-    async function sendStreamRequest(messages) {
+    async function sendStreamRequest(message) {
         // 累积完整的助手回复内容（不会被 finishStream 清空）
         let fullContent = "";
 
@@ -608,6 +674,9 @@
         const { signal } = state.abortController;
 
         try {
+            // [US-2.1] 确保会话 ID 已就绪（懒获取，避免首次请求时 sessionId 为空）
+            await ensureSessionId();
+
             setStatus("🤔 AI 思考中...", "chat-status--thinking");
             setInputEnabled(false);
 
@@ -623,13 +692,13 @@
             // 记录本次回答开始时间（前端计时，R3.4）
             state.currentStartTime = performance.now();
 
-            // 发起流式请求
+            // 发起流式请求（US-2.2：只发单条 message，历史由服务端持有）
             const response = await fetch(CONFIG.API_ENDPOINT, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ messages }),
+                body: JSON.stringify({ sessionId: state.sessionId, message }),
                 signal,
             });
 
@@ -798,20 +867,20 @@
         // 添加用户消息
         addMessage("user", text);
 
-        // 构建消息历史
+        // [US-2.2] 本地历史仅用于界面渲染，不再发送给服务端
         state.history.push({ role: "user", content: text });
 
-        // 限制历史长度
+        // 限制本地历史长度（仅影响本地渲染，服务端另有 MAX_HISTORY 上限）
         if (state.history.length > CONFIG.MAX_HISTORY) {
             state.history = state.history.slice(-CONFIG.MAX_HISTORY);
         }
 
         // 会话累计汇总栏由 renderSessionSummary 维护，此处不再清空
 
-        // 发送请求，并将助手的回复加入历史
+        // [US-2.2] 发送单条消息（历史由服务端持有），并将助手回复加入本地历史
         state.isStreaming = true;
-        sendStreamRequest(state.history).then((assistantContent) => {
-            // 请求完成后，将助手的回复加入历史
+        sendStreamRequest(text).then((assistantContent) => {
+            // 请求完成后，将助手的回复加入本地历史（供界面渲染）
             if (assistantContent) {
                 state.history.push({
                     role: "assistant",
@@ -852,6 +921,11 @@
 
         // 启用输入
         setInputEnabled(true);
+
+        // [US-2.1] 预获取会话 ID（异步，不阻塞界面初始化）
+        ensureSessionId().then((id) => {
+            console.log("🆔 当前会话 ID:", id);
+        });
 
         console.log("🤖 Bots AI Chat 已初始化");
     }

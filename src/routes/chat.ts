@@ -36,12 +36,29 @@
  *   - [US-1.3] 上游不支持工具时的流式兼容：新增 supportsTools 状态记录探测结论，
  *     探测失败即判定「不支持工具」并移除已失效的非流式降级重试；
  *     后续流式请求据 supportsTools 去除工具参数，避免上游 400，回答仍正常逐字返回。
+ *   - [US-2.1] 会话唯一标识：新增 src/infra/session.ts 生成全局唯一会话 ID；
+ *     新增 POST /api/chat/session 分配 ID，/stream 接收并校验可选 sessionId，
+ *     前端新建会话时获取并随请求携带，为后续会话隔离与持久化奠定标识基础。
+ *   - [US-2.2] 服务端持有会话历史：扩展 src/infra/session.ts 新增内存态会话历史存取
+ *     （appendMessage / getHistory / clearHistory，上限 MAX_HISTORY=20）；
+ *     /stream 支持单条 message + sessionId 入参，按会话读取历史并拼接本次消息作为上下文，
+ *     消息格式校验改为遍历 contextMessages（避免新模式 messages 为 undefined 时崩溃），
+ *     用户消息先写、助手回复（pipeStream 累积完整正文）后写回历史；
+ *     前端改为只发送单条 message，不再回传 messages 历史数组（保留旧入参兼容）。
+ *   - [US-2.3] 会话隔离：
+ *     P2 旧模式（messages）明确不接受 sessionId，携带即 400，杜绝误用导致会话边界模糊；
+ *     P3 新模式写入前用 hasSession 判定会话归属，首次写入仅记录日志（不拒绝），
+ *        强化隔离边界的可观测性（隔离硬保证仍由 Map 按 key 提供）。
+ *   - [US-2.4] 兼容旧接口（F1-5）：收窄旧模式 sessionId 的拒绝范围——
+ *     仅当 sessionId 格式合法时才 400；格式非法/任意非空值一律静默忽略，
+ *     与改造前旧接口对未知字段的容错行为保持一致，保证既有调用方式不受影响。
  *
  * 请求体 (JSON):
  * {
  *   "messages": [
  *     { "role": "user", "content": "你好" }
- *   ]
+ *   ],
+ *   "sessionId": "sess_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301"   // US-2.1 可选
  * }
  *
  * 响应 (SSE):
@@ -57,6 +74,15 @@
 import { Hono } from "hono";
 import { env } from "@/infra/env";
 import { loadTools, getToolDefinitions, executeTool, toDisplayName } from "@/tools";   // R1: 工具调用能力
+// US-2.1: 会话唯一标识；US-2.2: 会话历史存取；US-2.3: 会话隔离（hasSession）
+import {
+    generateSessionId,
+    isValidSessionId,
+    appendMessage,
+    getHistory,
+    hasSession,
+    type SessionMessage,
+} from "@/infra/session";
 
 const router = new Hono();
 
@@ -75,16 +101,19 @@ interface RawUsage {
  *   - 权威值：上游在最后一个 chunk 返回的 usage.completion_tokens（精确）；
  *   - 兜底值：上游未返回 usage 时，累计「输出文本字符数」作为近似，
  *     字段名与注释均明确其为字符数，不再把 chunk 数量当作 token 数。
+ *
+ * [US-2.2] 返回值改为「累积的完整正文」，供 /stream 写回会话历史。
  */
 async function pipeStream(
     upstream: ReadableStream<Uint8Array>,
     send: (obj: unknown) => void
-): Promise<void> {
+): Promise<string> {
     const reader = upstream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     // 兜底统计：累计输出字符数（仅在上游不返回 usage 时使用）
     let fallbackCompletionChars = 0;
+    let fullText = "";                            // [US-2.2] 累积完整正文，供写回历史
 
     while (true) {
         const { done, value } = await reader.read();
@@ -109,6 +138,7 @@ async function pipeStream(
                 if (delta) {
                     // 累计输出字符数（兜底用）
                     fallbackCompletionChars += delta.length;
+                    fullText += delta;            // [US-2.2] 同步累积完整正文
                     send({ type: "text", content: delta });
                 }
 
@@ -135,6 +165,8 @@ async function pipeStream(
             }
         }
     }
+
+    return fullText;                              // [US-2.2] 返回完整正文
 }
 
 /**
@@ -147,17 +179,76 @@ router.post("/stream", async (c) => {
 
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
-        const { messages } = body;
+        // US-2.2：新增单条消息入参 message；保留 messages 以兼容旧调用方
+        const { messages, sessionId, message } = body;
 
-        // 校验 messages 参数
-        if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            return c.json({ error: "messages 参数必须是非空数组" }, 400);
+        // [US-2.2] 入参双模式：
+        //   模式一（新，服务端持有历史）：{ sessionId, message } → 服务端按 sessionId 存取历史；
+        //   模式二（旧，无状态）：        { messages }           → 行为与改造前完全一致。
+        // 判定规则：提供 message 即走模式一；否则要求 messages（模式二）。
+        const useServerHistory = typeof message === "string" && message.length > 0;
+
+        if (!useServerHistory) {
+            // 旧模式：messages 必须是非空数组（保持原校验）
+            if (!messages || !Array.isArray(messages) || messages.length === 0) {
+                return c.json(
+                    { error: "messages 参数必须是非空数组（或提供 message 单条消息）" },
+                    400
+                );
+            }
+        } else {
+            // 新模式：必须提供合法的 sessionId（否则无法定位会话历史）
+            if (!isValidSessionId(sessionId)) {
+                return c.json({ error: "使用 message 时 sessionId 必须为合法会话 ID" }, 400);
+            }
+        }
+
+        // [US-2.3] 旧模式（无状态）不接受 sessionId：
+        //   旧模式的历史由前端全量回传，服务端不读写任何会话存储；
+        //   若旧模式携带**格式合法的** sessionId，说明调用方想用会话功能却用错了模式，
+        //   一律拒绝并给出明确指引，避免误以为「已落盘/已续接会话」（F1-3 会话隔离）。
+        // [US-2.4] 兼容旧接口（F1-5）：收窄拒绝范围——
+        //   仅当 sessionId **格式合法**时才拒绝；格式非法/任意非空值一律「静默忽略」，
+        //   与改造前旧接口对未知字段的容错行为保持一致，避免旧调用方因误带无关字段而 400。
+        if (!useServerHistory && isValidSessionId(sessionId)) {
+            return c.json(
+                {
+                    error:
+                        "旧模式（messages）不支持 sessionId；如需按会话保存历史，请改用 { sessionId, message } 单条消息模式",
+                },
+                400
+            );
+        }
+
+        // [US-2.2] 计算本次请求的上下文消息数组：
+        //   - 新模式：读取服务端已存历史（快照） + 本次用户消息；
+        //     同时先把本次用户消息写入历史（先写用户消息，保证模型失败也不丢）。
+        //   - 旧模式：直接使用前端回传的 messages（无状态，行为不变）。
+        let contextMessages: SessionMessage[];
+        if (useServerHistory) {
+            const sid = sessionId as string;
+            // [US-2.3] 会话归属判定：区分「续接已有会话」与「首次写入（隐式新建）」。
+            // 说明：Map 以 sessionId 为 key，天然硬隔离——即便 sid 错误，
+            //       也只会写入该 sid 自己的历史，绝不污染其他会话。
+            //       此处仅做可观测性记录，便于排查异常/伪造 ID。
+            const isNewSession = !hasSession(sid);
+            if (isNewSession) {
+                console.log(`🆕 新会话首次写入: ${sid}`);
+            }
+            const historySnapshot = getHistory(sid);                 // 读取历史快照（深拷贝）
+            const userMsg: SessionMessage = { role: "user", content: message };
+            appendMessage(sid, userMsg);                             // 先写用户消息（写入即登记会话）
+            contextMessages = [...historySnapshot, userMsg];         // 快照 + 本次消息
+        } else {
+            contextMessages = messages as SessionMessage[];
         }
 
         // 校验每条消息的格式
         // 说明：允许 tool 角色（工具结果回灌），tool 消息的 content 允许为空
+        // [US-2.2] 改为遍历 contextMessages：新模式 messages 为 undefined，
+        //          若仍遍历 messages 会抛 TypeError；contextMessages 已统一两种模式的数据来源。
         const validRoles = ["user", "assistant", "system", "tool"];
-        for (const msg of messages) {
+        for (const msg of contextMessages) {
             if (!msg.role) {
                 return c.json({ error: "每条消息必须包含 role 字段" }, 400);
             }
@@ -207,13 +298,7 @@ router.post("/stream", async (c) => {
         // 与 5.4「允许 tool 角色」的设计自相矛盾，多轮/回灌场景会触发上游 400。
         const baseBody = {
             model: env.LLM_MODEL,
-            messages: messages.map((m: {
-                role: string;
-                content: string | null;
-                tool_calls?: unknown;
-                tool_call_id?: string;
-                name?: string;
-            }) => {
+            messages: contextMessages.map((m: SessionMessage) => {   // ← [US-2.2] 改用 contextMessages
                 const out: Record<string, unknown> = { role: m.role, content: m.content };
                 if (m.tool_calls !== undefined) out.tool_calls = m.tool_calls;
                 if (m.tool_call_id !== undefined) out.tool_call_id = m.tool_call_id;
@@ -368,7 +453,14 @@ router.post("/stream", async (c) => {
                                 return;
                             }
 
-                            await pipeStream(secondResp.body, send);
+                            const assistantText = await pipeStream(secondResp.body, send);
+                            // [US-2.2] 助手回复写回会话历史（仅新模式）
+                            if (useServerHistory && assistantText) {
+                                appendMessage(sessionId as string, {
+                                    role: "assistant",
+                                    content: assistantText,
+                                });
+                            }
                             return;
                         }
 
@@ -393,7 +485,14 @@ router.post("/stream", async (c) => {
                             send({ type: "error", message: `LLM API 返回错误: ${t || fallbackResp.status}` });
                             return;
                         }
-                        await pipeStream(fallbackResp.body, send);
+                        const assistantText = await pipeStream(fallbackResp.body, send);
+                        // [US-2.2] 助手回复写回会话历史（仅新模式）
+                        if (useServerHistory && assistantText) {
+                            appendMessage(sessionId as string, {
+                                role: "assistant",
+                                content: assistantText,
+                            });
+                        }
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
                         send({ type: "error", message: msg });
@@ -407,6 +506,22 @@ router.post("/stream", async (c) => {
         const message = err instanceof Error ? err.message : String(err);
         return c.json({ error: `请求处理失败: ${message}` }, 500);
     }
+});
+
+/**
+ * POST /api/chat/session
+ * 新建会话，返回全局唯一的会话 ID（US-2.1：会话唯一标识）
+ *
+ * 说明：
+ * - 本接口只负责「分配唯一 ID」，不创建任何存储记录（存储属 US-2.2 / US-4.1）。
+ * - 前端在「新建会话」时调用本接口获取 ID，之后该会话的所有请求复用此 ID。
+ *
+ * 响应 (200):
+ * { "sessionId": "sess_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301" }
+ */
+router.post("/session", (c) => {
+    const sessionId = generateSessionId();
+    return c.json({ sessionId });
 });
 
 export default router;
