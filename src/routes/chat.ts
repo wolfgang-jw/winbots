@@ -16,54 +16,22 @@
  *   阶段二：若命中工具，后端执行工具并回灌 role:"tool" 消息，再流式生成最终回答。
  * 无工具调用 / 上游不支持 tools / 工具异常时，均优雅降级为纯文本流式对话。
  *
- * R1.1 修复：
- *   - 阶段一探测失败时打印上游错误正文（此前只打印状态码，无法定位 400）
- *   - 若探测失败疑似「上游不支持 tools」，自动去掉 tools 重试一次非流式探测，
- *     命中则回吐文本，避免无谓地再发起一次流式请求
- *
  * 本次修复：
- *   - [问题 1] baseBody.messages 保留 tool_calls / tool_call_id / name 字段，
- *     避免多轮或回灌场景丢失工具字段导致上游 400。
- *   - [问题 2] tool_call 事件推送可读的 callName（toDisplayName），
- *     并额外保留 wireName 便于排查。
- *   - [问题 3] 阶段一降级重试保留上游 usage，分支 B 回吐时不再返回空 usage/raw。
- *   - [问题 4] pipeStream 精确统计 token：优先采用上游 usage.completion_tokens，
- *     上游未返回时才用「累计字符数」作为兜底（不再用 chunk 计数冒充 token 数）。
  *   - [US-1.1] 统一流式输出：移除分支 B「探测拿到文本后整段回吐」，
  *     无工具调用的回答一律改走流式请求，消除一次性整段输出路径。
- *   - [US-1.2] 保留工具场景流式：确认分支 A（工具调用 → 阶段二流式）不受 US-1.1 影响，
- *     阶段二请求保持 stream:true 并经 pipeStream 逐字推送，工具场景与普通问答体验一致。
- *   - [US-1.3] 上游不支持工具时的流式兼容：新增 supportsTools 状态记录探测结论，
- *     探测失败即判定「不支持工具」并移除已失效的非流式降级重试；
- *     后续流式请求据 supportsTools 去除工具参数，避免上游 400，回答仍正常逐字返回。
- *   - [US-2.1] 会话唯一标识：新增 src/infra/session.ts 生成全局唯一会话 ID；
- *     新增 POST /api/chat/session 分配 ID，/stream 接收并校验可选 sessionId，
- *     前端新建会话时获取并随请求携带，为后续会话隔离与持久化奠定标识基础。
- *   - [US-2.2] 服务端持有会话历史：扩展 src/infra/session.ts 新增内存态会话历史存取
- *     （appendMessage / getHistory / clearHistory，上限 MAX_HISTORY=20）；
- *     /stream 支持单条 message + sessionId 入参，按会话读取历史并拼接本次消息作为上下文，
- *     消息格式校验改为遍历 contextMessages（避免新模式 messages 为 undefined 时崩溃），
- *     用户消息先写、助手回复（pipeStream 累积完整正文）后写回历史；
- *     前端改为只发送单条 message，不再回传 messages 历史数组（保留旧入参兼容）。
- *   - [US-2.3] 会话隔离：
- *     P2 旧模式（messages）明确不接受 sessionId，携带即 400，杜绝误用导致会话边界模糊；
- *     P3 新模式写入前用 hasSession 判定会话归属，首次写入仅记录日志（不拒绝），
- *        强化隔离边界的可观测性（隔离硬保证仍由 Map 按 key 提供）。
- *   - [US-2.4] 兼容旧接口（F1-5）：收窄旧模式 sessionId 的拒绝范围——
- *     仅当 sessionId 格式合法时才 400；格式非法/任意非空值一律静默忽略，
- *     与改造前旧接口对未知字段的容错行为保持一致，保证既有调用方式不受影响。
- *   - [US-3.3] 上游取消（止损）：采用「带外取消」机制——
- *     /stream 新增可选入参 requestId，创建 AbortController 并登记取消句柄，
- *     三处上游 fetch（阶段一探测 / 阶段二流式 / 分支 B 流式）均绑定其 signal；
- *     新增 POST /api/chat/cancel 依据 requestId 触发 abort()，停止上游继续生成；
- *     pipeStream 捕获 AbortError（取消）并返回已收正文，避免误报为错误；
- *     /stream 的 finally 注销句柄并主动关流，作为前端「排空完成」信号。
+ *   - [US-1.2] 保留工具场景流式：分支 A（工具调用 → 阶段二流式）保持 stream:true。
+ *   - [US-1.3] 上游不支持工具时的流式兼容：supportsTools 门控。
+ *   - [US-2.1~2.4] 会话唯一标识 / 服务端持有历史 / 会话隔离 / 兼容旧接口。
+ *   - [US-3.3] 上游取消（止损）：带外取消 + AbortController。
+ *   - [US-4.3~4.6] 会话列表 / 详情 / 删除接口。
+ *   - [A3 修复] 助手消息落盘时补传渲染元数据（meta）：
+ *     pipeStream 现返回 { text, thinking, usage }，两处 appendMessage 写回助手消息时
+ *     携带 thinking / toolCalls / usage / model / elapsedMs / interrupted，
+ *     使 US-4.4 的「完整重现」（思考/工具/信息栏/中断标识）在端到端数据链路上真正达成。
  *
  * 请求体 (JSON):
  * {
- *   "messages": [
- *     { "role": "user", "content": "你好" }
- *   ],
+ *   "messages": [ { "role": "user", "content": "你好" } ],
  *   "sessionId": "sess_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301",  // US-2.1 可选
  *   "requestId": "req_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301"    // US-3.3 可选
  * }
@@ -71,29 +39,41 @@
  * 响应 (SSE):
  * data: {"type":"think","content":"思考过程..."}
  * data: {"type":"tool_call","id":"...","name":"local.common.get_current_time","arguments":{}}
- * data: {"type":"tool_call","id":"...","name":"local.common.get_current_time","arguments":{},"result":"{...}"}
  * data: {"type":"text","content":"你"}
- * data: {"type":"text","content":"好"}
- * data: {"type":"text","content":"！"}
- * data: {"type":"finish","reason":"stop","usage":{"promptTokens":10,"completionTokens":5,"totalTokens":15},"raw":{...}}
+ * data: {"type":"finish","reason":"stop","usage":{...},"raw":{...}}
  * data: {"type":"error","message":"错误信息"}
  */
 import { Hono } from "hono";
 import { env } from "@/infra/env";
-import { loadTools, getToolDefinitions, executeTool, toDisplayName } from "@/tools";   // R1: 工具调用能力
-// US-2.1: 会话唯一标识；US-2.2: 会话历史存取；US-2.3: 会话隔离（hasSession）
+import { loadTools, getToolDefinitions, executeTool, toDisplayName } from "@/tools";
 import {
     generateSessionId,
     isValidSessionId,
     appendMessage,
     getHistory,
     hasSession,
+    listSessions,
+    getSessionDetail,
+    deleteSession,
     type SessionMessage,
+    type MessageMeta,
 } from "@/infra/session";
-// [US-3.3] 上游取消：进行中请求的取消句柄管理
 import { registerCancel, cancelRequest, unregisterCancel } from "@/infra/cancel";
 
 const router = new Hono();
+
+/**
+ * [US-4.3] 将 epoch 毫秒格式化为本地时区可读文本（YYYY-MM-DD HH:mm:ss）。
+ * 纯函数，便于单元测试。
+ */
+function formatDateTime(epochMs: number): string {
+    const d = new Date(epochMs);
+    const p = (n: number) => String(n).padStart(2, "0");
+    return (
+        `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+        `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    );
+}
 
 /** 上游 usage 的原始结构（OpenAI 兼容） */
 interface RawUsage {
@@ -102,32 +82,37 @@ interface RawUsage {
     total_tokens?: number;
 }
 
+/** [A3] pipeStream 的返回值：正文 + 思考 + usage（供写回 meta） */
+interface PipeResult {
+    text: string;
+    thinking: string;
+    usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+}
+
 /**
- * 读取上游 SSE 流，解析 delta，转发为前端事件
- * 复用现有解析逻辑（think / text / finish）
+ * 读取上游 SSE 流，解析 delta，转发为前端事件（think / text / finish）。
  *
- * [问题 4] token 精确统计策略：
- *   - 权威值：上游在最后一个 chunk 返回的 usage.completion_tokens（精确）；
- *   - 兜底值：上游未返回 usage 时，累计「输出文本字符数」作为近似，
- *     字段名与注释均明确其为字符数，不再把 chunk 数量当作 token 数。
- *
- * [US-2.2] 返回值改为「累积的完整正文」，供 /stream 写回会话历史。
+ * [A3 修复] 返回值由「纯文本」升级为 PipeResult（text + thinking + usage），
+ *   以便 /stream 写回助手消息时携带完整渲染元数据（meta），
+ *   使历史重现能还原思考过程、信息栏（含 token/耗时/模型）。
  *
  * [US-3.3] 捕获 AbortError：上游被 /cancel 取消时，reader.read() 会抛 AbortError，
- *   这是「用户主动打断」的正常路径，返回已累积正文交由调用方正常收尾，不误报为错误。
+ *   这是「用户主动打断」的正常路径，返回已累积内容交由调用方正常收尾，不误报为错误。
  */
 async function pipeStream(
     upstream: ReadableStream<Uint8Array>,
     send: (obj: unknown) => void
-): Promise<string> {
+): Promise<PipeResult> {
     const reader = upstream.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     // 兜底统计：累计输出字符数（仅在上游不返回 usage 时使用）
     let fallbackCompletionChars = 0;
     let fullText = "";                            // [US-2.2] 累积完整正文，供写回历史
+    let fullThinking = "";                        // [A3] 累积思考过程，供写回 meta
+    let lastUsage: PipeResult["usage"] = null;    // [A3] 记录上游 usage，供写回 meta
 
-    try {                                                    // ← [US-3.3] 新增 try
+    try {
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -147,7 +132,10 @@ async function pipeStream(
                     const delta = parsed.choices?.[0]?.delta?.content || "";
                     const thinking = parsed.choices?.[0]?.delta?.reasoning_content || "";
 
-                    if (thinking) send({ type: "think", content: thinking });
+                    if (thinking) {
+                        send({ type: "think", content: thinking });
+                        fullThinking += thinking;     // [A3] 累积思考过程
+                    }
                     if (delta) {
                         // 累计输出字符数（兜底用）
                         fallbackCompletionChars += delta.length;
@@ -162,14 +150,16 @@ async function pipeStream(
                         const completionTokens =
                             usage.completion_tokens ?? fallbackCompletionChars;
                         const promptTokens = usage.prompt_tokens ?? 0;
+                        // [A3] 记录本次 usage，供写回 meta（历史重现信息栏）
+                        lastUsage = {
+                            promptTokens,
+                            completionTokens,
+                            totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
+                        };
                         send({
                             type: "finish",
                             reason: finishReason,
-                            usage: {
-                                promptTokens,
-                                completionTokens,
-                                totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-                            },
+                            usage: lastUsage,
                             raw: parsed,
                         });
                     }
@@ -178,20 +168,16 @@ async function pipeStream(
                 }
             }
         }
-    } catch (err) {                                          // ← [US-3.3] 新增 catch
-        // [US-3.3] 上游被取消（/cancel 触发 abort）：
-        //   这是「用户主动打断」的正常路径，不是错误。
-        //   已推送给前端的数据（③段）已通过 send 发出，不受影响；
-        //   此处直接结束读取，返回已累积正文，交由调用方正常收尾。
-        //   注意：不 send({type:"error"})，避免把取消误报为错误。
+    } catch (err) {
+        // [US-3.3] 上游被取消（/cancel 触发 abort）：正常路径，返回已累积内容。
         if (err instanceof Error && err.name === "AbortError") {
             console.log("⏹️ [US-3.3] 上游请求已被取消，停止读取并收尾");
-            return fullText;                                 // 返回已收正文，正常收尾
+            return { text: fullText, thinking: fullThinking, usage: lastUsage };
         }
-        throw err;                                           // 其他错误：继续上抛，由 start() 的 catch 处理
+        throw err;                                           // 其他错误：继续上抛
     }
 
-    return fullText;                              // [US-2.2] 返回完整正文
+    return { text: fullText, thinking: fullThinking, usage: lastUsage };
 }
 
 /**
@@ -204,20 +190,15 @@ router.post("/stream", async (c) => {
 
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
-        // US-2.2：新增单条消息入参 message；保留 messages 以兼容旧调用方
-        // [US-3.3] 新增可选入参 requestId：带外取消的请求标识。
-        //   为向后兼容，requestId 可选；不携带时行为与改造前完全一致。
         const { messages, sessionId, message, requestId } = body;
 
-        // [US-3.3] 校验 requestId（若提供）：必须为非空字符串，长度设上限防滥用。
-        //   非法值一律「静默忽略」（视为未提供），与旧接口对未知字段的容错一致（US-2.4）。
+        // [US-3.3] 校验 requestId（若提供）：非空字符串且长度受限；非法静默忽略。
         const hasRequestId =
             typeof requestId === "string" && requestId.length > 0 && requestId.length <= 128;
 
         // [US-2.2] 入参双模式：
-        //   模式一（新，服务端持有历史）：{ sessionId, message } → 服务端按 sessionId 存取历史；
-        //   模式二（旧，无状态）：        { messages }           → 行为与改造前完全一致。
-        // 判定规则：提供 message 即走模式一；否则要求 messages（模式二）。
+        //   模式一（新）：{ sessionId, message } → 服务端按 sessionId 存取历史；
+        //   模式二（旧）：{ messages }           → 行为与改造前完全一致。
         const useServerHistory = typeof message === "string" && message.length > 0;
 
         if (!useServerHistory) {
@@ -235,13 +216,8 @@ router.post("/stream", async (c) => {
             }
         }
 
-        // [US-2.3] 旧模式（无状态）不接受 sessionId：
-        //   旧模式的历史由前端全量回传，服务端不读写任何会话存储；
-        //   若旧模式携带**格式合法的** sessionId，说明调用方想用会话功能却用错了模式，
-        //   一律拒绝并给出明确指引，避免误以为「已落盘/已续接会话」（F1-3 会话隔离）。
-        // [US-2.4] 兼容旧接口（F1-5）：收窄拒绝范围——
-        //   仅当 sessionId **格式合法**时才拒绝；格式非法/任意非空值一律「静默忽略」，
-        //   与改造前旧接口对未知字段的容错行为保持一致，避免旧调用方因误带无关字段而 400。
+        // [US-2.3 / US-2.4] 旧模式（无状态）不接受格式合法的 sessionId：明确拒绝；
+        //   格式非法/任意非空值一律静默忽略，与旧接口对未知字段的容错一致。
         if (!useServerHistory && isValidSessionId(sessionId)) {
             return c.json(
                 {
@@ -253,16 +229,11 @@ router.post("/stream", async (c) => {
         }
 
         // [US-2.2] 计算本次请求的上下文消息数组：
-        //   - 新模式：读取服务端已存历史（快照） + 本次用户消息；
-        //     同时先把本次用户消息写入历史（先写用户消息，保证模型失败也不丢）。
+        //   - 新模式：读取服务端已存历史（快照） + 本次用户消息；先写用户消息。
         //   - 旧模式：直接使用前端回传的 messages（无状态，行为不变）。
         let contextMessages: SessionMessage[];
         if (useServerHistory) {
             const sid = sessionId as string;
-            // [US-2.3] 会话归属判定：区分「续接已有会话」与「首次写入（隐式新建）」。
-            // 说明：Map 以 sessionId 为 key，天然硬隔离——即便 sid 错误，
-            //       也只会写入该 sid 自己的历史，绝不污染其他会话。
-            //       此处仅做可观测性记录，便于排查异常/伪造 ID。
             const isNewSession = !hasSession(sid);
             if (isNewSession) {
                 console.log(`🆕 新会话首次写入: ${sid}`);
@@ -275,10 +246,7 @@ router.post("/stream", async (c) => {
             contextMessages = messages as SessionMessage[];
         }
 
-        // 校验每条消息的格式
-        // 说明：允许 tool 角色（工具结果回灌），tool 消息的 content 允许为空
-        // [US-2.2] 改为遍历 contextMessages：新模式 messages 为 undefined，
-        //          若仍遍历 messages 会抛 TypeError；contextMessages 已统一两种模式的数据来源。
+        // 校验每条消息的格式（允许 tool 角色；tool 消息 content 允许为空）
         const validRoles = ["user", "assistant", "system", "tool"];
         for (const msg of contextMessages) {
             if (!msg.role) {
@@ -290,7 +258,6 @@ router.post("/stream", async (c) => {
                     400
                 );
             }
-            // assistant 携带 tool_calls 时 content 可为空；tool 消息 content 可为空
             const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
             if (
                 msg.role !== "tool" &&
@@ -305,9 +272,6 @@ router.post("/stream", async (c) => {
         }
 
         // ── 2. 构建 Chat Completions API 请求 ──────────────────────
-        // 自动处理 API Base URL：
-        // - 如果 LLM_API_BASE 末尾已有 /v1，则直接拼接 /chat/completions
-        // - 如果末尾没有 /v1，则自动补全 /v1/chat/completions
         const base = env.LLM_API_BASE.replace(/\/+$/, "");
         const apiUrl = base.endsWith("/v1")
             ? `${base}/chat/completions`
@@ -320,17 +284,10 @@ router.post("/stream", async (c) => {
         };
 
         // 公共请求体（不含 stream / tools，按阶段拼装）
-        // DeepSeek 思考模式控制（官方文档）：
-        // - 开启: thinking.type = "enabled"（默认即开启）
-        // - 关闭: thinking.type = "disabled"
-        // - 强度: reasoning_effort = "low"/"high"/"max"
-        //
         // [问题 1 修复] 保留工具相关字段：tool_calls / tool_call_id / name。
-        // 此前仅保留 role/content，会丢弃历史消息中的工具字段，
-        // 与 5.4「允许 tool 角色」的设计自相矛盾，多轮/回灌场景会触发上游 400。
         const baseBody = {
             model: env.LLM_MODEL,
-            messages: contextMessages.map((m: SessionMessage) => {   // ← [US-2.2] 改用 contextMessages
+            messages: contextMessages.map((m: SessionMessage) => {
                 const out: Record<string, unknown> = { role: m.role, content: m.content };
                 if (m.tool_calls !== undefined) out.tool_calls = m.tool_calls;
                 if (m.tool_call_id !== undefined) out.tool_call_id = m.tool_call_id;
@@ -351,16 +308,11 @@ router.post("/stream", async (c) => {
             function: { name: string; arguments: string };
         }> = [];
         let probeContent = "";
-        // [US-1.3] 记录「上游是否支持 tools」的判断结果：
-        //   - 探测成功（含上游静默忽略 tools）→ true
-        //   - 探测因 tools 失败（非 2xx）→ false
-        // 后续流式请求据此决定是否携带工具参数（F4-6）。
+        // [US-1.3] 记录「上游是否支持 tools」的判断结果
         let supportsTools = true;
 
         // ── [US-3.3] 创建取消句柄并登记 ────────────────────────────
-        // 说明：整个 /stream 请求（含阶段一探测 + 阶段二/分支 B 流式）
-        //       共用同一个 AbortController，确保 /cancel 一次即可取消全部上游请求。
-        //       必须在阶段一探测 fetch 之前创建，供三处 fetch 共用其 signal。
+        // 整个 /stream 请求（阶段一探测 + 阶段二/分支 B 流式）共用同一 AbortController。
         const upstreamController = new AbortController();
         if (hasRequestId) {
             registerCancel(requestId as string, upstreamController);
@@ -371,7 +323,7 @@ router.post("/stream", async (c) => {
             const probeResp = await fetch(apiUrl, {
                 method: "POST",
                 headers,
-                signal: upstreamController.signal,          // ← [US-3.3] 绑定取消信号
+                signal: upstreamController.signal,
                 body: JSON.stringify({
                     ...baseBody,
                     stream: false,
@@ -384,24 +336,15 @@ router.post("/stream", async (c) => {
                 const choice = probeJson.choices?.[0];
                 toolCalls = choice?.message?.tool_calls || [];
                 probeContent = choice?.message?.content || "";
-                // [US-1.3] 探测成功 → 上游接受 tools 参数，标记为支持工具
                 supportsTools = true;
             } else {
-                // 上游可能不支持 tools 参数 → 打印错误正文并降级（不抛错）
                 const errText = await probeResp.text().catch(() => "");
                 console.warn(
                     `⚠️ 阶段一探测失败 (${probeResp.status})，降级为纯文本流式对话。上游返回: ${errText || "(空)"}`
                 );
-
-                // [US-1.3] 探测失败（疑似上游不支持 tools）→ 标记为不支持工具。
-                // 说明：US-1.1 已移除「整段回吐」分支，此处原先的「非流式降级重试」
-                // 所拿到的文本已无人使用（其 toolCalls 必为空，不会进入分支 A），
-                // 属于多余请求，故移除；「上游不支持工具」的兜底统一交由分支 B 的
-                // 流式请求完成（分支 B 不携带 tools，天然兼容）。
                 supportsTools = false;
             }
         } catch (err) {
-            // [US-3.3] 若因取消而中断探测，属正常路径，不打印为"异常"
             if (err instanceof Error && err.name === "AbortError") {
                 console.log("⏹️ [US-3.3] 阶段一探测已被取消");
             } else {
@@ -423,16 +366,18 @@ router.post("/stream", async (c) => {
                     const send = (obj: unknown) =>
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
 
+                    // [A3] 本次回答的渲染元数据（供写回 meta）
+                    const startedAt = Date.now();
+                    const collectedToolCalls: Array<{ name: string; arguments?: unknown; result?: string }> = [];
+
                     try {
                         // 分支 A：模型请求了工具调用
-                        // [US-1.2] 工具场景保持流式：阶段二请求 stream:true 并调用 pipeStream 逐字推送，
-                        // 与分支 B 的流式行为一致；本分支不因 US-1.1 的改动而改变。
+                        // [US-1.2] 工具场景保持流式：阶段二请求 stream:true 并调用 pipeStream 逐字推送。
                         if (toolCalls.length > 0) {
                             // 4.1 逐个执行工具，推送 tool_call 事件，并构造回灌消息
                             const toolResultMessages: Array<Record<string, unknown>> = [];
                             for (const tc of toolCalls) {
                                 const wireName = tc.function?.name || "";
-                                // [问题 2 修复] 展示用可读 callName
                                 const displayName = toDisplayName(wireName);
                                 let args: Record<string, unknown> = {};
                                 try {
@@ -447,8 +392,8 @@ router.post("/stream", async (c) => {
                                 send({
                                     type: "tool_call",
                                     id: tc.id,
-                                    name: displayName,      // 可读名（callName）
-                                    wireName,               // 原始名（便于排查）
+                                    name: displayName,
+                                    wireName,
                                     arguments: args,
                                 });
 
@@ -465,6 +410,13 @@ router.post("/stream", async (c) => {
                                     result,
                                 });
 
+                                // [A3] 收集工具调用记录，供写回 meta（历史重现工具段）
+                                collectedToolCalls.push({
+                                    name: displayName,
+                                    arguments: args,
+                                    result,
+                                });
+
                                 toolResultMessages.push({
                                     role: "tool",
                                     tool_call_id: tc.id,
@@ -473,8 +425,6 @@ router.post("/stream", async (c) => {
                             }
 
                             // 4.2 阶段二：回灌 assistant(tool_calls) + tool 结果，流式请求
-                            // 注意：tool_calls 原样回灌（含模型返回的 function.name），
-                            // 以符合 OpenAI 协议对 tool_call_id 配对的要求。
                             const secondMessages = [
                                 ...baseBody.messages,
                                 {
@@ -488,7 +438,7 @@ router.post("/stream", async (c) => {
                             const secondResp = await fetch(apiUrl, {
                                 method: "POST",
                                 headers,
-                                signal: upstreamController.signal,   // ← [US-3.3] 绑定取消信号
+                                signal: upstreamController.signal,
                                 body: JSON.stringify({
                                     ...baseBody,
                                     messages: secondMessages,
@@ -502,26 +452,34 @@ router.post("/stream", async (c) => {
                                 return;
                             }
 
-                            const assistantText = await pipeStream(secondResp.body, send);
-                            // [US-2.2] 助手回复写回会话历史（仅新模式）
+                            const result = await pipeStream(secondResp.body, send);
+                            const assistantText = result.text;
+                            // [US-2.2 + A3] 助手回复写回会话历史（仅新模式），携带渲染元数据
                             if (useServerHistory && assistantText) {
-                                appendMessage(sessionId as string, {
-                                    role: "assistant",
-                                    content: assistantText,
-                                });
+                                const meta: MessageMeta = {
+                                    thinking: result.thinking || undefined,
+                                    toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined,
+                                    usage: result.usage ?? undefined,
+                                    model: env.LLM_MODEL,
+                                    elapsedMs: Date.now() - startedAt,
+                                    startedAt,
+                                    interrupted: upstreamController.signal.aborted || undefined,
+                                };
+                                appendMessage(
+                                    sessionId as string,
+                                    { role: "assistant", content: assistantText },
+                                    meta
+                                );
                             }
                             return;
                         }
 
                         // 分支 B：无工具调用 → 一律走流式请求（US-1.1：消除一次性整段输出）
-                        // 说明：不再判断 probeContent 是否已有文本，统一发起流式请求，
-                        // 保证所有回答均具备逐字过程，输出方式一致，且可被打断。
-                        // [US-1.3] 上游不支持工具时（supportsTools === false），流式请求去除工具参数，
-                        // 避免上游因无法识别 tools 而返回 400；上游支持工具时才按需携带。
+                        // [US-1.3] 上游不支持工具时（supportsTools === false），流式请求去除工具参数。
                         const fallbackResp = await fetch(apiUrl, {
                             method: "POST",
                             headers,
-                            signal: upstreamController.signal,       // ← [US-3.3] 绑定取消信号
+                            signal: upstreamController.signal,
                             body: JSON.stringify({
                                 ...baseBody,
                                 stream: true,
@@ -535,19 +493,26 @@ router.post("/stream", async (c) => {
                             send({ type: "error", message: `LLM API 返回错误: ${t || fallbackResp.status}` });
                             return;
                         }
-                        const assistantText = await pipeStream(fallbackResp.body, send);
-                        // [US-2.2] 助手回复写回会话历史（仅新模式）
+                        const result = await pipeStream(fallbackResp.body, send);
+                        const assistantText = result.text;
+                        // [US-2.2 + A3] 助手回复写回会话历史（仅新模式），携带渲染元数据
                         if (useServerHistory && assistantText) {
-                            appendMessage(sessionId as string, {
-                                role: "assistant",
-                                content: assistantText,
-                            });
+                            const meta: MessageMeta = {
+                                thinking: result.thinking || undefined,
+                                usage: result.usage ?? undefined,
+                                model: env.LLM_MODEL,
+                                elapsedMs: Date.now() - startedAt,
+                                startedAt,
+                                interrupted: upstreamController.signal.aborted || undefined,
+                            };
+                            appendMessage(
+                                sessionId as string,
+                                { role: "assistant", content: assistantText },
+                                meta
+                            );
                         }
                     } catch (err) {
-                        // [US-3.3] 取消（AbortError）属正常路径，不误报为错误：
-                        //   此时上游已被 /cancel 取消，pipeStream 若已捕获并正常返回，
-                        //   通常不会走到这里；但阶段二 fetch 本身被取消等场景可能到达，
-                        //   故此处兜底：AbortError 不 send error，直接收尾。
+                        // [US-3.3] 取消（AbortError）属正常路径，不误报为错误。
                         if (err instanceof Error && err.name === "AbortError") {
                             console.log("⏹️ [US-3.3] 上游请求已取消（start 兜底）");
                         } else {
@@ -555,7 +520,7 @@ router.post("/stream", async (c) => {
                             send({ type: "error", message: msg });
                         }
                     } finally {
-                        // [US-3.3] 注销取消句柄（幂等）：无论成功/失败/取消都清理，避免泄漏。
+                        // [US-3.3] 注销取消句柄（幂等）。
                         if (hasRequestId) {
                             unregisterCancel(requestId as string);
                         }
@@ -572,14 +537,8 @@ router.post("/stream", async (c) => {
 
 /**
  * POST /api/chat/session
- * 新建会话，返回全局唯一的会话 ID（US-2.1：会话唯一标识）
- *
- * 说明：
- * - 本接口只负责「分配唯一 ID」，不创建任何存储记录（存储属 US-2.2 / US-4.1）。
- * - 前端在「新建会话」时调用本接口获取 ID，之后该会话的所有请求复用此 ID。
- *
- * 响应 (200):
- * { "sessionId": "sess_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301" }
+ * 新建会话，返回全局唯一的会话 ID（US-2.1）
+ * 响应 (200): { "sessionId": "sess_..." }
  */
 router.post("/session", (c) => {
     const sessionId = generateSessionId();
@@ -587,24 +546,67 @@ router.post("/session", (c) => {
 });
 
 /**
+ * GET /api/chat/sessions
+ * 列出全部会话摘要，按最后活动时间倒序（US-4.3：会话列表，F2-3）
+ * 响应 (200): { "sessions": [ { id, title, createdAt, updatedAt, updatedAtText, messageCount } ] }
+ */
+router.get("/sessions", (c) => {
+    const sessions = listSessions();
+    const items = sessions.map((s) => ({
+        ...s,
+        updatedAtText: formatDateTime(s.updatedAt),
+    }));
+    return c.json({ sessions: items });
+});
+
+/**
+ * GET /api/chat/sessions/:id
+ * 读取单个会话的详情：元信息 + 全部消息（含 meta）（US-4.4：打开历史会话并完整重现）
+ * 响应 (200): { "session": {...}, "messages": [ { role, content, meta } ] }
+ * 响应 (400): { "error": "会话 ID 格式非法" }
+ * 响应 (404): { "error": "会话不存在" }
+ */
+router.get("/sessions/:id", (c) => {
+    const id = c.req.param("id");
+    if (!isValidSessionId(id)) {
+        return c.json({ error: "会话 ID 格式非法" }, 400);
+    }
+    const detail = getSessionDetail(id);
+    if (!detail.session) {
+        return c.json({ error: "会话不存在" }, 404);
+    }
+    return c.json({
+        session: {
+            ...detail.session,
+            updatedAtText: formatDateTime(detail.session.updatedAt),
+        },
+        messages: detail.messages,
+    });
+});
+
+/**
+ * DELETE /api/chat/sessions/:id
+ * 删除指定会话及其全部消息（US-4.6：删除会话，F2-7）
+ * 响应 (200): { "ok": true, "deleted": true }
+ * 响应 (400): { "error": "会话 ID 格式非法" }
+ * 响应 (404): { "error": "会话不存在" }
+ */
+router.delete("/sessions/:id", (c) => {
+    const id = c.req.param("id");
+    if (!isValidSessionId(id)) {
+        return c.json({ error: "会话 ID 格式非法" }, 400);
+    }
+    const deleted = deleteSession(id);
+    if (!deleted) {
+        return c.json({ error: "会话不存在" }, 404);
+    }
+    return c.json({ ok: true, deleted: true });
+});
+
+/**
  * POST /api/chat/cancel
  * 取消一个进行中的上游请求（US-3.3：上游取消 / 止损）
- *
- * 带外取消机制（需求文档 2.3.4）：
- * - 前端发起对话时携带 requestId；
- * - 用户打断时，前端「不切断本地流」，而是另发本请求携带该 requestId；
- * - 服务端据此定位并 abort() 对应的上游模型请求，停止继续生成（止损）；
- * - 上游取消后，/stream 会将已收数据推送完毕并主动关流，作为「排空完成」信号。
- *
- * 幂等性：
- * - 未知 / 已结束 / 重复取消的 requestId，均返回 200 且 cancelled=false，不报错。
- *
- * 请求体 (JSON):
- * { "requestId": "req_xxx" }
- *
- * 响应 (200):
- * { "ok": true, "cancelled": true }    // 成功取消了一个进行中的请求
- * { "ok": true, "cancelled": false }   // 未找到（已结束 / 未知 ID），幂等成功
+ * 响应 (200): { "ok": true, "cancelled": true | false }
  */
 router.post("/cancel", async (c) => {
     let requestId: unknown;
@@ -612,11 +614,9 @@ router.post("/cancel", async (c) => {
         const body = await c.req.json();
         requestId = body?.requestId;
     } catch {
-        // 请求体非法（非 JSON）：按未提供处理，返回幂等成功
         return c.json({ ok: true, cancelled: false });
     }
 
-    // 校验：非空字符串且长度受限，非法一律按「未找到」处理（不报错）
     if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) {
         return c.json({ ok: true, cancelled: false });
     }

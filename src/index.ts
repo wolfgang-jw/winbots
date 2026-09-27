@@ -18,6 +18,7 @@ import healthRoute from "@/routes/health";
 import chatRoute from "@/routes/chat";
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
+import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
 
 // ============================================
 // 创建应用实例
@@ -49,6 +50,8 @@ app.use("/*", serveStatic({ root: resolve(import.meta.dir, "../public") }));
 // ============================================
 const gracefulShutdown = async (signal: string) => {
     console.log(`\n📢 收到 ${signal} 信号，正在优雅关闭...`);
+    // [US-4.1] 关闭数据库：checkpoint 后 close，确保 WAL 数据落盘（N3）
+    closeDb();
     console.log("✅ 服务已关闭，进程退出。");
     process.exit(0);
 };
@@ -60,6 +63,10 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 // 启动服务器
 // ============================================
 const port = env.APP_PORT;
+
+// [US-4.1] 初始化本地数据库（建表 + PRAGMA），保证首个请求前存储就绪
+//   若数据目录不可写等问题，在此阶段快速失败，避免运行期才暴露。
+initDb();
 
 console.log("\n" + "=".repeat(60));
 console.log("🚀 Bots 服务启动成功！");

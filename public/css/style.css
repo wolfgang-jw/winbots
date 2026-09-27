@@ -993,3 +993,219 @@ padding: 12px 16px;
     max-width: 100% !important;
     flex: 0 0 auto !important;
 }
+
+
+/* ============================================
+   US-4.8 顶部菜单与多视图切换
+   ============================================ */
+
+/* ---------- M0 关键规则：强制 hidden 生效 ----------
+   说明：.chat-layout / .history-layout 均显式 display:flex，
+   会覆盖 hidden 属性默认的 display:none，导致三视图同时显示、切换失效。
+   必须用 !important 强制隐藏，保证视图切换真正生效。 */
+[hidden] {
+    display: none !important;
+}
+
+/* ---------- M1 顶部菜单 ---------- */
+.top-menu {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.top-menu__item {
+    background: rgba(255, 255, 255, 0.15);
+    color: var(--white);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    padding: 6px 20px;
+    border-radius: 20px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s, transform 0.1s;
+}
+
+.top-menu__item:hover {
+    background: rgba(255, 255, 255, 0.28);
+}
+
+.top-menu__item:active {
+    transform: scale(0.97);
+}
+
+.top-menu__item--active {
+    background: var(--egg-yellow);
+    color: var(--gray-800);
+    border-color: var(--egg-yellow);
+}
+
+/* ---------- M2 历史视图 ---------- */
+.history-layout {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 140px);
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px;
+    width: 100%;
+}
+
+.history-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.history-header__title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--gray-800);
+}
+
+.history-new-btn {
+    background: linear-gradient(135deg, var(--tomato-red), var(--tomato-red-dark));
+    color: var(--white);
+    border: none;
+    padding: 8px 18px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+}
+
+.history-new-btn:hover {
+    opacity: 0.9;
+}
+
+.history-new-btn:active {
+    transform: scale(0.97);
+}
+
+.history-list {
+    list-style: none;
+    overflow-y: auto;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.history-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--white);
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+}
+
+.history-item:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow);
+    border-color: var(--egg-yellow-dark);
+}
+
+.history-item__main {
+    flex: 1;
+    min-width: 0;
+}
+
+.history-item__title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--gray-800);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 4px;
+}
+
+.history-item__meta {
+    font-size: 0.78rem;
+    color: var(--gray-600);
+}
+
+.history-item__delete {
+    background: transparent;
+    color: var(--tomato-red);
+    border: 1px solid var(--tomato-red-light);
+    padding: 6px 14px;
+    border-radius: 16px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.2s, color 0.2s;
+}
+
+.history-item__delete:hover {
+    background: var(--tomato-red);
+    color: var(--white);
+}
+
+.history-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+    color: var(--gray-600);
+    text-align: center;
+    padding: 40px;
+}
+
+.history-empty__icon {
+    font-size: 3.5rem;
+    margin-bottom: 12px;
+}
+
+.history-empty__title {
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--gray-800);
+    margin-bottom: 6px;
+}
+
+.history-empty__desc {
+    font-size: 0.88rem;
+    color: var(--gray-600);
+}
+
+/* ---------- M3 状态视图（iframe 复用既有状态页） ---------- */
+.status-view {
+    flex: 1;
+    width: 100%;
+    min-height: calc(100vh - 140px);
+}
+
+.status-view__frame {
+    display: block;
+    width: 100%;
+    height: calc(100vh - 140px);
+    border: none;
+}
+
+/* ---------- M4 响应式 ---------- */
+@media (max-width: 600px) {
+    .history-layout {
+        height: calc(100vh - 120px);
+        padding: 12px;
+    }
+
+    .top-menu__item {
+        padding: 6px 14px;
+        font-size: 0.82rem;
+    }
+
+    .status-view,
+    .status-view__frame {
+        min-height: calc(100vh - 120px);
+        height: calc(100vh - 120px);
+    }
+}

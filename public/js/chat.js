@@ -21,6 +21,12 @@
  * 17. US-3.6 打断 usage 记 0 与信息栏：被打断回答补「已中断」信息栏，usage 记 0 且不累加
  * 18. US-3.7 防重复收尾：新增 completed 幂等标记 + finalizeOnce 统一收尾入口，保证同一次回答只收尾一次
  * 19. US-3.8 排空超时兜底：新增 drainTimedOut 显式超时标记，使「排空超时」可识别、可观测、可断言
+ * 20. US-4.4 打开历史会话并完整重现：新增静态重现渲染路径（renderHistoryThink/Tools/Message）
+ *     与 openSession，复用现有 CSS 类名保证与实时对话显示一致
+ * 21. US-4.5 继续对话：openSession 增加 4 处加固（流式守卫 / 统计复位 / 本地历史同步 / 聚焦输入框）
+ * 22. US-4.7 新建会话：新增 newSession() 主动分配全新会话并复位界面（F2-8）
+ * 23. US-4.8 顶部菜单与多视图：新增 switchView() 在「会话/历史/状态」间切换（F2-9）
+ * 24. US-4.8 历史视图：新增 renderSessionList() 渲染会话列表（打开/删除/新建）
  */
 
 (function () {
@@ -59,6 +65,14 @@
         status: document.getElementById("chat-status"),
         usage: document.getElementById("chat-usage"),
         // R2-1：已删除默认问题行（#chat-suggestions），此处不再缓存其引用
+        // [US-4.8] 顶部菜单与多视图元素
+        menuItems: document.querySelectorAll(".top-menu__item"),
+        viewChat: document.getElementById("view-chat"),
+        viewHistory: document.getElementById("view-history"),
+        viewStatus: document.getElementById("view-status"),
+        historyList: document.getElementById("history-list"),
+        historyEmpty: document.getElementById("history-empty"),
+        historyNewBtn: document.getElementById("history-new-btn"),
     };
 
     // ============================================
@@ -75,78 +89,29 @@
         abortController: null,
         /** @type {boolean} [US-3.1] 用户是否已请求打断（打断入口标志） */
         stopRequested: false,
-        /**
-         * @type {boolean} [US-3.2] 是否处于"排空态"。
-         * 语义：已请求打断，正在继续接收并显示在途数据（③④⑤ 段），
-         *       直至读取到流结束（done）或排空超时。
-         * 默认 false；打断时置 true；收尾时复位 false。
-         */
+        /** @type {boolean} [US-3.2] 是否处于"排空态" */
         draining: false,
-        /**
-         * @type {boolean} [US-3.8] 是否已发生"排空超时"（显式超时标记）。
-         * 语义：与 draining 正交——draining 表示"用户是否打断"，本字段表示
-         *       "打断后是否已超过排空超时被强制收尾"。
-         *   - 打断时随 draining 一并保持 false；仅在超时回调中置 true；
-         *   - catch 的 AbortError 分支据此判定"超时中断"，稳定走打断收尾
-         *     （渲染"已中断"信息栏），不因 draining 的时序复位而丢失；
-         *   - finally 复位为 false，保证下一轮干净。
-         * 与 draining 的区别：draining 决定"以何种方式收尾"，本字段决定
-         *   "是否由超时触发收尾"，二者语义正交、不可互相替代。
-         */
+        /** @type {boolean} [US-3.8] 是否已发生"排空超时"（显式超时标记） */
         drainTimedOut: false,
-        /**
-         * @type {ReturnType<typeof setTimeout>|null} [US-3.2] 排空超时计时器句柄。
-         * 打断时启动；排空完成/超时/收尾时清理，避免定时器泄漏。
-         */
+        /** @type {ReturnType<typeof setTimeout>|null} [US-3.2] 排空超时计时器句柄 */
         drainTimer: null,
-        /**
-         * @type {string|null} [US-3.3] 本次对话请求的唯一标识（requestId）。
-         * 语义：发起 /stream 时生成并随请求体发送；打断时据此调用取消接口，
-         *       取消对应的上游模型请求。请求结束后清空。
-         */
+        /** @type {string|null} [US-3.3] 本次对话请求的唯一标识（requestId） */
         currentRequestId: null,
         /** @type {string} 当前正在累积的助手消息 */
         currentAssistantContent: "",
-        /**
-         * @type {HTMLElement|null} 当前助手消息的根元素（.message）
-         * 注意：这是 .message 根节点，真正的气泡是它内部的 .message__bubble。
-         * 插入思考段/信息栏时必须下钻到 .message__bubble，否则会插到 .message
-         * 上，与头像、气泡一起被 .message 的横向 flex 排成一行。
-         */
+        /** @type {HTMLElement|null} 当前助手消息的根元素（.message） */
         currentBubbleEl: null,
-        /** @type {HTMLElement|null} 当前思考块元素（无思考内容时为 null） */
+        /** @type {HTMLElement|null} 当前思考块元素 */
         currentThinkEl: null,
         /** @type {string} 当前正在累积的思考内容 */
         currentThinkContent: "",
-        /** @type {HTMLElement|null} 当前信息栏元素 */
-        currentInfoEl: null,
-        /** @type {HTMLElement|null} 当前工具调用段元素（第 4 段） */
-        currentToolEl: null,
-        /**
-         * @type {HTMLElement|null} 当前回答段容器（总开关）
-         * @deprecated [US-3.5] 该字段自引入以来从未被赋值/读取/复位，属历史遗留死字段。
-         *   回答段容器现由 createMessageEl() 内局部创建（answerEl），无需全局引用。
-         *   保留声明仅为避免潜在外部引用报错；建议后续 US 或重构时移除。
-         */
-        currentAnswerEl: null,
-        /**
-         * @type {string} [US-3.6] 本次回答的模型名（暂存）。
-         * 语义：正常路径由 finish 事件的 raw.model 提供；但"打断路径可能收不到 finish"，
-         *       故在流处理中提前暂存，供打断信息栏（F3-9）兜底使用。
-         * 每轮回答开始时复位为空串；收尾（finally / sendMessage）一并复位。
-         */
-        currentModel: "",
-        /**
-         * @type {boolean} [US-3.7] 本次回答是否已收尾（幂等标记，防重复收尾）。
-         * 语义：为"同一次回答"引入的显式收尾标记，保证"正常结束"与"打断收尾"
-         *       不会对同一次回答重复执行（F3-11）。
-         *   - 每轮回答开始时复位为 false（sendStreamRequest 开头）；
-         *   - 任一收尾路径经 finalizeOnce() 实际收尾后置为 true；
-         *   - 其余收尾路径检测到 true 即跳过，天然幂等；
-         *   - finally 兜底复位为 false，保证下一轮干净。
-         * 与 draining 的区别：draining 决定"以何种方式收尾"（正常/打断），
-         *   completed 决定"是否还需要收尾"，二者语义正交、不可互相替代。
-         */
+      /** @type {HTMLElement|null} 当前信息栏元素 */
+      currentInfoEl: null,
+       /** @type {HTMLElement|null} 当前工具调用段元素（第 4 段） */
+       currentToolEl: null,
+       /** @type {string} [US-3.6] 本次回答的模型名（暂存） */
+       currentModel: "",
+        /** @type {boolean} [US-3.7] 本次回答是否已收尾（幂等标记） */
         completed: false,
         /** @type {number} 本次回答开始时间（performance.now()） */
         currentStartTime: 0,
@@ -158,6 +123,8 @@
             totalTokens: 0,
             elapsedMs: 0,
         },
+        /** @type {string} [US-4.8] 当前视图：chat / history / status */
+        currentView: "chat",
     };
 
     // ============================================
@@ -244,8 +211,6 @@
 
     /**
      * 获取指定 .message 根元素内真正的气泡元素（.message__bubble）
-     * 思考段 / 回答段 / 信息栏三段都必须挂在气泡内部，才能随气泡纵向堆叠；
-     * 若挂到 .message 上，会与头像、气泡一起被 .message 的横向 flex 排成一行。
      * @param {HTMLElement} messageEl - .message 根元素
      * @returns {HTMLElement} - .message__bubble 元素（找不到时回退为 messageEl）
      */
@@ -317,18 +282,6 @@
 
     /**
      * [US-3.6] 渲染"已中断"信息栏（F3-9）。
-     *
-     * 语义：用户打断后，为被打断的回答补一条信息栏，展示：
-     *   - "已中断"标识（区别于正常完成的"🤖 模型名"）；
-     *   - 模型名（来自 state.currentModel，缺失时显示 unknown）；
-     *   - 开始时刻与耗时（来自 state.currentStartTime）；
-     *   - token 记为 0（F3-8：不估算、不累加）。
-     *
-     * 关键约束：
-     *   1. **必须在 US-3.5 的 finally 清理之前调用**（依赖 currentBubbleEl / currentStartTime）；
-     *   2. **只读 state，不写 state.sessionStats**（打断回答不计入会话累计，F3-8）；
-     *   3. 复用 renderInfoBar（同一套折叠交互与详情体），仅通过 info.interrupted 区分展示。
-     *
      * @returns {HTMLElement|null} 信息栏元素；无气泡时返回 null
      */
     function renderInterruptedInfoBar() {
@@ -359,7 +312,6 @@
 
     /**
      * 渲染工具调用段（第 4 段，默认折叠）
-     * 插入到气泡内、回答段之前（思考段之后），不破坏三段纵向堆叠
      * @param {HTMLElement} messageEl - .message 根元素
      * @param {{name:string, arguments:object, result?:string}} info
      * @returns {HTMLElement}
@@ -420,6 +372,170 @@
         }
         line.textContent = text;
         body.appendChild(line);
+
+        return el;
+    }
+
+    /**
+     * [US-4.4] 静态渲染思考块（历史重现专用，F2-5）。
+     * @param {HTMLElement} bubble - 目标气泡元素（.message__bubble）
+     * @param {string} thinking - 完整思考文本
+     * @returns {HTMLElement|null} 思考块元素；无内容时返回 null
+     */
+    function renderHistoryThink(bubble, thinking) {
+        if (!bubble || !thinking) return null;
+
+        const thinkEl = document.createElement("div");
+        thinkEl.className = "message__think";
+        thinkEl.style.width = "100%";
+
+        // 标题（可折叠）
+        const header = document.createElement("div");
+        header.className = "message__think-header";
+        header.innerHTML = '<span class="message__think-icon">💭</span> 思考过程'
+            + '<span class="message__think-arrow">▸</span>';
+        thinkEl.appendChild(header);
+
+        // 主体（默认收起，与实时对话一致）
+        const body = document.createElement("div");
+        body.className = "message__think-body";
+        body.style.display = "none";
+        body.textContent = thinking;   // 纯文本，避免 Markdown 干扰
+        thinkEl.appendChild(body);
+
+        // 折叠交互
+        header.addEventListener("click", () => {
+            const arrow = header.querySelector(".message__think-arrow");
+            if (body.style.display === "none") {
+                body.style.display = "block";
+                arrow.textContent = "▾";
+            } else {
+                body.style.display = "none";
+                arrow.textContent = "▸";
+            }
+        });
+
+        // 插入到气泡最前面（与实时对话一致：思考段在第 1 段）
+        bubble.insertBefore(thinkEl, bubble.firstChild);
+        return thinkEl;
+    }
+
+    /**
+     * [US-4.4] 静态渲染工具调用段（历史重现专用，F2-5）。
+     * @param {HTMLElement} bubble - 目标气泡元素（.message__bubble）
+     * @param {Array<{name:string, arguments?:object, result?:string}>} toolCalls - 工具调用数组
+     * @returns {HTMLElement|null} 工具段元素；无调用时返回 null
+     */
+    function renderHistoryTools(bubble, toolCalls) {
+        if (!bubble || !Array.isArray(toolCalls) || toolCalls.length === 0) return null;
+
+        const el = document.createElement("div");
+        el.className = "message__tool";
+
+        // 标题（可折叠）
+        const header = document.createElement("div");
+        header.className = "message__tool-header";
+        header.innerHTML = '<span class="message__tool-icon">🔧</span> 工具调用'
+            + '<span class="message__tool-arrow">▸</span>';
+        el.appendChild(header);
+
+        // 主体（默认收起）
+        const body = document.createElement("div");
+        body.className = "message__tool-body";
+        body.style.display = "none";
+        el.appendChild(body);
+
+        // 逐条追加调用信息（名称 + 参数 + 结果）
+        for (const tc of toolCalls) {
+            const line = document.createElement("div");
+            line.className = "message__tool-item";
+
+            let text = `调用：${tc.name}`;
+            if (tc.arguments && Object.keys(tc.arguments).length > 0) {
+                text += `\n参数：${JSON.stringify(tc.arguments)}`;
+            }
+            if (tc.result !== undefined) {
+                text += `\n结果：${tc.result}`;
+            }
+            line.textContent = text;
+            body.appendChild(line);
+        }
+
+        // 折叠交互
+        header.addEventListener("click", () => {
+            const arrow = header.querySelector(".message__tool-arrow");
+            if (body.style.display === "none") {
+                body.style.display = "block";
+                arrow.textContent = "▾";
+            } else {
+                body.style.display = "none";
+                arrow.textContent = "▸";
+            }
+        });
+
+        // 插入到气泡内、回答段之前（与实时对话一致：工具段在思考段之后、回答段之前）
+        const answerEl = bubble.querySelector(".message__answer");
+        if (answerEl) {
+            bubble.insertBefore(el, answerEl);
+        } else {
+            bubble.appendChild(el);
+        }
+        return el;
+    }
+
+    /**
+     * [US-4.4] 静态渲染一条历史消息（历史重现专用，F2-4/F2-5）。
+     * @param {{role:string, content:string|null, meta:object|null}} msg - 历史消息
+     * @returns {HTMLElement} 消息根元素（.message）
+     */
+    function renderHistoryMessage(msg) {
+        const role = msg.role === "assistant" ? "assistant"
+            : (msg.role === "user" ? "user" : "error");
+
+        // 1. 复用骨架（assistant 会创建「回答段」；user/error 直接渲染正文）
+        const el = createMessageEl(role, msg.content || "");
+        const bubble = getBubbleOf(el);
+
+        // 2. 非 assistant：仅正文，直接返回
+        if (role !== "assistant") {
+            return el;
+        }
+
+        // 3. 移除流式光标：createMessageEl 会为 assistant 创建 .message__cursor，
+        //    历史重现是静态的，不应有闪烁光标（与实时对话完成态一致）。
+        const cursor = bubble.querySelector(".message__cursor");
+        if (cursor) cursor.remove();
+
+        const meta = msg.meta || {};
+
+        // 4. 思考段（第 1 段）：插到气泡最前
+        if (meta.thinking) {
+            renderHistoryThink(bubble, meta.thinking);
+        }
+
+        // 5. 工具段（第 4 段）：插到回答段之前
+        if (Array.isArray(meta.toolCalls) && meta.toolCalls.length > 0) {
+            renderHistoryTools(bubble, meta.toolCalls);
+        }
+
+        // 6. 信息栏（第 3 段）：追加到气泡末尾
+        //    复用 renderInfoBar（其入参为 .message 根元素，内部自行下钻到气泡）
+        const usage = meta.usage || { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+        const elapsedMs = typeof meta.elapsedMs === "number" ? meta.elapsedMs : 0;
+        const startTime = meta.startedAt ? new Date(meta.startedAt)
+            : new Date(Date.now() - elapsedMs);
+
+        renderInfoBar(el, {
+            model: meta.model || "",
+            startTime,
+            elapsedMs,
+            usage,
+            raw: meta,
+            interrupted: !!meta.interrupted,   // [US-3.6] 中断态信息栏
+        });
+
+        // 7. 绑定回答段折叠联动（与 addMessage 中 assistant 的逻辑一致）
+        bindAnswerToggle(el);
 
         return el;
     }
@@ -518,6 +634,46 @@
     }
 
     /**
+     * [US-4.4] 为助手消息绑定「回答段折叠联动」（从 addMessage 抽取的公共逻辑）。
+     * @param {HTMLElement} el - 消息根元素（.message）
+     */
+    function bindAnswerToggle(el) {
+        const answerHeader = el.querySelector(".message__answer-header");
+        const answerBody = el.querySelector(".message__answer-body");
+        if (!answerHeader || !answerBody) return;
+
+        answerHeader.addEventListener("click", () => {
+            const arrow = answerHeader.querySelector(".message__answer-arrow");
+            const collapsed = answerBody.style.display === "none";
+            if (collapsed) {
+                answerBody.style.display = "block";
+                arrow.textContent = "▾";
+
+                const thinkEl = el.querySelector(".message__think");
+                if (thinkEl) thinkEl.style.display = "";
+
+                const toolEl = el.querySelector(".message__tool");
+                if (toolEl) toolEl.style.display = "";
+
+                const infoEl = el.querySelector(".message__info");
+                if (infoEl) infoEl.style.display = "";
+            } else {
+                answerBody.style.display = "none";
+                arrow.textContent = "▸";
+
+                const thinkEl = el.querySelector(".message__think");
+                if (thinkEl) thinkEl.style.display = "none";
+
+                const toolEl = el.querySelector(".message__tool");
+                if (toolEl) toolEl.style.display = "none";
+
+                const infoEl = el.querySelector(".message__info");
+                if (infoEl) infoEl.style.display = "none";
+            }
+        });
+    }
+
+    /**
      * 添加消息到列表
      * @param {string} role
      * @param {string} content
@@ -532,46 +688,9 @@
         $dom.messages.appendChild(el);
 
         // 助手消息：为回答段标题绑定折叠联动（回答段为三段总开关）
+        // [US-4.4] 逻辑抽取为 bindAnswerToggle，供实时对话与历史重现共用
         if (role === "assistant") {
-            const answerHeader = el.querySelector(".message__answer-header");
-            const answerBody = el.querySelector(".message__answer-body");
-            if (answerHeader && answerBody) {
-                answerHeader.addEventListener("click", () => {
-                    const arrow = answerHeader.querySelector(".message__answer-arrow");
-                    const collapsed = answerBody.style.display === "none";
-                    if (collapsed) {
-                        // 展开回答段：仅展开回答段；思考段/工具段/信息栏恢复"区块可见"，
-                        // 但保持各自 body 的原有展开/收起状态（不强制展开）
-                        answerBody.style.display = "block";
-                        arrow.textContent = "▾";
-
-                        const thinkEl = el.querySelector(".message__think");
-                        if (thinkEl) thinkEl.style.display = "";
-
-                        const toolEl = el.querySelector(".message__tool");
-                        if (toolEl) toolEl.style.display = "";
-
-                        const infoEl = el.querySelector(".message__info");
-                        if (infoEl) infoEl.style.display = "";
-                    } else {
-                        // 折叠回答段：思考段 + 工具段 + 信息栏段整体不可见（含标题行）
-                        answerBody.style.display = "none";
-                        arrow.textContent = "▸";
-
-                        // 隐藏思考段整个区块（含标题行）
-                        const thinkEl = el.querySelector(".message__think");
-                        if (thinkEl) thinkEl.style.display = "none";
-
-                        // 隐藏工具调用段整个区块（含标题行，R1 第 4 段）
-                        const toolEl = el.querySelector(".message__tool");
-                        if (toolEl) toolEl.style.display = "none";
-
-                        // 隐藏信息栏整个区块（含摘要行）
-                        const infoEl = el.querySelector(".message__info");
-                        if (infoEl) infoEl.style.display = "none";
-                    }
-                });
-            }
+            bindAnswerToggle(el);
         }
 
         // 滚动到底部
@@ -697,27 +816,8 @@
 
     /**
      * [US-3.7] 统一收尾入口（幂等，防重复收尾，F3-11）。
-     *
-     * 语义：同一次回答的收尾动作（移除光标 + 渲染信息栏 + 终态提示）
-     *       必须"只执行一次"。本函数是所有收尾路径的唯一入口：
-     *         - case "finish" 正常路径（P1）
-     *         - 循环退出后（P4）
-     *         - catch 的 AbortError 分支（P5 / P6）
-     *
-     * 幂等机制：
-     *   1. 进入时检查 state.completed，若已为 true 直接返回（不重复收尾）；
-     *   2. 执行收尾体后置 state.completed = true；
-     *   3. state.completed 的生命周期与"一次回答"对齐（轮初/轮末复位）。
-     *
-     * 关键约束：
-     *   - 必须在 US-3.5 的 finally 清理之前调用（依赖 currentBubbleEl / currentStartTime）；
-     *   - 本函数只读 state、不写 sessionStats（usage 记 0 由 US-3.6 保证）；
-     *   - 不修改任何既有收尾动作的"内容"，仅将其收敛到一处并加幂等保护。
-     *
-     * @param {boolean} interrupted - 是否为"打断收尾"：
-     *        true  → 渲染"已中断"信息栏 + "⏹️ 已停止"提示（US-3.4/3.6）；
-     *        false → 正常收尾（信息栏与"✅ 完成"由调用方在收尾前/后处理，见第三章）。
-     * @returns {boolean} - 本次是否实际执行了收尾（true=执行；false=已收尾过，跳过）
+     * @param {boolean} interrupted - 是否为"打断收尾"
+     * @returns {boolean} - 本次是否实际执行了收尾
      */
     function finalizeOnce(interrupted) {
         // 幂等保护：已收尾则直接返回，避免重复渲染信息栏 / 重复提示（F3-11）
@@ -737,8 +837,6 @@
             setStoppedStatus();
         } else {
             // 正常收尾：终态提示由调用方负责（保持原"✅ 完成"逻辑不变，零回归）
-            //   说明：正常路径的信息栏 + usage 累加在 case "finish" 内已完成，
-            //         此处不重复处理，仅确保收尾动作只执行一次。
         }
 
         return true;
@@ -756,13 +854,6 @@
 
     /**
      * [US-3.4] 设置"打断/停止"状态提示（统一入口，显式非错误样式）。
-     *
-     * 语义（F3-4）：打断过程与结果以"已停止/已中断"提示，**不得呈现为错误**。
-     *   - 统一文案：终态固定为 "⏹️ 已停止"，可选追加时间；
-     *   - 显式样式：固定使用 "chat-status--stopped"（非错误色），
-     *     不再依赖 .chat-status 的默认灰色（把"非错误"从隐式约定变为显式契约）；
-     *   - 集中收口：所有打断相关提示均经此函数，避免文案/样式再次分散。
-     *
      * @param {boolean} [withTime=true] - 是否追加当前时间（终态默认追加）
      */
     function setStoppedStatus(withTime = true) {
@@ -801,7 +892,6 @@
 
     /**
      * [US-3.1] 控制「停止」入口的显隐。
-     * 仅在 AI 流式输出进行中显示，非输出状态隐藏。
      * @param {boolean} visible
      */
     function setStopBtnVisible(visible) {
@@ -811,19 +901,6 @@
 
     /**
      * [US-3.2 / US-3.8] 启动排空超时兜底。
-     *
-     * 语义：打断后若在 CONFIG.DRAIN_TIMEOUT_MS 内仍未读到流结束（服务端未关流），
-     *       则强制收尾，避免读取循环永久阻塞、界面卡死。
-     *
-     * 超时动作：
-     *   1. 置显式超时标记 state.drainTimedOut = true（US-3.8），
-     *      使"排空超时"可被 catch 分支稳定识别（不依赖 draining 的时序）；
-     *   2. 记录超时日志（含 requestId，便于观测）；
-     *   3. 主动取消本地读取器（释放底层连接），让读取循环尽快退出。
-     *
-     * 实现说明：本函数只负责"计时"与"超时后取消读取器"，
-     *           真正的收尾（移除光标、复位状态）由读取循环退出后的统一逻辑完成，
-     *           避免收尾逻辑分散在多处导致重复执行（呼应 US-3.7 防重复收尾）。
      */
     function startDrainTimeout() {
         clearDrainTimeout(); // 防重复：先清理旧计时器
@@ -854,8 +931,6 @@
 
     /**
      * [US-3.3] 生成一个请求标识（requestId）。
-     * 用于带外取消：随 /stream 请求发送，打断时据此取消对应上游请求。
-     * 格式：req_<时间戳36进制>_<UUID>，与 sessionId 风格一致，保证唯一性。
      * @returns {string}
      */
     function generateRequestId() {
@@ -869,13 +944,6 @@
 
     /**
      * [US-3.3] 发送带外取消请求（停止未来）。
-     *
-     * 语义：用户打断时调用。**不切断本地流**，而是另发一个独立请求，
-     *       携带 requestId，服务端据此 abort() 对应的上游模型请求。
-     *
-     * 容错：取消是"尽力而为"的操作，任何失败（网络错误、404、超时）
-     *       均**静默忽略**，不弹错误、不阻塞本地排空（US-3.2 继续读在途数据）。
-     *
      * @param {string|null} requestId
      */
     function sendCancelRequest(requestId) {
@@ -895,17 +963,6 @@
 
     /**
      * [US-3.1 / US-3.2 / US-3.3 / US-3.4] 用户点击「停止」入口。
-     *
-     * US-3.1：记录打断意图（stopRequested）并给出即时反馈。
-     * US-3.2：进入"排空态"（draining），**不切断本地流**，
-     *         继续接收并显示在途数据（③④⑤ 段），直至流结束或排空超时。
-     * US-3.3：发送带外取消请求（停止未来），取消上游模型请求。
-     * US-3.4：即时反馈文案统一为"正在停止…"，并显式使用非错误样式。
-     *
-     * 注意（与 US-3.3 的边界）：
-     *   - 本函数**不调用** abortController.abort()，以保证本地流继续读取；
-     *   - "停止未来"（取消上游模型请求）由 US-3.3 通过**带外取消请求**实现，
-     *     本地流读取不受影响。
      */
     function requestStop() {
         // 非输出状态：无操作（防御性）
@@ -1102,21 +1159,15 @@
 
                             case "finish":
                                 // [US-3.2] 排空态下：用户已打断，本次回答不应按"正常完成"处理。
-                                //   - 跳过"✅ 完成"提示（避免与循环退出后的"⏹️ 已停止"冲突/闪烁）；
-                                //   - 跳过 usage 累加（被打断回答 usage 记 0，详见 US-3.6）。
-                                //   注意：仍执行 finishStream() 移除光标，保证视觉收尾。
                                 if (state.draining) {
                                     finishStream();
                                     break;   // 跳出 switch，交由循环退出后的统一收尾处理
                                 }
 
-                                // [US-3.7] 正常收尾经统一入口（幂等）：
-                                //   移除光标 + 置 completed=true，防止循环退出后 P4 重复收尾。
-                                //   注：信息栏 + usage 累加 + "✅ 完成" 仍在下方按原逻辑执行（零回归）。
+                                // [US-3.7] 正常收尾经统一入口（幂等）
                                 finalizeOnce(false);
 
-                                // [US-3.6] 暂存模型名：正常路径用于信息栏；若本轮随后被打断，
-                                //          亦可作为打断信息栏的模型名来源（打断可能无 finish）。
+                                // [US-3.6] 暂存模型名
                                 if (data.raw && data.raw.model) {
                                     state.currentModel = data.raw.model;
                                 }
@@ -1158,10 +1209,7 @@
                                 break;
 
                             case "error":
-                                // [US-3.4] 排空态下：用户已打断，此 error 很可能由"上游取消"引发，
-                                //   不应呈现为错误（F3-4：打断不得呈现为错误）。
-                                //   处理：仅移除光标（视觉收尾），跳过错误 UI；
-                                //         终态提示交由循环退出后的统一收尾（setStoppedStatus）给出。
+                                // [US-3.4] 排空态下：用户已打断，此 error 很可能由"上游取消"引发
                                 if (state.draining) {
                                     finishStream();
                                     break;   // 跳出 switch，继续 while 读取在途数据
@@ -1196,19 +1244,12 @@
             }
 
             // [US-3.7] 统一收尾（幂等）：
-            //   - 若 P1 已收尾（completed=true）→ finalizeOnce 直接跳过，避免重复；
-            //   - 若尚未收尾（如无 finish 事件）→ 此处完成收尾。
             if (!state.isStreaming) {
-                // [US-3.4] 排空完成 → 统一"已停止"提示（非错误样式）；
-                //           正常完成 → 保持原"✅ 完成"不变。
                 if (wasDraining) {
                     // [US-3.6] 打断收尾（排空完成）：渲染"已中断"信息栏 + usage 记 0。
-                    //   注意：必须在 finally 清理 currentBubbleEl/currentStartTime 之前执行！
-                    //   本函数只读 state、不写 sessionStats（F3-8：不累加）。
                     finalizeOnce(true);
                 } else {
                     // 正常收尾：finalizeOnce(false) 只移除光标 + 置位；
-                    //   终态提示按原逻辑给出（零回归）。
                     finalizeOnce(false);
                     setStatus(`✅ 完成 (${getTimeStr()})`);
                 }
@@ -1216,29 +1257,15 @@
         } catch (err) {
             // 处理错误
             if (err.name === "AbortError") {
-                // [US-3.2 / US-3.8] 区分两种 abort 来源：
-                //   (a) 排空超时兜底触发的 abort：此时 drainTimedOut === true（US-3.8 显式标记），
-                //       或 draining === true（US-3.2 兜底判定），
-                //       说明"打断后未能及时排空"，直接收尾即可，不重复提示；
-                //   (b) 其他 abort（如页面卸载、外部取消）：按原逻辑处理。
-                // 注意：US-3.2 自身**不主动 abort 本地流**（除超时兜底），
-                //       "停止未来"由 US-3.3 的带外取消请求完成，故此处分支
-                //       在 US-3.2 阶段主要用于承接"排空超时"。
+                // [US-3.2 / US-3.8] 区分两种 abort 来源
                 clearDrainTimeout();          // [US-3.2] 清理计时器（幂等）
 
-                // [US-3.7] 统一收尾（幂等）：
-                //   - 排空超时（drainTimedOut/draining=true）→ 打断收尾（信息栏 + "已停止"）；
-                //   - 非排空 abort（页面卸载等）→ 仅收尾提示，不渲染"已中断"信息栏。
-                // [US-3.8] 判定优先使用 drainTimedOut（显式超时标记），
-                //          避免 draining 在时序上被提前复位而丢失"已中断"信息栏。
+                // [US-3.8] 判定优先使用 drainTimedOut（显式超时标记）
                 if (state.drainTimedOut || state.draining) {
-                    // [US-3.6] 打断收尾（排空超时）：渲染"已中断"信息栏 + usage 记 0。
-                    //   同样必须在 finally 清理之前执行。
+                    // [US-3.6] 打断收尾（排空超时）
                     finalizeOnce(true);
                 } else {
-                    // [US-3.4] 非排空 abort（如页面卸载、外部取消）：
-                    //          同样以"已停止"呈现，避免"已取消"措辞不统一。
-                    //   注：非排空 abort 不属于"用户打断排空"，不渲染"已中断"信息栏。
+                    // [US-3.4] 非排空 abort（如页面卸载、外部取消）
                     finalizeOnce(false);
                     setStoppedStatus(false);
                 }
@@ -1263,22 +1290,15 @@
         } finally {
             state.isStreaming = false;
             state.abortController = null;
-            // [US-3.2] 复位打断相关状态，保证下一轮回答干净：
-            //   - stopRequested：US-3.1 遗留未复位，此处补齐；
-            //   - draining：排空态复位；
-            //   - drainTimer：清理超时计时器，避免泄漏。
+            // [US-3.2] 复位打断相关状态，保证下一轮回答干净
             state.stopRequested = false;
             state.draining = false;
             state.drainTimedOut = false;     // [US-3.8] 复位排空超时标记
             state.currentRequestId = null;   // [US-3.3] 清理本次请求标识
 
             // [US-3.5] 统一清理"指向旧气泡的流式引用"，确保新消息不串入旧气泡（F3-7）。
-            //   背景：这些引用原先仅在"正常 finish 分支生成信息栏后"清理，
-            //         打断路径（排空 finish / 排空 error / 循环退出 / 超时 catch）
-            //         不会走到该清理点，导致引用残留、跨轮串写。
             //   原则：**只置引用为 null，绝不 remove() DOM**——
             //         旧气泡及其内容（正文/思考/工具）必须保留（F3-5）。
-            //   幂等：与正常 finish 分支的既有清理重复执行无害。
             state.currentBubbleEl = null;
             state.currentThinkEl = null;
             state.currentThinkContent = "";
@@ -1359,6 +1379,267 @@
     }
 
     /**
+     * [US-4.4] 打开一个历史会话并完整重现（F2-4/F2-5）。
+     * [US-4.5] 增加 4 处加固：流式守卫 / 统计复位 / 本地历史同步 / 聚焦输入框。
+     * @param {string} id - 会话 ID
+     * @returns {Promise<boolean>} - 是否成功打开
+     */
+    async function openSession(id) {
+        if (!id) return false;
+
+        // [US-4.5] 防串会话（D1）：流式输出进行中禁止切换会话。
+        //   注意：此处**不覆盖状态栏**（避免干扰正在进行的流状态显示），
+        //         仅以 console.warn 给出可观测提示。
+        if (state.isStreaming) {
+            console.warn("[US-4.5] 流式输出进行中，已拒绝切换会话:", id);
+            return false;
+        }
+
+        try {
+            const resp = await fetch(`/api/chat/sessions/${encodeURIComponent(id)}`);
+            if (resp.status === 404) {
+                console.warn("[US-4.4] 会话不存在:", id);
+                return false;
+            }
+            if (!resp.ok) {
+                console.warn("[US-4.4] 打开会话失败:", resp.status);
+                return false;
+            }
+
+            const data = await resp.json();
+            const messages = Array.isArray(data.messages) ? data.messages : [];
+
+            // 1. 清空消息区（保留空状态元素引用，但隐藏）
+            $dom.messages.querySelectorAll(".message").forEach((n) => n.remove());
+            $dom.empty.style.display = messages.length > 0 ? "none" : "flex";
+
+            // [US-4.5] 复位会话累计统计（D2）：会话累计是「按会话」的，
+            //   切换会话必须清零，否则汇总栏显示的是上一个会话的数据。
+            state.sessionStats.count = 0;
+            state.sessionStats.promptTokens = 0;
+            state.sessionStats.completionTokens = 0;
+            state.sessionStats.totalTokens = 0;
+            state.sessionStats.elapsedMs = 0;
+            renderSessionSummary();   // 刷新汇总栏（count=0 时清空显示）
+
+            // 2. 逐条静态渲染（完整重现）
+            for (const msg of messages) {
+                $dom.messages.appendChild(renderHistoryMessage(msg));
+            }
+
+            // [US-4.5] 同步本地渲染历史（D3）：用已加载消息重建 state.history，
+            //   保证本地历史与当前会话一致（服务端仍持有权威历史，本地仅用于渲染）。
+            state.history = messages.map((m) => ({
+                role: m.role,
+                content: m.content || "",
+            }));
+
+            // 3. 更新当前会话 ID（续接该会话）
+            state.sessionId = id;
+            persistSessionId(id);
+
+            // 4. 滚动到底部
+            scrollToBottom();
+
+            // 5. 状态提示
+            setStatus(`📂 已打开会话：${data.session?.title || id}`);
+
+            // [US-4.5] 聚焦输入框（D4）：打开会话后可直接续聊，无需手动点击。
+            $dom.input.focus();
+
+            return true;
+        } catch (e) {
+            console.warn("[US-4.4] 打开会话异常:", e);
+            return false;
+        }
+    }
+
+    /**
+     * [US-4.7] 新建会话并进入对话（F2-8）。
+     *
+     * 语义：主动放弃当前会话，分配一个**全新**会话 ID，并把界面复位为空白新会话，
+     *       用户可直接开始一段新对话（T-4.7.1 / T-4.7.2）。
+     *
+     * 关键点（D1 绕过缓存）：
+     *   ensureSessionId() 会**优先复用 sessionStorage 缓存**的会话 ID（US-2.3 标签页级隔离），
+     *   因此"新建会话"**不能**只把 state.sessionId 置空（会被缓存"复活"），
+     *   必须**显式调用** POST /api/chat/session 分配新 ID，并 persistSessionId 覆盖缓存。
+     *
+     * @returns {Promise<boolean>} - 是否成功新建
+     */
+    async function newSession() {
+        // 1. 流式守卫（D2）：输出进行中拒绝新建，避免流写入被清空的界面。
+        //    注意：不覆盖状态栏（避免干扰正在进行的流状态显示），仅 console.warn。
+        if (state.isStreaming) {
+            console.warn("[US-4.7] 流式输出进行中，已拒绝新建会话");
+            return false;
+        }
+
+        // 2. 清空消息区，显示空状态（新会话无任何消息）
+        $dom.messages.querySelectorAll(".message").forEach((n) => n.remove());
+        $dom.empty.style.display = "flex";
+
+        // 3. 复位会话累计统计（D3）：新会话从零开始，避免汇总栏残留上个会话数据
+        state.sessionStats.count = 0;
+        state.sessionStats.promptTokens = 0;
+        state.sessionStats.completionTokens = 0;
+        state.sessionStats.totalTokens = 0;
+        state.sessionStats.elapsedMs = 0;
+        renderSessionSummary();
+
+        // 4. 复位本地渲染历史与流式引用（新会话无历史）
+        state.history = [];
+        state.currentBubbleEl = null;
+        state.currentThinkEl = null;
+        state.currentThinkContent = "";
+        state.currentToolEl = null;
+        state.currentInfoEl = null;
+        state.currentStartTime = 0;
+        state.currentAssistantContent = "";
+        state.currentModel = "";
+        state.completed = false;
+
+        // 5. 分配全新会话 ID（D1 绕过缓存）：直接调服务端分配接口，
+        //    不经 ensureSessionId 的 sessionStorage 缓存分支，确保拿到全新 ID。
+        let newId = null;
+        try {
+            const resp = await fetch(CONFIG.SESSION_ENDPOINT, { method: "POST" });
+            if (resp.ok) {
+                const data = await resp.json();
+                if (data && typeof data.sessionId === "string") {
+                    newId = data.sessionId;
+                }
+            }
+        } catch (e) {
+            console.warn("[US-4.7] 分配新会话 ID 失败，降级为本地生成:", e);
+        }
+
+        // 降级兜底（D4）：接口异常时本地生成，格式与服务端保持一致（sess_<ts36>_<uuid>），
+        // 以便降级 ID 亦能通过服务端 isValidSessionId 校验。
+        if (!newId) {
+            newId = "sess_" + Date.now().toString(36) + "_" + crypto.randomUUID();
+        }
+
+        state.sessionId = newId;
+        persistSessionId(newId);   // 覆盖 sessionStorage 缓存，防止后续被旧 ID "复活"
+
+        // 6. 状态提示 + 聚焦输入框
+        setStatus("✅ 已新建会话，可开始输入", "chat-status--done");
+        $dom.input.focus();
+
+        return true;
+    }
+
+    // ============================================
+    // [US-4.8] 顶部菜单与多视图切换（F2-9）
+    // ============================================
+
+    /**
+     * [US-4.8] 切换视图（会话 / 历史 / 状态）。
+     *
+     * 语义：仅切换各视图容器的 hidden 属性与菜单高亮，**不销毁聊天 DOM**，
+     *       因此 state.sessionId 与消息区内容保持不变——从会话→历史→会话
+     *       仍停留在原会话（AC-3 切换不丢失当前会话上下文）。
+     *
+     * 关键依赖：CSS 中的 `[hidden] { display: none !important; }` 规则，
+     *           否则 .chat-layout / .history-layout 的 display:flex 会覆盖 hidden。
+     *
+     * @param {string} view - chat / history / status
+     * @returns {boolean} - 是否切换成功
+     */
+    function switchView(view) {
+        state.currentView = view;
+
+        // 1. 切换视图容器显隐（仅切 hidden，不销毁 DOM）
+        if ($dom.viewChat) $dom.viewChat.hidden = view !== "chat";
+        if ($dom.viewHistory) $dom.viewHistory.hidden = view !== "history";
+        if ($dom.viewStatus) $dom.viewStatus.hidden = view !== "status";
+
+        // 2. 菜单高亮
+        $dom.menuItems.forEach((btn) => {
+            btn.classList.toggle("top-menu__item--active", btn.dataset.view === view);
+        });
+
+        // 3. 切到历史视图时刷新列表
+        if (view === "history") {
+            renderSessionList();
+        }
+
+        return true;
+    }
+
+    /**
+     * [US-4.8] 渲染历史会话列表（F2-3）。
+     *
+     * 数据来源：GET /api/chat/sessions（US-4.3），已按最后活动时间倒序。
+     * 交互：
+     *   - 点击列表项 → openSession(id) 打开并切回会话视图；
+     *   - 点击删除按钮 → DELETE /api/chat/sessions/:id（US-4.6）后刷新列表；
+     *   - 点击「新建会话」→ newSession()（US-4.7）并切回会话视图。
+     *
+     * 安全：标题/时间经 escapeHtml 转义，防止 XSS。
+     *
+     * @returns {Promise<void>}
+     */
+    async function renderSessionList() {
+        if (!$dom.historyList) return;
+        try {
+            const resp = await fetch("/api/chat/sessions");
+            if (!resp.ok) {
+                console.warn("[US-4.8] 加载会话列表失败:", resp.status);
+                return;
+            }
+            const data = await resp.json();
+            const sessions = (data && data.sessions) || [];
+
+            // 空态处理
+            if (sessions.length === 0) {
+                $dom.historyList.innerHTML = "";
+                if ($dom.historyEmpty) $dom.historyEmpty.hidden = false;
+                return;
+            }
+            if ($dom.historyEmpty) $dom.historyEmpty.hidden = true;
+
+            // 渲染列表（escapeHtml 转义，防 XSS）
+            $dom.historyList.innerHTML = sessions.map((s) => `
+                <li class="history-item" data-id="${escapeHtml(s.id)}">
+                    <div class="history-item__main">
+                        <div class="history-item__title">${escapeHtml(s.title || "新会话")}</div>
+                        <div class="history-item__meta">${escapeHtml(s.updatedAtText || "")} · ${s.messageCount} 条消息</div>
+                    </div>
+                    <button class="history-item__delete" data-id="${escapeHtml(s.id)}">删除</button>
+                </li>
+            `).join("");
+
+            // 点击列表项打开会话（删除按钮除外）
+            $dom.historyList.querySelectorAll(".history-item").forEach((li) => {
+                li.addEventListener("click", async (e) => {
+                    if (e.target.closest(".history-item__delete")) return;
+                    const ok = await openSession(li.dataset.id);
+                    if (ok) switchView("chat");
+                });
+            });
+
+            // 删除按钮
+            $dom.historyList.querySelectorAll(".history-item__delete").forEach((btn) => {
+                btn.addEventListener("click", async (e) => {
+                    e.stopPropagation();
+                    try {
+                        await fetch("/api/chat/sessions/" + encodeURIComponent(btn.dataset.id), {
+                            method: "DELETE",
+                        });
+                    } catch (err) {
+                        console.warn("[US-4.8] 删除会话失败:", err);
+                    }
+                    renderSessionList();   // 刷新列表
+                });
+            });
+        } catch (e) {
+            console.warn("[US-4.8] 加载会话列表异常:", e);
+        }
+    }
+
+    /**
      * 自动调整输入框高度
      */
     function autoResizeInput() {
@@ -1399,6 +1680,28 @@
         ensureSessionId().then((id) => {
             console.log("🆔 当前会话 ID:", id);
         });
+
+        // [US-4.4] 暴露 openSession 供历史列表点击调用
+        window.__winbotsOpenSession = openSession;
+
+        // [US-4.7] 暴露 newSession 供「新建会话」按钮调用
+        window.__winbotsNewSession = newSession;
+
+        // [US-4.8] 顶部菜单点击切换视图
+        $dom.menuItems.forEach((btn) => {
+            btn.addEventListener("click", () => switchView(btn.dataset.view));
+        });
+
+        // [US-4.8] 历史视图「新建会话」按钮
+        if ($dom.historyNewBtn) {
+            $dom.historyNewBtn.addEventListener("click", async () => {
+                await newSession();
+                switchView("chat");
+            });
+        }
+
+        // [US-4.8] 暴露 switchView 供手动验证
+        window.__winbotsSwitchView = switchView;
 
         console.log("🤖 Bots AI Chat 已初始化");
     }

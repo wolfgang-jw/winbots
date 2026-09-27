@@ -19,18 +19,19 @@
                     <span class="header__emoji">🤖</span>
                     <h1 class="header__title">Bots AI 对话</h1>
                 </div>
-                <p class="header__subtitle">
-                    流式对话
-                    <span style="margin-left:12px;opacity:0.7;">
-                        <a href="status.html" style="color:inherit;text-decoration:underline;">系统状态</a>
-                    </span>
-                </p>
+                <p class="header__subtitle">流式对话</p>
+                <!-- US-4.8: 顶部菜单（会话 / 历史 / 状态） -->
+                <nav class="top-menu" id="top-menu">
+                    <button class="top-menu__item top-menu__item--active" data-view="chat">会话</button>
+                    <button class="top-menu__item" data-view="history">历史</button>
+                    <button class="top-menu__item" data-view="status">状态</button>
+                </nav>
             </div>
         </div>
     </header>
 
-    <!-- ==================== 聊天主区域 ==================== -->
-    <div class="chat-layout">
+    <!-- ==================== 聊天视图（US-4.8） ==================== -->
+    <main class="chat-layout" id="view-chat">
         <!-- 消息列表 -->
         <div class="chat-messages" id="chat-messages">
             <!-- 空状态 -->
@@ -64,7 +65,26 @@
                 </button>
             </div>
         </div>
-    </div>
+    </main>
+
+    <!-- ==================== 历史视图（US-4.8） ==================== -->
+    <section class="history-layout" id="view-history" hidden>
+        <div class="history-header">
+            <h2 class="history-header__title">历史会话</h2>
+            <button class="history-new-btn" id="history-new-btn">＋ 新建会话</button>
+        </div>
+        <ul class="history-list" id="history-list"></ul>
+        <div class="history-empty" id="history-empty" hidden>
+            <div class="history-empty__icon">📭</div>
+            <div class="history-empty__title">暂无历史会话</div>
+            <div class="history-empty__desc">开始一段新对话后，会话会出现在这里。</div>
+        </div>
+    </section>
+
+    <!-- ==================== 状态视图（US-4.8，iframe 复用既有状态页） ==================== -->
+    <section class="status-view" id="view-status" hidden>
+        <iframe class="status-view__frame" src="status.html" title="系统状态"></iframe>
+    </section>
 
     <!-- ==================== 底部页脚 ==================== -->
     <footer class="footer">
