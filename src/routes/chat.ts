@@ -52,13 +52,20 @@
  *   - [US-2.4] 兼容旧接口（F1-5）：收窄旧模式 sessionId 的拒绝范围——
  *     仅当 sessionId 格式合法时才 400；格式非法/任意非空值一律静默忽略，
  *     与改造前旧接口对未知字段的容错行为保持一致，保证既有调用方式不受影响。
+ *   - [US-3.3] 上游取消（止损）：采用「带外取消」机制——
+ *     /stream 新增可选入参 requestId，创建 AbortController 并登记取消句柄，
+ *     三处上游 fetch（阶段一探测 / 阶段二流式 / 分支 B 流式）均绑定其 signal；
+ *     新增 POST /api/chat/cancel 依据 requestId 触发 abort()，停止上游继续生成；
+ *     pipeStream 捕获 AbortError（取消）并返回已收正文，避免误报为错误；
+ *     /stream 的 finally 注销句柄并主动关流，作为前端「排空完成」信号。
  *
  * 请求体 (JSON):
  * {
  *   "messages": [
  *     { "role": "user", "content": "你好" }
  *   ],
- *   "sessionId": "sess_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301"   // US-2.1 可选
+ *   "sessionId": "sess_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301",  // US-2.1 可选
+ *   "requestId": "req_lx8f2k_3f2504e0-4f89-41d3-9a0c-0305e82c3301"    // US-3.3 可选
  * }
  *
  * 响应 (SSE):
@@ -83,6 +90,8 @@ import {
     hasSession,
     type SessionMessage,
 } from "@/infra/session";
+// [US-3.3] 上游取消：进行中请求的取消句柄管理
+import { registerCancel, cancelRequest, unregisterCancel } from "@/infra/cancel";
 
 const router = new Hono();
 
@@ -103,6 +112,9 @@ interface RawUsage {
  *     字段名与注释均明确其为字符数，不再把 chunk 数量当作 token 数。
  *
  * [US-2.2] 返回值改为「累积的完整正文」，供 /stream 写回会话历史。
+ *
+ * [US-3.3] 捕获 AbortError：上游被 /cancel 取消时，reader.read() 会抛 AbortError，
+ *   这是「用户主动打断」的正常路径，返回已累积正文交由调用方正常收尾，不误报为错误。
  */
 async function pipeStream(
     upstream: ReadableStream<Uint8Array>,
@@ -115,55 +127,68 @@ async function pipeStream(
     let fallbackCompletionChars = 0;
     let fullText = "";                            // [US-2.2] 累积完整正文，供写回历史
 
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+    try {                                                    // ← [US-3.3] 新增 try
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
 
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith(":")) continue;
-            if (!trimmed.startsWith("data:")) continue;
-            const data = trimmed.slice(5).trim();
-            if (data === "[DONE]") continue;
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith(":")) continue;
+                if (!trimmed.startsWith("data:")) continue;
+                const data = trimmed.slice(5).trim();
+                if (data === "[DONE]") continue;
 
-            try {
-                const parsed = JSON.parse(data);
-                const delta = parsed.choices?.[0]?.delta?.content || "";
-                const thinking = parsed.choices?.[0]?.delta?.reasoning_content || "";
+                try {
+                    const parsed = JSON.parse(data);
+                    const delta = parsed.choices?.[0]?.delta?.content || "";
+                    const thinking = parsed.choices?.[0]?.delta?.reasoning_content || "";
 
-                if (thinking) send({ type: "think", content: thinking });
-                if (delta) {
-                    // 累计输出字符数（兜底用）
-                    fallbackCompletionChars += delta.length;
-                    fullText += delta;            // [US-2.2] 同步累积完整正文
-                    send({ type: "text", content: delta });
+                    if (thinking) send({ type: "think", content: thinking });
+                    if (delta) {
+                        // 累计输出字符数（兜底用）
+                        fallbackCompletionChars += delta.length;
+                        fullText += delta;            // [US-2.2] 同步累积完整正文
+                        send({ type: "text", content: delta });
+                    }
+
+                    const finishReason = parsed.choices?.[0]?.finish_reason;
+                    if (finishReason) {
+                        const usage: RawUsage = parsed.usage || {};
+                        // 精确优先：上游 completion_tokens；否则用字符数兜底
+                        const completionTokens =
+                            usage.completion_tokens ?? fallbackCompletionChars;
+                        const promptTokens = usage.prompt_tokens ?? 0;
+                        send({
+                            type: "finish",
+                            reason: finishReason,
+                            usage: {
+                                promptTokens,
+                                completionTokens,
+                                totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
+                            },
+                            raw: parsed,
+                        });
+                    }
+                } catch {
+                    // 忽略解析失败的行
                 }
-
-                const finishReason = parsed.choices?.[0]?.finish_reason;
-                if (finishReason) {
-                    const usage: RawUsage = parsed.usage || {};
-                    // 精确优先：上游 completion_tokens；否则用字符数兜底
-                    const completionTokens =
-                        usage.completion_tokens ?? fallbackCompletionChars;
-                    const promptTokens = usage.prompt_tokens ?? 0;
-                    send({
-                        type: "finish",
-                        reason: finishReason,
-                        usage: {
-                            promptTokens,
-                            completionTokens,
-                            totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
-                        },
-                        raw: parsed,
-                    });
-                }
-            } catch {
-                // 忽略解析失败的行
             }
         }
+    } catch (err) {                                          // ← [US-3.3] 新增 catch
+        // [US-3.3] 上游被取消（/cancel 触发 abort）：
+        //   这是「用户主动打断」的正常路径，不是错误。
+        //   已推送给前端的数据（③段）已通过 send 发出，不受影响；
+        //   此处直接结束读取，返回已累积正文，交由调用方正常收尾。
+        //   注意：不 send({type:"error"})，避免把取消误报为错误。
+        if (err instanceof Error && err.name === "AbortError") {
+            console.log("⏹️ [US-3.3] 上游请求已被取消，停止读取并收尾");
+            return fullText;                                 // 返回已收正文，正常收尾
+        }
+        throw err;                                           // 其他错误：继续上抛，由 start() 的 catch 处理
     }
 
     return fullText;                              // [US-2.2] 返回完整正文
@@ -180,7 +205,14 @@ router.post("/stream", async (c) => {
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
         // US-2.2：新增单条消息入参 message；保留 messages 以兼容旧调用方
-        const { messages, sessionId, message } = body;
+        // [US-3.3] 新增可选入参 requestId：带外取消的请求标识。
+        //   为向后兼容，requestId 可选；不携带时行为与改造前完全一致。
+        const { messages, sessionId, message, requestId } = body;
+
+        // [US-3.3] 校验 requestId（若提供）：必须为非空字符串，长度设上限防滥用。
+        //   非法值一律「静默忽略」（视为未提供），与旧接口对未知字段的容错一致（US-2.4）。
+        const hasRequestId =
+            typeof requestId === "string" && requestId.length > 0 && requestId.length <= 128;
 
         // [US-2.2] 入参双模式：
         //   模式一（新，服务端持有历史）：{ sessionId, message } → 服务端按 sessionId 存取历史；
@@ -325,10 +357,21 @@ router.post("/stream", async (c) => {
         // 后续流式请求据此决定是否携带工具参数（F4-6）。
         let supportsTools = true;
 
+        // ── [US-3.3] 创建取消句柄并登记 ────────────────────────────
+        // 说明：整个 /stream 请求（含阶段一探测 + 阶段二/分支 B 流式）
+        //       共用同一个 AbortController，确保 /cancel 一次即可取消全部上游请求。
+        //       必须在阶段一探测 fetch 之前创建，供三处 fetch 共用其 signal。
+        const upstreamController = new AbortController();
+        if (hasRequestId) {
+            registerCancel(requestId as string, upstreamController);
+            console.log(`🔗 [US-3.3] 登记取消句柄: ${requestId}`);
+        }
+
         try {
             const probeResp = await fetch(apiUrl, {
                 method: "POST",
                 headers,
+                signal: upstreamController.signal,          // ← [US-3.3] 绑定取消信号
                 body: JSON.stringify({
                     ...baseBody,
                     stream: false,
@@ -358,7 +401,12 @@ router.post("/stream", async (c) => {
                 supportsTools = false;
             }
         } catch (err) {
-            console.warn("⚠️ 阶段一探测异常，降级为纯文本对话", err);
+            // [US-3.3] 若因取消而中断探测，属正常路径，不打印为"异常"
+            if (err instanceof Error && err.name === "AbortError") {
+                console.log("⏹️ [US-3.3] 阶段一探测已被取消");
+            } else {
+                console.warn("⚠️ 阶段一探测异常，降级为纯文本对话", err);
+            }
         }
 
         // ── 3. 设置 SSE 响应头 ─────────────────────────────────────
@@ -440,6 +488,7 @@ router.post("/stream", async (c) => {
                             const secondResp = await fetch(apiUrl, {
                                 method: "POST",
                                 headers,
+                                signal: upstreamController.signal,   // ← [US-3.3] 绑定取消信号
                                 body: JSON.stringify({
                                     ...baseBody,
                                     messages: secondMessages,
@@ -472,6 +521,7 @@ router.post("/stream", async (c) => {
                         const fallbackResp = await fetch(apiUrl, {
                             method: "POST",
                             headers,
+                            signal: upstreamController.signal,       // ← [US-3.3] 绑定取消信号
                             body: JSON.stringify({
                                 ...baseBody,
                                 stream: true,
@@ -494,10 +544,22 @@ router.post("/stream", async (c) => {
                             });
                         }
                     } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        send({ type: "error", message: msg });
+                        // [US-3.3] 取消（AbortError）属正常路径，不误报为错误：
+                        //   此时上游已被 /cancel 取消，pipeStream 若已捕获并正常返回，
+                        //   通常不会走到这里；但阶段二 fetch 本身被取消等场景可能到达，
+                        //   故此处兜底：AbortError 不 send error，直接收尾。
+                        if (err instanceof Error && err.name === "AbortError") {
+                            console.log("⏹️ [US-3.3] 上游请求已取消（start 兜底）");
+                        } else {
+                            const msg = err instanceof Error ? err.message : String(err);
+                            send({ type: "error", message: msg });
+                        }
                     } finally {
-                        controller.close();
+                        // [US-3.3] 注销取消句柄（幂等）：无论成功/失败/取消都清理，避免泄漏。
+                        if (hasRequestId) {
+                            unregisterCancel(requestId as string);
+                        }
+                        controller.close();   // 主动关流：作为前端"排空完成"信号
                     }
                 },
             })
@@ -522,6 +584,48 @@ router.post("/stream", async (c) => {
 router.post("/session", (c) => {
     const sessionId = generateSessionId();
     return c.json({ sessionId });
+});
+
+/**
+ * POST /api/chat/cancel
+ * 取消一个进行中的上游请求（US-3.3：上游取消 / 止损）
+ *
+ * 带外取消机制（需求文档 2.3.4）：
+ * - 前端发起对话时携带 requestId；
+ * - 用户打断时，前端「不切断本地流」，而是另发本请求携带该 requestId；
+ * - 服务端据此定位并 abort() 对应的上游模型请求，停止继续生成（止损）；
+ * - 上游取消后，/stream 会将已收数据推送完毕并主动关流，作为「排空完成」信号。
+ *
+ * 幂等性：
+ * - 未知 / 已结束 / 重复取消的 requestId，均返回 200 且 cancelled=false，不报错。
+ *
+ * 请求体 (JSON):
+ * { "requestId": "req_xxx" }
+ *
+ * 响应 (200):
+ * { "ok": true, "cancelled": true }    // 成功取消了一个进行中的请求
+ * { "ok": true, "cancelled": false }   // 未找到（已结束 / 未知 ID），幂等成功
+ */
+router.post("/cancel", async (c) => {
+    let requestId: unknown;
+    try {
+        const body = await c.req.json();
+        requestId = body?.requestId;
+    } catch {
+        // 请求体非法（非 JSON）：按未提供处理，返回幂等成功
+        return c.json({ ok: true, cancelled: false });
+    }
+
+    // 校验：非空字符串且长度受限，非法一律按「未找到」处理（不报错）
+    if (typeof requestId !== "string" || requestId.length === 0 || requestId.length > 128) {
+        return c.json({ ok: true, cancelled: false });
+    }
+
+    const cancelled = cancelRequest(requestId);
+    if (cancelled) {
+        console.log(`⏹️ [US-3.3] 已取消上游请求: ${requestId}`);
+    }
+    return c.json({ ok: true, cancelled });
 });
 
 export default router;

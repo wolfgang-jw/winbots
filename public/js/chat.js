@@ -13,6 +13,14 @@
  * 9. US-2.1 会话唯一标识：新建会话时获取唯一 sessionId 并随请求携带
  * 10. US-2.2 服务端持有会话历史：发送单条 message，历史由服务端持有
  * 11. US-2.3 会话隔离：当前会话 ID 用 sessionStorage 做标签页级隔离
+ * 12. US-3.1 打断入口：AI 输出中提供「停止」入口（显隐联动 + 触发点）
+ * 13. US-3.2 优雅停止：打断后不切断本地流，继续接收在途数据直至排空完成
+ * 14. US-3.3 上游取消：打断时另发带外取消请求，取消上游模型请求（停止未来）
+ * 15. US-3.4 打断状态提示：打断过程/结果以「已停止」提示，显式非错误样式
+ * 16. US-3.5 打断内容保留与状态复位：收尾时统一清理流式引用，保证旧内容保留、新消息不串入旧气泡
+ * 17. US-3.6 打断 usage 记 0 与信息栏：被打断回答补「已中断」信息栏，usage 记 0 且不累加
+ * 18. US-3.7 防重复收尾：新增 completed 幂等标记 + finalizeOnce 统一收尾入口，保证同一次回答只收尾一次
+ * 19. US-3.8 排空超时兜底：新增 drainTimedOut 显式超时标记，使「排空超时」可识别、可观测、可断言
  */
 
 (function () {
@@ -30,6 +38,13 @@
         // 使用 sessionStorage（标签页级隔离）而非 localStorage（跨标签页共享），
         // 确保同一浏览器多标签页各自持有独立会话，避免串会话（F1-3）。
         SESSION_STORAGE_KEY: "winbots.currentSessionId",
+        // [US-3.2] 打断后排空超时（毫秒）。
+        // 语义：用户点击"停止"后，前端不切断本地流，继续接收在途数据；
+        //       若在此时长内仍未读到流结束（服务端未关流），则强制收尾，避免界面卡死。
+        // 取值：需求文档"待确认事项 4"建议 3000ms。
+        DRAIN_TIMEOUT_MS: 3000,
+        // [US-3.3] 带外取消接口：打断时另发此请求，取消对应上游模型请求（止损）。
+        CANCEL_ENDPOINT: "/api/chat/cancel",
     };
 
     // ============================================
@@ -40,6 +55,7 @@
         empty: document.getElementById("chat-empty"),
         input: document.getElementById("chat-input"),
         sendBtn: document.getElementById("chat-send-btn"),
+        stopBtn: document.getElementById("chat-stop-btn"),   // [US-3.1] 打断入口
         status: document.getElementById("chat-status"),
         usage: document.getElementById("chat-usage"),
         // R2-1：已删除默认问题行（#chat-suggestions），此处不再缓存其引用
@@ -57,6 +73,38 @@
         isStreaming: false,
         /** @type {AbortController|null} 用于取消请求 */
         abortController: null,
+        /** @type {boolean} [US-3.1] 用户是否已请求打断（打断入口标志） */
+        stopRequested: false,
+        /**
+         * @type {boolean} [US-3.2] 是否处于"排空态"。
+         * 语义：已请求打断，正在继续接收并显示在途数据（③④⑤ 段），
+         *       直至读取到流结束（done）或排空超时。
+         * 默认 false；打断时置 true；收尾时复位 false。
+         */
+        draining: false,
+        /**
+         * @type {boolean} [US-3.8] 是否已发生"排空超时"（显式超时标记）。
+         * 语义：与 draining 正交——draining 表示"用户是否打断"，本字段表示
+         *       "打断后是否已超过排空超时被强制收尾"。
+         *   - 打断时随 draining 一并保持 false；仅在超时回调中置 true；
+         *   - catch 的 AbortError 分支据此判定"超时中断"，稳定走打断收尾
+         *     （渲染"已中断"信息栏），不因 draining 的时序复位而丢失；
+         *   - finally 复位为 false，保证下一轮干净。
+         * 与 draining 的区别：draining 决定"以何种方式收尾"，本字段决定
+         *   "是否由超时触发收尾"，二者语义正交、不可互相替代。
+         */
+        drainTimedOut: false,
+        /**
+         * @type {ReturnType<typeof setTimeout>|null} [US-3.2] 排空超时计时器句柄。
+         * 打断时启动；排空完成/超时/收尾时清理，避免定时器泄漏。
+         */
+        drainTimer: null,
+        /**
+         * @type {string|null} [US-3.3] 本次对话请求的唯一标识（requestId）。
+         * 语义：发起 /stream 时生成并随请求体发送；打断时据此调用取消接口，
+         *       取消对应的上游模型请求。请求结束后清空。
+         */
+        currentRequestId: null,
         /** @type {string} 当前正在累积的助手消息 */
         currentAssistantContent: "",
         /**
@@ -74,8 +122,32 @@
         currentInfoEl: null,
         /** @type {HTMLElement|null} 当前工具调用段元素（第 4 段） */
         currentToolEl: null,
-        /** @type {HTMLElement|null} 当前回答段容器（总开关） */
+        /**
+         * @type {HTMLElement|null} 当前回答段容器（总开关）
+         * @deprecated [US-3.5] 该字段自引入以来从未被赋值/读取/复位，属历史遗留死字段。
+         *   回答段容器现由 createMessageEl() 内局部创建（answerEl），无需全局引用。
+         *   保留声明仅为避免潜在外部引用报错；建议后续 US 或重构时移除。
+         */
         currentAnswerEl: null,
+        /**
+         * @type {string} [US-3.6] 本次回答的模型名（暂存）。
+         * 语义：正常路径由 finish 事件的 raw.model 提供；但"打断路径可能收不到 finish"，
+         *       故在流处理中提前暂存，供打断信息栏（F3-9）兜底使用。
+         * 每轮回答开始时复位为空串；收尾（finally / sendMessage）一并复位。
+         */
+        currentModel: "",
+        /**
+         * @type {boolean} [US-3.7] 本次回答是否已收尾（幂等标记，防重复收尾）。
+         * 语义：为"同一次回答"引入的显式收尾标记，保证"正常结束"与"打断收尾"
+         *       不会对同一次回答重复执行（F3-11）。
+         *   - 每轮回答开始时复位为 false（sendStreamRequest 开头）；
+         *   - 任一收尾路径经 finalizeOnce() 实际收尾后置为 true；
+         *   - 其余收尾路径检测到 true 即跳过，天然幂等；
+         *   - finally 兜底复位为 false，保证下一轮干净。
+         * 与 draining 的区别：draining 决定"以何种方式收尾"（正常/打断），
+         *   completed 决定"是否还需要收尾"，二者语义正交、不可互相替代。
+         */
+        completed: false,
         /** @type {number} 本次回答开始时间（performance.now()） */
         currentStartTime: 0,
         /** @type {{count:number, promptTokens:number, completionTokens:number, totalTokens:number, elapsedMs:number}} 会话累计统计 */
@@ -185,22 +257,37 @@
     /**
      * 渲染单条信息栏（第 3 段，默认折叠）
      * @param {HTMLElement} messageEl - 目标消息根元素（.message）
-     * @param {{model:string, startTime:Date, elapsedMs:number, usage:object, raw:object}} info
+     * @param {{model:string, startTime:Date, elapsedMs:number, usage:object, raw:object, interrupted?:boolean}} info
      * @returns {HTMLElement} - 信息栏元素
      */
     function renderInfoBar(messageEl, info) {
         const el = document.createElement("div");
         el.className = "message__info";
+        // [US-3.6] 中断态附加类名，用于样式区分（非错误色，见 style.css）
+        if (info.interrupted) {
+            el.classList.add("message__info--interrupted");
+        }
 
         // 摘要行（折叠态可见）
         const summary = document.createElement("div");
         summary.className = "message__info-summary";
-        summary.innerHTML =
-            `<span class="message__info-icon">🤖</span> ${escapeHtml(info.model || "unknown")}`
-            + ` · ${formatClock(info.startTime)}`
-            + ` · ${formatElapsed(info.elapsedMs)}`
-            + ` · 📊 ${info.usage.totalTokens} tokens`
-            + `<span class="message__info-arrow">▸</span>`;
+        // [US-3.6] 中断态：显示"已中断"标识 + token 记 0；正常态：保持原样。
+        if (info.interrupted) {
+            summary.innerHTML =
+                `<span class="message__info-icon">⏹️</span> 已中断`
+                + ` · ${escapeHtml(info.model || "unknown")}`
+                + ` · ${formatClock(info.startTime)}`
+                + ` · ${formatElapsed(info.elapsedMs)}`
+                + ` · 📊 0 tokens`
+                + `<span class="message__info-arrow">▸</span>`;
+        } else {
+            summary.innerHTML =
+                `<span class="message__info-icon">🤖</span> ${escapeHtml(info.model || "unknown")}`
+                + ` · ${formatClock(info.startTime)}`
+                + ` · ${formatElapsed(info.elapsedMs)}`
+                + ` · 📊 ${info.usage.totalTokens} tokens`
+                + `<span class="message__info-arrow">▸</span>`;
+        }
         el.appendChild(summary);
 
         // 详情体（展开态显示全部字段，格式化 JSON）
@@ -226,6 +313,48 @@
         const bubble = getBubbleOf(messageEl);
         bubble.appendChild(el);
         return el;
+    }
+
+    /**
+     * [US-3.6] 渲染"已中断"信息栏（F3-9）。
+     *
+     * 语义：用户打断后，为被打断的回答补一条信息栏，展示：
+     *   - "已中断"标识（区别于正常完成的"🤖 模型名"）；
+     *   - 模型名（来自 state.currentModel，缺失时显示 unknown）；
+     *   - 开始时刻与耗时（来自 state.currentStartTime）；
+     *   - token 记为 0（F3-8：不估算、不累加）。
+     *
+     * 关键约束：
+     *   1. **必须在 US-3.5 的 finally 清理之前调用**（依赖 currentBubbleEl / currentStartTime）；
+     *   2. **只读 state，不写 state.sessionStats**（打断回答不计入会话累计，F3-8）；
+     *   3. 复用 renderInfoBar（同一套折叠交互与详情体），仅通过 info.interrupted 区分展示。
+     *
+     * @returns {HTMLElement|null} 信息栏元素；无气泡时返回 null
+     */
+    function renderInterruptedInfoBar() {
+        // 无气泡（极端情况）→ 不渲染，避免抛错
+        if (!state.currentBubbleEl) return null;
+
+        // 计算耗时（前端计时，R3.4）；currentStartTime 为 0 时耗时记 0
+        const elapsedMs = state.currentStartTime
+            ? performance.now() - state.currentStartTime
+            : 0;
+        const startTime = new Date(Date.now() - elapsedMs);
+
+        // usage 全 0（F3-8：不估算、不累加）
+        const zeroUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+        // 复用 renderInfoBar，通过 interrupted 标记切换摘要行展示
+        state.currentInfoEl = renderInfoBar(state.currentBubbleEl, {
+            model: state.currentModel || "unknown",
+            startTime,
+            elapsedMs,
+            usage: zeroUsage,
+            raw: { interrupted: true, usage: zeroUsage },
+            interrupted: true,   // [US-3.6] 中断标记：renderInfoBar 据此显示"已中断"
+        });
+
+        return state.currentInfoEl;
     }
 
     /**
@@ -561,7 +690,58 @@
         state.currentAssistantContent = "";
 
         finishThink();
-        // 注意：currentBubbleEl 不在此处置空，由 finish 分支生成信息栏后再清理
+        // [US-3.5] currentBubbleEl 的置空已统一收敛到 sendStreamRequest 的 finally 中，
+        //          覆盖正常/排空/超时/错误全部路径，避免打断路径遗漏导致串写。
+        //          此处仅负责"移除光标 + 收起思考"，不触碰气泡引用。
+    }
+
+    /**
+     * [US-3.7] 统一收尾入口（幂等，防重复收尾，F3-11）。
+     *
+     * 语义：同一次回答的收尾动作（移除光标 + 渲染信息栏 + 终态提示）
+     *       必须"只执行一次"。本函数是所有收尾路径的唯一入口：
+     *         - case "finish" 正常路径（P1）
+     *         - 循环退出后（P4）
+     *         - catch 的 AbortError 分支（P5 / P6）
+     *
+     * 幂等机制：
+     *   1. 进入时检查 state.completed，若已为 true 直接返回（不重复收尾）；
+     *   2. 执行收尾体后置 state.completed = true；
+     *   3. state.completed 的生命周期与"一次回答"对齐（轮初/轮末复位）。
+     *
+     * 关键约束：
+     *   - 必须在 US-3.5 的 finally 清理之前调用（依赖 currentBubbleEl / currentStartTime）；
+     *   - 本函数只读 state、不写 sessionStats（usage 记 0 由 US-3.6 保证）；
+     *   - 不修改任何既有收尾动作的"内容"，仅将其收敛到一处并加幂等保护。
+     *
+     * @param {boolean} interrupted - 是否为"打断收尾"：
+     *        true  → 渲染"已中断"信息栏 + "⏹️ 已停止"提示（US-3.4/3.6）；
+     *        false → 正常收尾（信息栏与"✅ 完成"由调用方在收尾前/后处理，见第三章）。
+     * @returns {boolean} - 本次是否实际执行了收尾（true=执行；false=已收尾过，跳过）
+     */
+    function finalizeOnce(interrupted) {
+        // 幂等保护：已收尾则直接返回，避免重复渲染信息栏 / 重复提示（F3-11）
+        if (state.completed) return false;
+
+        // 标记为已收尾（先置位，防止收尾体内部再次触发收尾路径造成递归/重入）
+        state.completed = true;
+
+        // 统一收尾体：
+        // 1) 移除光标、收起思考块（幂等：cursor 已移除时 querySelector 返回 null）
+        finishStream();
+
+        // 2) 终态展示
+        if (interrupted) {
+            // 打断收尾：渲染"已中断"信息栏（US-3.6）+ "已停止"提示（US-3.4）
+            renderInterruptedInfoBar();
+            setStoppedStatus();
+        } else {
+            // 正常收尾：终态提示由调用方负责（保持原"✅ 完成"逻辑不变，零回归）
+            //   说明：正常路径的信息栏 + usage 累加在 case "finish" 内已完成，
+            //         此处不重复处理，仅确保收尾动作只执行一次。
+        }
+
+        return true;
     }
 
     /**
@@ -572,6 +752,24 @@
     function setStatus(text, className) {
         $dom.status.textContent = text;
         $dom.status.className = "chat-status" + (className ? " " + className : "");
+    }
+
+    /**
+     * [US-3.4] 设置"打断/停止"状态提示（统一入口，显式非错误样式）。
+     *
+     * 语义（F3-4）：打断过程与结果以"已停止/已中断"提示，**不得呈现为错误**。
+     *   - 统一文案：终态固定为 "⏹️ 已停止"，可选追加时间；
+     *   - 显式样式：固定使用 "chat-status--stopped"（非错误色），
+     *     不再依赖 .chat-status 的默认灰色（把"非错误"从隐式约定变为显式契约）；
+     *   - 集中收口：所有打断相关提示均经此函数，避免文案/样式再次分散。
+     *
+     * @param {boolean} [withTime=true] - 是否追加当前时间（终态默认追加）
+     */
+    function setStoppedStatus(withTime = true) {
+        const text = withTime
+            ? `⏹️ 已停止 (${getTimeStr()})`
+            : "⏹️ 已停止";
+        setStatus(text, "chat-status--stopped");
     }
 
     /**
@@ -599,6 +797,139 @@
         if (enabled) {
             $dom.input.focus();
         }
+    }
+
+    /**
+     * [US-3.1] 控制「停止」入口的显隐。
+     * 仅在 AI 流式输出进行中显示，非输出状态隐藏。
+     * @param {boolean} visible
+     */
+    function setStopBtnVisible(visible) {
+        if (!$dom.stopBtn) return;
+        $dom.stopBtn.hidden = !visible;
+    }
+
+    /**
+     * [US-3.2 / US-3.8] 启动排空超时兜底。
+     *
+     * 语义：打断后若在 CONFIG.DRAIN_TIMEOUT_MS 内仍未读到流结束（服务端未关流），
+     *       则强制收尾，避免读取循环永久阻塞、界面卡死。
+     *
+     * 超时动作：
+     *   1. 置显式超时标记 state.drainTimedOut = true（US-3.8），
+     *      使"排空超时"可被 catch 分支稳定识别（不依赖 draining 的时序）；
+     *   2. 记录超时日志（含 requestId，便于观测）；
+     *   3. 主动取消本地读取器（释放底层连接），让读取循环尽快退出。
+     *
+     * 实现说明：本函数只负责"计时"与"超时后取消读取器"，
+     *           真正的收尾（移除光标、复位状态）由读取循环退出后的统一逻辑完成，
+     *           避免收尾逻辑分散在多处导致重复执行（呼应 US-3.7 防重复收尾）。
+     */
+    function startDrainTimeout() {
+        clearDrainTimeout(); // 防重复：先清理旧计时器
+        state.drainTimer = setTimeout(() => {
+            state.drainTimer = null;
+            // 超时仍未排空完成 → 主动取消本地读取器，让读取循环尽快退出
+            if (!state.draining || !state.abortController) return;
+
+            // [US-3.8] 置显式超时标记（先于 abort，确保 catch 能识别本次为超时中断）
+            state.drainTimedOut = true;
+            console.warn(
+                `[US-3.8] 排空超时(${CONFIG.DRAIN_TIMEOUT_MS}ms)，强制收尾`,
+                state.currentRequestId || ""
+            );
+            state.abortController.abort();
+        }, CONFIG.DRAIN_TIMEOUT_MS);
+    }
+
+    /**
+     * [US-3.2] 清理排空超时计时器（幂等）。
+     */
+    function clearDrainTimeout() {
+        if (state.drainTimer) {
+            clearTimeout(state.drainTimer);
+            state.drainTimer = null;
+        }
+    }
+
+    /**
+     * [US-3.3] 生成一个请求标识（requestId）。
+     * 用于带外取消：随 /stream 请求发送，打断时据此取消对应上游请求。
+     * 格式：req_<时间戳36进制>_<UUID>，与 sessionId 风格一致，保证唯一性。
+     * @returns {string}
+     */
+    function generateRequestId() {
+        try {
+            return "req_" + Date.now().toString(36) + "_" + crypto.randomUUID();
+        } catch {
+            // 极端环境无 crypto.randomUUID 时降级（唯一性略降，但可用）
+            return "req_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2);
+        }
+    }
+
+    /**
+     * [US-3.3] 发送带外取消请求（停止未来）。
+     *
+     * 语义：用户打断时调用。**不切断本地流**，而是另发一个独立请求，
+     *       携带 requestId，服务端据此 abort() 对应的上游模型请求。
+     *
+     * 容错：取消是"尽力而为"的操作，任何失败（网络错误、404、超时）
+     *       均**静默忽略**，不弹错误、不阻塞本地排空（US-3.2 继续读在途数据）。
+     *
+     * @param {string|null} requestId
+     */
+    function sendCancelRequest(requestId) {
+        if (!requestId) return;
+        // 独立请求：不绑定 state.abortController，避免与本地流共用信号；
+        // 使用 keepalive 提升页面卸载/切换时的送达率（可选，现代浏览器支持）。
+        fetch(CONFIG.CANCEL_ENDPOINT, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ requestId }),
+            keepalive: true,
+        }).catch((e) => {
+            // 取消失败不影响本地排空，静默记录即可
+            console.warn("[US-3.3] 发送取消请求失败（已忽略）:", e);
+        });
+    }
+
+    /**
+     * [US-3.1 / US-3.2 / US-3.3 / US-3.4] 用户点击「停止」入口。
+     *
+     * US-3.1：记录打断意图（stopRequested）并给出即时反馈。
+     * US-3.2：进入"排空态"（draining），**不切断本地流**，
+     *         继续接收并显示在途数据（③④⑤ 段），直至流结束或排空超时。
+     * US-3.3：发送带外取消请求（停止未来），取消上游模型请求。
+     * US-3.4：即时反馈文案统一为"正在停止…"，并显式使用非错误样式。
+     *
+     * 注意（与 US-3.3 的边界）：
+     *   - 本函数**不调用** abortController.abort()，以保证本地流继续读取；
+     *   - "停止未来"（取消上游模型请求）由 US-3.3 通过**带外取消请求**实现，
+     *     本地流读取不受影响。
+     */
+    function requestStop() {
+        // 非输出状态：无操作（防御性）
+        if (!state.isStreaming) return;
+        // 防重复：已请求过则不重复触发（呼应 US-3.7）
+        if (state.stopRequested) return;
+
+        // 1. 记录打断意图（US-3.1）
+        state.stopRequested = true;
+
+        // 2. 进入排空态（US-3.2）：读取循环据此继续消费在途数据
+        state.draining = true;
+
+        // 3. [US-3.4] 即时反馈：提示"正在停止…"，显式使用非错误样式；
+        //    同时隐藏停止入口避免重复点击。
+        setStatus("⏹️ 正在停止…", "chat-status--stopped");
+        setStopBtnVisible(false);
+
+        // 4. 启动排空超时兜底（US-3.2 / US-3.8）：超时未排空则强制收尾
+        startDrainTimeout();
+
+        // 5. [US-3.3] 发送带外取消请求（停止未来）：
+        //    不切断本地流（US-3.2 继续读在途数据），而是另发独立请求取消上游。
+        sendCancelRequest(state.currentRequestId);
     }
 
     // ============================================
@@ -669,6 +1000,11 @@
         // 累积完整的助手回复内容（不会被 finishStream 清空）
         let fullContent = "";
 
+        // [US-3.7] 本轮回答开始：复位收尾标记，保证本轮收尾不被上一轮误跳过。
+        state.completed = false;
+        // [US-3.8] 本轮回答开始：复位排空超时标记，保证本轮超时判定不被上一轮污染。
+        state.drainTimedOut = false;
+
         // 创建 AbortController
         state.abortController = new AbortController();
         const { signal } = state.abortController;
@@ -692,13 +1028,21 @@
             // 记录本次回答开始时间（前端计时，R3.4）
             state.currentStartTime = performance.now();
 
+            // [US-3.3] 生成本次请求标识，随请求体发送，供带外取消定位。
+            state.currentRequestId = generateRequestId();
+
             // 发起流式请求（US-2.2：只发单条 message，历史由服务端持有）
             const response = await fetch(CONFIG.API_ENDPOINT, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ sessionId: state.sessionId, message }),
+                // [US-3.3] 请求体新增 requestId
+                body: JSON.stringify({
+                    sessionId: state.sessionId,
+                    message,
+                    requestId: state.currentRequestId,
+                }),
                 signal,
             });
 
@@ -757,8 +1101,26 @@
                                 break;
 
                             case "finish":
-                                // 完成
-                                finishStream();
+                                // [US-3.2] 排空态下：用户已打断，本次回答不应按"正常完成"处理。
+                                //   - 跳过"✅ 完成"提示（避免与循环退出后的"⏹️ 已停止"冲突/闪烁）；
+                                //   - 跳过 usage 累加（被打断回答 usage 记 0，详见 US-3.6）。
+                                //   注意：仍执行 finishStream() 移除光标，保证视觉收尾。
+                                if (state.draining) {
+                                    finishStream();
+                                    break;   // 跳出 switch，交由循环退出后的统一收尾处理
+                                }
+
+                                // [US-3.7] 正常收尾经统一入口（幂等）：
+                                //   移除光标 + 置 completed=true，防止循环退出后 P4 重复收尾。
+                                //   注：信息栏 + usage 累加 + "✅ 完成" 仍在下方按原逻辑执行（零回归）。
+                                finalizeOnce(false);
+
+                                // [US-3.6] 暂存模型名：正常路径用于信息栏；若本轮随后被打断，
+                                //          亦可作为打断信息栏的模型名来源（打断可能无 finish）。
+                                if (data.raw && data.raw.model) {
+                                    state.currentModel = data.raw.model;
+                                }
+
                                 if (data.usage) {
                                     // 计算耗时（前端计时，R3.4）
                                     const elapsedMs = state.currentStartTime
@@ -796,6 +1158,16 @@
                                 break;
 
                             case "error":
+                                // [US-3.4] 排空态下：用户已打断，此 error 很可能由"上游取消"引发，
+                                //   不应呈现为错误（F3-4：打断不得呈现为错误）。
+                                //   处理：仅移除光标（视觉收尾），跳过错误 UI；
+                                //         终态提示交由循环退出后的统一收尾（setStoppedStatus）给出。
+                                if (state.draining) {
+                                    finishStream();
+                                    break;   // 跳出 switch，继续 while 读取在途数据
+                                }
+
+                                // 非打断态：真实错误，保持原逻辑不变（红色错误样式）
                                 finishStream();
                                 setStatus(`❌ 错误: ${data.message}`, "chat-status--error");
                                 break;
@@ -807,20 +1179,69 @@
                 }
             }
 
-            // 流正常结束
-            finishStream();
+            // 流结束（done === true）：
+            //   - 正常结束：未打断，走原收尾；
+            //   - 排空完成：已打断（draining），在途数据已全部消费，同样收尾。
+            // 两种情况在此统一收尾，天然避免重复（呼应 US-3.7）。
+            const wasDraining = state.draining;   // [US-3.2] 记录是否为"打断后排空结束"
+
+            // 排空完成：清理超时计时器（避免定时器在收尾后仍触发）
+            clearDrainTimeout();                  // [US-3.2]
+
             // 如果还没有收到 finish 事件（可能某些模型不返回 usage）
+            // 注意：必须在 finalizeOnce 之前完成——finalizeOnce 内部 finishStream()
+            //       会清空 state.currentAssistantContent。
             if (!fullContent) {
                 fullContent = state.currentAssistantContent;
             }
+
+            // [US-3.7] 统一收尾（幂等）：
+            //   - 若 P1 已收尾（completed=true）→ finalizeOnce 直接跳过，避免重复；
+            //   - 若尚未收尾（如无 finish 事件）→ 此处完成收尾。
             if (!state.isStreaming) {
-                setStatus(`✅ 完成 (${getTimeStr()})`);
+                // [US-3.4] 排空完成 → 统一"已停止"提示（非错误样式）；
+                //           正常完成 → 保持原"✅ 完成"不变。
+                if (wasDraining) {
+                    // [US-3.6] 打断收尾（排空完成）：渲染"已中断"信息栏 + usage 记 0。
+                    //   注意：必须在 finally 清理 currentBubbleEl/currentStartTime 之前执行！
+                    //   本函数只读 state、不写 sessionStats（F3-8：不累加）。
+                    finalizeOnce(true);
+                } else {
+                    // 正常收尾：finalizeOnce(false) 只移除光标 + 置位；
+                    //   终态提示按原逻辑给出（零回归）。
+                    finalizeOnce(false);
+                    setStatus(`✅ 完成 (${getTimeStr()})`);
+                }
             }
         } catch (err) {
             // 处理错误
             if (err.name === "AbortError") {
-                setStatus("⏹️ 已取消");
-                finishStream();
+                // [US-3.2 / US-3.8] 区分两种 abort 来源：
+                //   (a) 排空超时兜底触发的 abort：此时 drainTimedOut === true（US-3.8 显式标记），
+                //       或 draining === true（US-3.2 兜底判定），
+                //       说明"打断后未能及时排空"，直接收尾即可，不重复提示；
+                //   (b) 其他 abort（如页面卸载、外部取消）：按原逻辑处理。
+                // 注意：US-3.2 自身**不主动 abort 本地流**（除超时兜底），
+                //       "停止未来"由 US-3.3 的带外取消请求完成，故此处分支
+                //       在 US-3.2 阶段主要用于承接"排空超时"。
+                clearDrainTimeout();          // [US-3.2] 清理计时器（幂等）
+
+                // [US-3.7] 统一收尾（幂等）：
+                //   - 排空超时（drainTimedOut/draining=true）→ 打断收尾（信息栏 + "已停止"）；
+                //   - 非排空 abort（页面卸载等）→ 仅收尾提示，不渲染"已中断"信息栏。
+                // [US-3.8] 判定优先使用 drainTimedOut（显式超时标记），
+                //          避免 draining 在时序上被提前复位而丢失"已中断"信息栏。
+                if (state.drainTimedOut || state.draining) {
+                    // [US-3.6] 打断收尾（排空超时）：渲染"已中断"信息栏 + usage 记 0。
+                    //   同样必须在 finally 清理之前执行。
+                    finalizeOnce(true);
+                } else {
+                    // [US-3.4] 非排空 abort（如页面卸载、外部取消）：
+                    //          同样以"已停止"呈现，避免"已取消"措辞不统一。
+                    //   注：非排空 abort 不属于"用户打断排空"，不渲染"已中断"信息栏。
+                    finalizeOnce(false);
+                    setStoppedStatus(false);
+                }
                 return fullContent; // 取消时返回已累积的内容
             }
 
@@ -842,6 +1263,34 @@
         } finally {
             state.isStreaming = false;
             state.abortController = null;
+            // [US-3.2] 复位打断相关状态，保证下一轮回答干净：
+            //   - stopRequested：US-3.1 遗留未复位，此处补齐；
+            //   - draining：排空态复位；
+            //   - drainTimer：清理超时计时器，避免泄漏。
+            state.stopRequested = false;
+            state.draining = false;
+            state.drainTimedOut = false;     // [US-3.8] 复位排空超时标记
+            state.currentRequestId = null;   // [US-3.3] 清理本次请求标识
+
+            // [US-3.5] 统一清理"指向旧气泡的流式引用"，确保新消息不串入旧气泡（F3-7）。
+            //   背景：这些引用原先仅在"正常 finish 分支生成信息栏后"清理，
+            //         打断路径（排空 finish / 排空 error / 循环退出 / 超时 catch）
+            //         不会走到该清理点，导致引用残留、跨轮串写。
+            //   原则：**只置引用为 null，绝不 remove() DOM**——
+            //         旧气泡及其内容（正文/思考/工具）必须保留（F3-5）。
+            //   幂等：与正常 finish 分支的既有清理重复执行无害。
+            state.currentBubbleEl = null;
+            state.currentThinkEl = null;
+            state.currentThinkContent = "";
+            state.currentToolEl = null;
+            state.currentInfoEl = null;
+            state.currentStartTime = 0;
+            state.currentAssistantContent = "";   // [US-3.5] 一并复位累积缓冲
+            state.currentModel = "";              // [US-3.6] 复位本次回答模型名
+            state.completed = false;              // [US-3.7] 兜底复位收尾标记
+
+            clearDrainTimeout();
+            setStopBtnVisible(false);     // [US-3.1] 流结束隐藏「停止」入口
             setInputEnabled(true);
         }
 
@@ -879,6 +1328,25 @@
 
         // [US-2.2] 发送单条消息（历史由服务端持有），并将助手回复加入本地历史
         state.isStreaming = true;
+        state.stopRequested = false;      // [US-3.1] 新一轮回答重置打断标志
+        state.draining = false;           // [US-3.2] 新一轮回答重置排空态
+        state.drainTimedOut = false;      // [US-3.8] 新一轮回答重置排空超时标记
+
+        // [US-3.5] 新一轮开始前，清空"指向上一轮气泡的流式引用"，
+        //   消除 sendMessage → sendStreamRequest 引用复位点之间的时序窗口，
+        //   确保新消息绝不串入旧气泡（F3-7 / T-3.5.3）。
+        //   注：sendStreamRequest 开头仍会再次复位（幂等），此处为提前兜底。
+        state.currentBubbleEl = null;
+        state.currentThinkEl = null;
+        state.currentThinkContent = "";
+        state.currentToolEl = null;
+        state.currentInfoEl = null;
+        state.currentStartTime = 0;
+        state.currentAssistantContent = "";   // [US-3.5] 一并复位累积缓冲
+        state.currentModel = "";              // [US-3.6] 复位本次回答模型名
+        state.completed = false;              // [US-3.7] 新一轮复位收尾标记
+
+        setStopBtnVisible(true);          // [US-3.1] 显示「停止」入口
         sendStreamRequest(text).then((assistantContent) => {
             // 请求完成后，将助手的回复加入本地历史（供界面渲染）
             if (assistantContent) {
@@ -916,6 +1384,11 @@
 
         // 发送按钮点击
         $dom.sendBtn.addEventListener("click", sendMessage);
+
+        // [US-3.1] 停止按钮点击（打断入口）
+        if ($dom.stopBtn) {
+            $dom.stopBtn.addEventListener("click", requestStop);
+        }
 
         // R2-1：默认问题行已删除，此处不再绑定 #chat-suggestions 的点击事件
 
