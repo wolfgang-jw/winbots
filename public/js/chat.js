@@ -32,6 +32,7 @@
  * 27. US-2.2 新建入口迁移：顶部菜单「新建会话」动作项绑定点击（新建 + 切回会话视图）
  * 28. US-2.4 入口唯一：删除历史视图旧「新建会话」按钮及其绑定
  * 29. US-2.7 动作项链接化：href 携带 ?view=chat&new=1 + init 解析 ?new=1 进入空白新会话
+ * 30. US-3.1 刷新即新会话：init 加载即 newSession()（绕过 sessionStorage 缓存），合并 ?new=1 分支
  */
 
 (function () {
@@ -1472,6 +1473,8 @@
      *   因此"新建会话"**不能**只把 state.sessionId 置空（会被缓存"复活"），
      *   必须**显式调用** POST /api/chat/session 分配新 ID，并 persistSessionId 覆盖缓存。
      *
+     * [US-3.1] 复用点：init() 加载时亦调用本函数，实现"刷新即新会话"。
+     *
      * @returns {Promise<boolean>} - 是否成功新建
      */
     async function newSession() {
@@ -1703,9 +1706,13 @@
         // 启用输入
         setInputEnabled(true);
 
-        // [US-2.1] 预获取会话 ID（异步，不阻塞界面初始化）
-        ensureSessionId().then((id) => {
-            console.log("🆔 当前会话 ID:", id);
+        // [US-3.1] 刷新/新开标签页即全新会话（F1-1/F1-2）：
+        //   不再调用 ensureSessionId()（其会优先复用 sessionStorage 缓存，
+        //   导致刷新后续接旧会话）；改为直接调用 newSession() 强制分配全新会话，
+        //   并清空消息区、复位统计与流式引用，使界面处于空白新会话。
+        //   注：newSession() 内部已 persistSessionId 覆盖缓存，且含流式守卫（加载时通常无流式）。
+        newSession().then((ok) => {
+            if (ok) console.log("🆕 已进入全新会话（刷新即新会话）");
         });
 
         // [US-4.4] 暴露 openSession 供历史列表点击调用
@@ -1756,11 +1763,10 @@
         const initialView = params.get("view") || "chat";
         switchView(initialView);
 
-        // [US-2.7] 支持 ?new=1：新标签页经 /?view=chat&new=1 打开时进入空白新会话（F3-8）。
-        //   注意：newSession() 内含流式守卫；加载时通常无流式，故直接调用即可。
-        if (params.get("new") === "1") {
-            newSession();
-        }
+        // [US-2.7] ?new=1 语义（F3-8）已由上方 [US-3.1] 的「加载即新建会话」统一覆盖：
+        //   无论是否携带 ?new=1，页面加载都会进入全新空白会话，二者天然幂等，
+        //   故此处不再重复调用 newSession()，避免加载时分配两次会话 ID。
+        //   （保留 params 解析用于 ?view= 初始视图，见上方 [US-1.4]。）
 
         console.log("🤖 Bots AI Chat 已初始化");
     }
