@@ -21,10 +21,16 @@
                 </div>
                 <p class="header__subtitle">流式对话</p>
                 <!-- US-4.8: 顶部菜单（会话 / 历史 / 状态） -->
+                <!-- [US-1.4] 导航项改为链接，支持右键「在新标签页中打开链接」；href 携带 ?view= 供新页解析 -->
                 <nav class="top-menu" id="top-menu">
-                    <button class="top-menu__item top-menu__item--active" data-view="chat">会话</button>
-                    <button class="top-menu__item" data-view="history">历史</button>
-                    <button class="top-menu__item" data-view="status">状态</button>
+                    <a class="top-menu__item top-menu__item--active" data-view="chat" href="/?view=chat">会话</a>
+                    <a class="top-menu__item" data-view="history" href="/?view=history">历史</a>
+                    <a class="top-menu__item" data-view="status" href="/?view=status">状态</a>
+                    <!-- [US-2.3] 导航区 / 动作区 分隔符（F3-4）：明确区分左侧导航项与右侧动作项 -->
+                    <span class="top-menu__divider" aria-hidden="true"></span>
+                    <!-- [US-2.1] 新建会话动作项：位于菜单栏同一行右侧（F3-1），随菜单常驻，三视图均可见（F3-2） -->
+                    <!-- [US-2.7] 链接化：href 携带 ?view=chat&new=1，支持右键「在新标签页中打开链接」并进入空白新会话（F3-8） -->
+                    <a class="top-menu__action" id="top-menu-new" href="/?view=chat&new=1">＋ 新建会话</a>
                 </nav>
             </div>
         </div>
@@ -71,7 +77,8 @@
     <section class="history-layout" id="view-history" hidden>
         <div class="history-header">
             <h2 class="history-header__title">历史会话</h2>
-            <button class="history-new-btn" id="history-new-btn">＋ 新建会话</button>
+            <!-- [US-2.4] 删除历史视图旧「新建会话」入口，保证入口唯一（F3-5）；
+                 新建入口统一由顶部菜单 #top-menu-new 承担。 -->
         </div>
         <ul class="history-list" id="history-list"></ul>
         <div class="history-empty" id="history-empty" hidden>

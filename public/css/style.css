@@ -1010,35 +1010,35 @@ padding: 12px 16px;
 /* ---------- M1 顶部菜单 ---------- */
 .top-menu {
     display: flex;
-    justify-content: center;
-    gap: 8px;
+    align-items: center;
+    justify-content: flex-start;   /* 导航栏左对齐；右侧动作区由 US-2.1 用 margin-left:auto 顶到最右 */
+    gap: 4px;
     margin-top: 14px;
+    flex-wrap: nowrap;             /* 窄屏由内部收缩，不换行溢出（F3-7 预留） */
 }
 
+/* 导航项：透明背景 + 文字导航，呈现 Tab 观感（F2-1） */
 .top-menu__item {
-    background: rgba(255, 255, 255, 0.15);
-    color: var(--white);
-    border: 1px solid rgba(255, 255, 255, 0.35);
-    padding: 6px 20px;
-    border-radius: 20px;
+    position: relative;               /* 为 US-1.2 的底部指示条 ::after 定位 */
+    background: transparent;          /* 去按钮底色 */
+    color: rgba(255, 255, 255, 0.85); /* 未选中：半透明白字 → 普通未激活态（F2-5） */
+    border: none;                     /* 去按钮边框 */
+    border-radius: 0;                 /* 去胶囊圆角 */
+    padding: 8px 16px 10px;           /* 底部多留 2px，容纳 US-1.2 指示条 */
     font-size: 0.9rem;
     font-weight: 600;
+    text-decoration: none;            /* US-1.4 将改为 <a>，此处预先去下划线 */
     cursor: pointer;
-    transition: background 0.2s, color 0.2s, transform 0.1s;
+    transition: color 0.2s;
 }
 
 .top-menu__item:hover {
-    background: rgba(255, 255, 255, 0.28);
+    color: var(--white);              /* 仅轻微提亮，保留 hover 反馈（去按钮式反馈） */
 }
 
-.top-menu__item:active {
-    transform: scale(0.97);
-}
-
+/* 选中态：本 US 先提供基础字色区分；US-1.2 升级为底部指示条 */
 .top-menu__item--active {
-    background: var(--egg-yellow);
-    color: var(--gray-800);
-    border-color: var(--egg-yellow);
+    color: var(--egg-yellow);         /* 选中项高亮字色（蛋黄色） */
 }
 
 /* ---------- M2 历史视图 ---------- */
@@ -1207,5 +1207,94 @@ padding: 12px 16px;
     .status-view__frame {
         min-height: calc(100vh - 120px);
         height: calc(100vh - 120px);
+    }
+}
+
+
+/* ============================================
+   [US-1.2] 当前选中项视觉反馈（F2-2）
+   在 US-1.1 的「字色高亮」基础上，叠加底部指示条，
+   形成明确的 Tab 选中标识。置于文件末尾确保优先级，
+   且 ::after 为新增伪元素，不与既有规则冲突。
+   ============================================ */
+.top-menu__item--active::after {
+    content: "";
+    position: absolute;               /* 相对 .top-menu__item（US-1.1 已设 position:relative）定位 */
+    left: 12px;
+    right: 12px;
+    bottom: 0;
+    height: 3px;
+    background: var(--egg-yellow);
+    border-radius: 2px;
+}
+
+
+/* ============================================
+   [US-2.1] 新建会话动作项（F3-1 / F3-2）
+   置于菜单栏同一行最右：margin-left:auto 在 flex 容器中把动作项顶到最右。
+   与左侧「透明文字导航项」形成基础视觉区分（F3-4，US-2.3 进一步强化）。
+   ============================================ */
+.top-menu__action {
+    margin-left: auto;            /* 顶到菜单栏最右，与左侧导航区分开（F3-1） */
+    background: var(--egg-yellow);
+    color: var(--gray-800);
+    border: none;
+    padding: 6px 16px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    text-decoration: none;
+    white-space: nowrap;          /* 窄屏不换行（为 US-2.6 打底） */
+    transition: opacity 0.2s, transform 0.1s;
+}
+
+.top-menu__action:hover {
+    opacity: 0.9;
+}
+
+.top-menu__action:active {
+    transform: scale(0.97);
+}
+
+
+/* ============================================
+   [US-2.3] 导航区 / 动作区 视觉区分（F3-4）
+   在导航项与「新建会话」动作项之间插入竖线分隔符，
+   形成"左侧导航区 | 右侧动作区"的显式分区。
+   ============================================ */
+.top-menu__divider {
+    width: 1px;
+    height: 20px;
+    background: rgba(255, 255, 255, 0.4);   /* 半透明白竖线，与导航文字同色系 */
+    margin: 0 12px;                          /* 左右留白，避免紧贴 */
+    margin-left: auto;                       /* [US-2.3] 把"分隔符 + 动作项"整体顶到最右 */
+    flex-shrink: 0;                          /* 窄屏不被压缩（为 US-2.6 打底） */
+}
+
+/* [US-2.3] 右推职责移交分隔符：动作项不再自带 margin-left:auto，
+   避免同一 flex 行中多个 auto 均分剩余空间、导致分隔符与动作项之间出现大间隙。 */
+.top-menu__action {
+    margin-left: 0;
+}
+
+
+/* ============================================
+   [US-2.6] 窄屏适配（F3-7）
+   补充菜单栏在窄屏下的收缩规则：收紧 gap、分隔符留白、动作项尺寸，
+   保证 320~600px 宽度下菜单栏单行不溢出、各入口仍可点击。
+   说明：.top-menu__item 的窄屏收缩已在 M4 段存在，此处不重复。
+   ============================================ */
+@media (max-width: 600px) {
+    .top-menu {
+        gap: 2px;                    /* 收紧导航项间距 */
+    }
+
+    .top-menu__divider {
+        margin: 0 6px;               /* 分隔符左右留白减半（24px → 12px） */
+    }
+
+    .top-menu__action {
+        padding: 5px 12px;           /* 动作项内边距收缩 */
+        font-size: 0.78rem;          /* 动作项字号缩小 */
     }
 }

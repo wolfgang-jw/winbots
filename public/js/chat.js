@@ -27,6 +27,11 @@
  * 22. US-4.7 新建会话：新增 newSession() 主动分配全新会话并复位界面（F2-8）
  * 23. US-4.8 顶部菜单与多视图：新增 switchView() 在「会话/历史/状态」间切换（F2-9）
  * 24. US-4.8 历史视图：新增 renderSessionList() 渲染会话列表（打开/删除/新建）
+ * 25. US-1.3 选中态与视图同步：switchView 增加合法值守卫 + init 末尾显式初始化默认视图
+ * 26. US-1.4 导航项链接化：菜单点击拦截左键保留 href + ?view= 初始视图解析 + URL 同步
+ * 27. US-2.2 新建入口迁移：顶部菜单「新建会话」动作项绑定点击（新建 + 切回会话视图）
+ * 28. US-2.4 入口唯一：删除历史视图旧「新建会话」按钮及其绑定
+ * 29. US-2.7 动作项链接化：href 携带 ?view=chat&new=1 + init 解析 ?new=1 进入空白新会话
  */
 
 (function () {
@@ -72,7 +77,9 @@
         viewStatus: document.getElementById("view-status"),
         historyList: document.getElementById("history-list"),
         historyEmpty: document.getElementById("history-empty"),
-        historyNewBtn: document.getElementById("history-new-btn"),
+        // [US-2.4] 历史视图旧「新建会话」按钮已删除，此处不再缓存其引用（入口唯一，F3-5）
+        // [US-2.2] 顶部菜单「新建会话」动作项（US-2.1 新增）
+        topMenuNew: document.getElementById("top-menu-new"),
     };
 
     // ============================================
@@ -1544,10 +1551,24 @@
      * 关键依赖：CSS 中的 `[hidden] { display: none !important; }` 规则，
      *           否则 .chat-layout / .history-layout 的 display:flex 会覆盖 hidden。
      *
+     * [US-1.3] 选中态与视图同步：
+     *   - 增加合法值守卫，非法 view 回退 chat，避免三项全不选中导致"视图-选中态错位"（N4）；
+     *   - 菜单高亮由下方 toggle(btn.dataset.view === view) 保证"恰好一项选中"。
+     *
+     * [US-1.4] URL 同步：用 history.replaceState 将当前视图写入 ?view=（不刷新），
+     *   使地址栏与视图一致，便于分享/刷新（新标签页经 href 打开亦能解析）。
+     *
      * @param {string} view - chat / history / status
      * @returns {boolean} - 是否切换成功
      */
     function switchView(view) {
+        // [US-1.3] 合法值守卫：非法 view 回退到 chat，避免三项全不选中导致"视图-选中态错位"（N4）
+        const VALID_VIEWS = ["chat", "history", "status"];
+        if (!VALID_VIEWS.includes(view)) {
+            console.warn("[US-1.3] 非法视图，回退到 chat:", view);
+            view = "chat";
+        }
+
         state.currentView = view;
 
         // 1. 切换视图容器显隐（仅切 hidden，不销毁 DOM）
@@ -1565,6 +1586,13 @@
             renderSessionList();
         }
 
+        // [US-1.4] 同步 URL（不刷新）：使地址栏与当前视图一致，便于分享/刷新
+        try {
+            const url = new URL(location.href);
+            url.searchParams.set("view", view);
+            history.replaceState(null, "", url);
+        } catch { /* 忽略 */ }
+
         return true;
     }
 
@@ -1574,8 +1602,7 @@
      * 数据来源：GET /api/chat/sessions（US-4.3），已按最后活动时间倒序。
      * 交互：
      *   - 点击列表项 → openSession(id) 打开并切回会话视图；
-     *   - 点击删除按钮 → DELETE /api/chat/sessions/:id（US-4.6）后刷新列表；
-     *   - 点击「新建会话」→ newSession()（US-4.7）并切回会话视图。
+     *   - 点击删除按钮 → DELETE /api/chat/sessions/:id（US-4.6）后刷新列表。
      *
      * 安全：标题/时间经 escapeHtml 转义，防止 XSS。
      *
@@ -1688,13 +1715,31 @@
         window.__winbotsNewSession = newSession;
 
         // [US-4.8] 顶部菜单点击切换视图
-        $dom.menuItems.forEach((btn) => {
-            btn.addEventListener("click", () => switchView(btn.dataset.view));
+        // [US-1.4] 链接化：仅拦截普通左键走 SPA 切换；修饰键/中键/右键放行原生行为（新标签页打开）
+        $dom.menuItems.forEach((item) => {
+            item.addEventListener("click", (e) => {
+                if (e.defaultPrevented || e.button !== 0
+                    || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+                    return;   // 放行：浏览器原生「在新标签页中打开链接」
+                }
+                e.preventDefault();   // 拦截左键：SPA 内切换，不整页刷新
+                switchView(item.dataset.view);
+            });
         });
 
-        // [US-4.8] 历史视图「新建会话」按钮
-        if ($dom.historyNewBtn) {
-            $dom.historyNewBtn.addEventListener("click", async () => {
+        // [US-2.4] 历史视图旧「新建会话」按钮已删除，其绑定一并移除（入口唯一，F3-5）；
+        //          新建入口统一由下方顶部菜单动作项承担。
+
+        // [US-2.2] 顶部菜单「新建会话」动作项：新建 + 切回会话视图（F3-3）
+        //   行为与历史视图旧按钮一致：newSession() 内部含流式守卫（F3-6，US-2.5 复用）。
+        //   [US-2.7] 链接化后，此处同样需拦截普通左键，放行修饰键/中键/右键原生行为。
+        if ($dom.topMenuNew) {
+            $dom.topMenuNew.addEventListener("click", async (e) => {
+                if (e.defaultPrevented || e.button !== 0
+                    || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) {
+                    return;   // 放行：浏览器原生「在新标签页中打开链接」
+                }
+                e.preventDefault();   // 拦截左键：SPA 内新建，不整页刷新
                 await newSession();
                 switchView("chat");
             });
@@ -1702,6 +1747,20 @@
 
         // [US-4.8] 暴露 switchView 供手动验证
         window.__winbotsSwitchView = switchView;
+
+        // [US-1.3] 初始化默认视图为「会话」，由 switchView 单一入口驱动
+        //   「视图显隐 + 菜单选中态」同步，保证默认选中「会话」（F2-4）。
+        // [US-1.4] 支持 ?view= 初始视图：新标签页经 href="/?view=history" 打开后，
+        //   加载即进入对应视图（F2-6）。非法/缺省时回退 chat（switchView 内含守卫）。
+        const params = new URLSearchParams(location.search);
+        const initialView = params.get("view") || "chat";
+        switchView(initialView);
+
+        // [US-2.7] 支持 ?new=1：新标签页经 /?view=chat&new=1 打开时进入空白新会话（F3-8）。
+        //   注意：newSession() 内含流式守卫；加载时通常无流式，故直接调用即可。
+        if (params.get("new") === "1") {
+            newSession();
+        }
 
         console.log("🤖 Bots AI Chat 已初始化");
     }
