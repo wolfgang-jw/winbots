@@ -60,6 +60,22 @@ LLM_MODEL=deepseek-v4-flash
 # 思考模式（true=开启，false/留空=关闭）
 LLM_THINKING=true
 LLM_REASONING_EFFORT=high
+
+# ============================================
+# 文件工具配置（US-CFG-1）
+# ============================================
+# 总操作目录：AI 文件操作的唯一沙箱根，与 data 目录平级。
+#   默认 working，即 <项目根>/working；所有文件操作限定在此目录内，越界拒绝。
+FILE_ROOT_DIR=working
+# 读开关：控制「列出目录/读取文件/查看信息/搜索文件路径/搜索文件内容」。
+#   默认开启（读操作无副作用）。
+FILE_READ_ENABLED=true
+# 新建开关：控制「创建文件夹/创建新文件/追加内容」。
+#   默认关闭（写操作需显式开启）。
+FILE_CREATE_ENABLED=false
+# 修改开关：控制「整篇覆盖/定点替换/移动重命名/删除」。
+#   默认关闭（含删除，破坏性最强，请谨慎开启）。
+FILE_MODIFY_ENABLED=false
 ```
 
 | 配置项 | 说明 | 示例 | 是否必填 |
@@ -70,6 +86,10 @@ LLM_REASONING_EFFORT=high
 | `LLM_MODEL` | 使用的模型名称 | `deepseek-v4-flash` | ✅ 必填 |
 | `LLM_THINKING` | 思考模式开关 | `true` / `false` | 可选 |
 | `LLM_REASONING_EFFORT` | 推理强度 | `high` / `medium` / `low` | 可选 |
+| `FILE_ROOT_DIR` | AI 文件操作的沙箱总目录（与 `data` 平级） | `working` | 可选（默认 `working`） |
+| `FILE_READ_ENABLED` | 读操作开关（列目录/读文件/查信息/搜索） | `true` / `false` | 可选（默认 `true`） |
+| `FILE_CREATE_ENABLED` | 新建操作开关（建目录/建文件/追加） | `true` / `false` | 可选（默认 `false`） |
+| `FILE_MODIFY_ENABLED` | 修改操作开关（覆盖/替换/移动/**删除**） | `true` / `false` | 可选（默认 `false`） |
 
 ### 2.2 修改 API Key（必做）
 
@@ -109,6 +129,20 @@ LLM_MODEL=deepseek-chat
 ### 2.5 配置完成后
 
 配置保存后，请继续阅读下一章 **启动服务**，开始使用。
+
+### 2.6 文件工具安全说明（重要）
+
+开启文件工具后，AI 可读写指定目录。请务必了解以下安全边界：
+
+1. **沙箱边界**：所有文件操作限定在 `FILE_ROOT_DIR`（默认 `working`）目录内，
+   使用 `../` 等越界路径会被**直接拒绝**，AI 无法访问项目源码、配置文件或系统目录。
+2. **分级开关**：读 / 新建 / 修改三类操作由**独立开关**控制，默认「读开、新建关、修改关」。
+   建议按需逐步开启，不要一次性全部打开。
+3. **删除进回收站**：删除操作**不会物理销毁**文件，而是移入 `working/.trash`（带时间戳），
+   可手动恢复。删除能力随「修改开关」统一控制，无独立删除开关。
+4. **破坏性确认**：覆盖、删除等操作需 AI 显式声明确认意图，降低误操作概率。
+
+> ⚠️ 请勿将 `FILE_ROOT_DIR` 指向项目根目录或系统重要目录，以免暴露源码或误改数据。
 
 ---
 

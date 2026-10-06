@@ -23,6 +23,11 @@ export interface EnvConfig {
   LLM_THINKING: boolean;
   LLM_REASONING_EFFORT: string;
 
+  // [US-CFG-1] 文件工具配置（全部可选，带默认值；不加入 REQUIRED_VARS）
+  FILE_ROOT_DIR: string;          // 沙箱总目录（默认 working，与 data 平级）
+  FILE_READ_ENABLED: boolean;     // 读开关（默认 true）
+  FILE_CREATE_ENABLED: boolean;   // 新建开关（默认 false）
+  FILE_MODIFY_ENABLED: boolean;   // 修改开关（含删除，默认 false）
 }
 
 /** 必需的环境变量列表 */
@@ -88,6 +93,16 @@ function validateEnv(): EnvConfig {
     LLM_MODEL: Bun.env.LLM_MODEL!,
     LLM_THINKING: Bun.env.LLM_THINKING === "true",
     LLM_REASONING_EFFORT: Bun.env.LLM_REASONING_EFFORT || "high",
+
+    // [US-CFG-1] 文件工具配置（可选，带默认值）
+    //   总目录：默认 "working"（与 data 平级）；仅存目录名，绝对路径由 _shared.ts 拼接
+    FILE_ROOT_DIR: Bun.env.FILE_ROOT_DIR || "working",
+    //   读开关：默认开启（读操作无副作用）
+    FILE_READ_ENABLED: Bun.env.FILE_READ_ENABLED !== "false",
+    //   新建开关：默认关闭（写操作需显式开启）
+    FILE_CREATE_ENABLED: Bun.env.FILE_CREATE_ENABLED === "true",
+    //   修改开关：默认关闭（含删除，破坏性最强）
+    FILE_MODIFY_ENABLED: Bun.env.FILE_MODIFY_ENABLED === "true",
   };
 }
 
@@ -107,4 +122,10 @@ console.log(`  LLM_MODEL:             ${env.LLM_MODEL}`);
 console.log(`  LLM_API_KEY:           ${env.LLM_API_KEY ? "******" : "未设置"}`);
 console.log(`  LLM_THINKING:          ${env.LLM_THINKING ? "开启" : "关闭"}`);
 console.log(`  LLM_REASONING_EFFORT:  ${env.LLM_REASONING_EFFORT}`);
+// [US-CFG-1] 文件工具配置（无敏感信息，直接打印）
+console.log("-".repeat(60));
+console.log(`  FILE_ROOT_DIR:         ${env.FILE_ROOT_DIR}`);
+console.log(`  FILE_READ_ENABLED:     ${env.FILE_READ_ENABLED ? "开启" : "关闭"}`);
+console.log(`  FILE_CREATE_ENABLED:   ${env.FILE_CREATE_ENABLED ? "开启" : "关闭"}`);
+console.log(`  FILE_MODIFY_ENABLED:   ${env.FILE_MODIFY_ENABLED ? "开启" : "关闭"}`);
 console.log("=".repeat(60));

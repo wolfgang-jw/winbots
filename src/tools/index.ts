@@ -23,6 +23,7 @@
  *   - [问题 6] toWireName 截断到 64 字符时记录到 truncatedWires；
  *     fromWireName 对截断名不再做有损的 replace 兜底，改为明确报错。
  *   - [问题 2] 新增 toDisplayName()，供 chat.ts 推送可读的 callName。
+ *   - [US-CFG-1] loadTools 跳过以 _ 开头的共享模块（如 local/_shared.ts）。
  */
 import { resolve } from "path";
 
@@ -151,6 +152,11 @@ export async function loadTools(): Promise<void> {
     try {
         const glob = new Bun.Glob("**/*.ts");
         for await (const rel of glob.scan({ cwd: TOOLS_ROOT, absolute: false })) {
+            // [US-CFG-1] 跳过以 _ 开头的共享模块（如 local/_shared.ts），
+            // 它们不导出 tools，仅被其他工具 import。
+            const base = rel.split("/").pop() ?? "";
+            if (base.startsWith("_")) continue;
+
             const full = resolve(TOOLS_ROOT, rel);
             try {
                 const mod = await import(full);
