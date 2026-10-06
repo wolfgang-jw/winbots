@@ -59,7 +59,10 @@ body {
     "Helvetica Neue", Arial, "Noto Sans SC", sans-serif;
   background: linear-gradient(135deg, var(--egg-shell) 0%, var(--gray-100) 100%);
   color: var(--gray-800);
-  min-height: 100vh;
+  /* [US-UI-2] 锁定整页高度为视口高度：100dvh 优先，100vh 兜底（N12） */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;            /* [US-UI-2] 禁止整页滚动（F2-1） */
   display: flex;
   flex-direction: column;
 }
@@ -74,12 +77,12 @@ body {
 .header {
   background: linear-gradient(135deg, var(--tomato-red) 0%, var(--tomato-red-dark) 100%);
   color: var(--white);
-  padding: 24px 0;
+  padding: 12px 0;              /* [US-UI-1] 垂直内边距收敛（F1-4） */
   box-shadow: 0 4px 12px rgba(211, 47, 47, 0.3);
 }
 
 .header__inner {
-  text-align: center;
+  text-align: left;             /* [US-UI-1] 标题左移后整体左对齐（F1-2） */
 }
 
 .header__logo {
@@ -91,12 +94,12 @@ body {
 }
 
 .header__emoji {
-  font-size: 2.5rem;
+  font-size: 1.4rem;            /* [US-UI-1] 图标字号收敛（F1-4） */
   line-height: 1;
 }
 
 .header__title {
-  font-size: 1.75rem;
+  font-size: 1.15rem;           /* [US-UI-1] 标题字号收敛（F1-4） */
   font-weight: 700;
   letter-spacing: 1px;
 }
@@ -321,6 +324,7 @@ body {
   color: var(--gray-300);
   padding: 16px 0;
   text-align: center;
+  flex-shrink: 0;              /* [US-UI-2] footer 不被压缩（F2-2） */
 }
 
 .footer__text {
@@ -381,11 +385,14 @@ body {
 .chat-layout {
     display: flex;
     flex-direction: column;
-    height: calc(100vh - 140px);
-    /* 减去 header + footer 高度 */
+    /* [US-UI-2] 自适应填充 header 与 footer 之间的剩余空间（F2-3），
+       替代原 calc(100vh - 140px) 硬编码估算 */
+    flex: 1;
+    min-height: 0;               /* 关键：允许 flex 子项收缩，内部滚动才生效 */
     max-width: 900px;
     margin: 0 auto;
     padding: 0 20px;
+    width: 100%;                 /* 配合 max-width 居中，避免窄屏塌陷 */
 }
 
 /* ---------- 消息容器 ---------- */
@@ -770,8 +777,23 @@ transform: scale(0.97);
 /* ---------- 响应式 ---------- */
 @media (max-width: 600px) {
     .chat-layout {
-        height: calc(100vh - 120px);
         padding: 0 12px;
+    }
+
+    /* [US-UI-3] 移动端常驻布局（F2-7/F2-8/F2-9）：
+       整页高度已由 body 锁定为视口高度（US-UI-2），
+       此处确保 header / footer / 输入区不参与滚动，滚动容器收敛为 .chat-messages。 */
+    .header {
+        flex-shrink: 0;              /* 顶部菜单常驻，不被压缩（F2-7） */
+    }
+
+    .chat-input-area {
+        flex-shrink: 0;              /* 底部输入框常驻（F2-8） */
+    }
+
+    .chat-messages {
+        overflow-y: auto;            /* 唯一滚动容器（F2-9） */
+        -webkit-overflow-scrolling: touch;   /* iOS 惯性滚动 */
     }
 
     /* R2-2：气泡宽度由 flex 自适应，删除原 max-width:85% 以免与固定宽度规则冲突 */
@@ -1017,6 +1039,31 @@ padding: 12px 16px;
     flex-wrap: nowrap;             /* 窄屏由内部收缩，不换行溢出（F3-7 预留） */
 }
 
+/* [US-UI-1] 菜单行内标题（F1-2）：仅作视觉标识，不参与导航 */
+.top-menu__brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-right: 12px;          /* 与首个导航项留白 */
+    color: var(--white);
+    font-weight: 700;
+    letter-spacing: 1px;
+    white-space: nowrap;         /* 窄屏不换行（为 US-UI-3 打底） */
+    flex-shrink: 0;              /* 不被压缩 */
+    user-select: none;           /* 非交互标识，禁止选中 */
+    cursor: default;             /* 明确非可点击（F1-3） */
+}
+
+.top-menu__brand .header__emoji {
+    font-size: 1.4rem;           /* 与 2.3 收敛后的图标字号一致 */
+    line-height: 1;
+}
+
+.top-menu__brand .header__title {
+    font-size: 1.15rem;          /* 与 2.3 收敛后的标题字号一致 */
+    font-weight: 700;
+}
+
 /* 导航项：透明背景 + 文字导航，呈现 Tab 观感（F2-1） */
 .top-menu__item {
     position: relative;               /* 为 US-1.2 的底部指示条 ::after 定位 */
@@ -1045,7 +1092,9 @@ padding: 12px 16px;
 .history-layout {
     display: flex;
     flex-direction: column;
-    height: calc(100vh - 140px);
+    /* [US-UI-2] 自适应填充（F2-3/F2-5），替代 calc(100vh - 140px) */
+    flex: 1;
+    min-height: 0;
     max-width: 900px;
     margin: 0 auto;
     padding: 20px;
@@ -1179,34 +1228,29 @@ padding: 12px 16px;
 
 /* ---------- M3 状态视图（iframe 复用既有状态页） ---------- */
 .status-view {
+    /* [US-UI-2] 自适应填充（F2-5），替代 calc(100vh - 140px) */
     flex: 1;
+    min-height: 0;
     width: 100%;
-    min-height: calc(100vh - 140px);
 }
 
 .status-view__frame {
     display: block;
     width: 100%;
-    height: calc(100vh - 140px);
+    /* [US-UI-2] iframe 填满父容器（F2-6） */
+    height: 100%;
     border: none;
 }
 
 /* ---------- M4 响应式 ---------- */
 @media (max-width: 600px) {
     .history-layout {
-        height: calc(100vh - 120px);
         padding: 12px;
     }
 
     .top-menu__item {
         padding: 6px 14px;
         font-size: 0.82rem;
-    }
-
-    .status-view,
-    .status-view__frame {
-        min-height: calc(100vh - 120px);
-        height: calc(100vh - 120px);
     }
 }
 
@@ -1297,4 +1341,19 @@ padding: 12px 16px;
         padding: 5px 12px;           /* 动作项内边距收缩 */
         font-size: 0.78rem;          /* 动作项字号缩小 */
     }
+}
+
+
+/* ============================================
+   [US-UI-3] 状态页独立打开时的滚动兜底（不影响聊天页）
+   说明：US-UI-2 将 body 锁定为 100dvh + overflow:hidden，
+   状态页通过 iframe 嵌入时不受影响；但独立打开 status.html 时，
+   其内容（概览 + 服务卡片 + 刷新栏）可能超出一屏而无法滚动。
+   故为 status.html 的 body 加 .page-scroll 类，覆盖为可滚动。
+   ============================================ */
+.page-scroll {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow: auto;
 }

@@ -15,14 +15,15 @@
     <header class="header">
         <div class="container">
             <div class="header__inner">
-                <div class="header__logo">
-                    <span class="header__emoji">🤖</span>
-                    <h1 class="header__title">Bots AI 对话</h1>
-                </div>
-                <p class="header__subtitle">流式对话</p>
                 <!-- US-4.8: 顶部菜单（会话 / 历史 / 状态） -->
                 <!-- [US-1.4] 导航项改为链接，支持右键「在新标签页中打开链接」；href 携带 ?view= 供新页解析 -->
                 <nav class="top-menu" id="top-menu">
+                    <!-- [US-UI-1] 标题移至菜单行最左侧（F1-2）：仅作视觉标识，
+                         不使用 top-menu__item 类、不带 data-view，故不参与导航选中态与点击（F1-3） -->
+                    <span class="top-menu__brand">
+                        <span class="header__emoji">🤖</span>
+                        <span class="header__title">Bots AI 对话</span>
+                    </span>
                     <a class="top-menu__item top-menu__item--active" data-view="chat" href="/?view=chat">会话</a>
                     <a class="top-menu__item" data-view="history" href="/?view=history">历史</a>
                     <a class="top-menu__item" data-view="status" href="/?view=status">状态</a>
