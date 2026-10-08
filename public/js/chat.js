@@ -33,6 +33,10 @@
  * 28. US-2.4 入口唯一：删除历史视图旧「新建会话」按钮及其绑定
  * 29. US-2.7 动作项链接化：href 携带 ?view=chat&new=1 + init 解析 ?new=1 进入空白新会话
  * 30. US-3.1 刷新即新会话：init 加载即 newSession()（绕过 sessionStorage 缓存），合并 ?new=1 分支
+ * 31. US-HF-5 前端 DSML 兜底过滤：state.dsmlBlocked 声明 + sendStreamRequest 复位 +
+ *     updateStreamContent 推送前过滤（最后防线，防止工具调用文本泄漏到界面）
+ * 32. US-HF-6 多轮内容显示修复（前端防御）：finish 分支仅在 completed 时置空气泡引用，
+ *     避免多轮循环下上游意外多发 finish 导致后续轮次内容被丢弃。
  */
 
 (function () {
@@ -113,12 +117,12 @@
         currentThinkEl: null,
         /** @type {string} 当前正在累积的思考内容 */
         currentThinkContent: "",
-      /** @type {HTMLElement|null} 当前信息栏元素 */
-      currentInfoEl: null,
-       /** @type {HTMLElement|null} 当前工具调用段元素（第 4 段） */
-       currentToolEl: null,
-       /** @type {string} [US-3.6] 本次回答的模型名（暂存） */
-       currentModel: "",
+        /** @type {HTMLElement|null} 当前信息栏元素 */
+        currentInfoEl: null,
+        /** @type {HTMLElement|null} 当前工具调用段元素（第 4 段） */
+        currentToolEl: null,
+        /** @type {string} [US-3.6] 本次回答的模型名（暂存） */
+        currentModel: "",
         /** @type {boolean} [US-3.7] 本次回答是否已收尾（幂等标记） */
         completed: false,
         /** @type {number} 本次回答开始时间（performance.now()） */
@@ -133,6 +137,8 @@
         },
         /** @type {string} [US-4.8] 当前视图：chat / history / status */
         currentView: "chat",
+        /** @type {boolean} [US-HF-5] 是否处于 DSML 块内（前端兜底过滤状态） */
+        dsmlBlocked: false,
     };
 
     // ============================================
@@ -723,6 +729,15 @@
     function updateStreamContent(text) {
         if (!state.currentBubbleEl) return;
 
+        // [US-HF-5] 前端兜底过滤（与后端一致：匹配「竖线 + DSML + 竖线」标记）
+        const DSML_OPEN_RE = /[|｜]\s*DSML\s*[|｜]/;
+        const DSML_CLOSE_RE = /[|｜]\s*DSML\s*[|｜]/;
+        if (!state.dsmlBlocked && DSML_OPEN_RE.test(text)) state.dsmlBlocked = true;
+        if (state.dsmlBlocked) {
+            if (DSML_CLOSE_RE.test(text)) state.dsmlBlocked = false;
+            return;   // 块内不渲染
+        }
+
         state.currentAssistantContent += text;
 
         const contentSpan = state.currentBubbleEl.querySelector(".message__content");
@@ -1069,6 +1084,8 @@
         state.completed = false;
         // [US-3.8] 本轮回答开始：复位排空超时标记，保证本轮超时判定不被上一轮污染。
         state.drainTimedOut = false;
+        // [US-HF-5] 本轮回答开始：复位 DSML 过滤状态，避免上一条回答污染下一条
+        state.dsmlBlocked = false;
 
         // 创建 AbortController
         state.abortController = new AbortController();
@@ -1208,10 +1225,14 @@
                                     // 刷新会话汇总栏
                                     renderSessionSummary();
 
-                                    // 信息栏生成后清理当前气泡引用
-                                    state.currentBubbleEl = null;
-                                    state.currentInfoEl = null;
-                                    state.currentStartTime = 0;
+                                    // [US-HF-6] 信息栏生成后清理当前气泡引用。
+                                    //   注意：仅当本次回答确实已收尾（completed=true）时才置空，
+                                    //   避免多轮循环下若上游意外多发 finish 导致后续轮次内容被丢弃。
+                                    if (state.completed) {
+                                        state.currentBubbleEl = null;
+                                        state.currentInfoEl = null;
+                                        state.currentStartTime = 0;
+                                    }
                                 }
                                 setStatus(`✅ 完成 (${getTimeStr()})`);
                                 break;

@@ -29,6 +29,20 @@
  *     携带 thinking / toolCalls / usage / model / elapsedMs / interrupted，
  *     使 US-4.4 的「完整重现」（思考/工具/信息栏/中断标识）在端到端数据链路上真正达成。
  *
+ * Sprint 4.6 修复（工具调用泄漏 + 多轮工具调用）：
+ *   - [US-HF-1] 阶段二请求补传 tools 定义（止血：让模型有标准协议可用）。
+ *   - [US-HF-2] pipeStream 聚合流式 delta.tool_calls（按 index），扩展 PipeResult.toolCalls。
+ *   - [US-HF-3] 分支 A 由「单轮」升级为「多轮循环」（上限 MAX_TOOL_ROUNDS），
+ *     每轮执行工具 + 回灌 + 流式，直到模型不再请求工具为止。
+ *   - [US-HF-4] pipeStream 推送 content 前做 DSML 文本兜底过滤（防御）。
+ *
+ * Sprint 4.6 二次修复（多轮内容显示不全）：
+ *   - [US-HF-6] 多轮循环下，中间轮不再推送 finish（emitFinish=false），
+ *     由调用方在循环结束后统一补发一次 finish，避免前端在第 1 轮就收尾置空气泡，
+ *     导致后续轮次的思考 / 工具调用 / 回答全部被丢弃。
+ *   - [US-HF-6] 正文 / 思考跨轮累积（finalText += ...），保证多轮内容完整。
+ *   - [US-HF-6] DSML 兜底正则改为通用「竖线 + DSML + 竖线」匹配。
+ *
  * 请求体 (JSON):
  * {
  *   "messages": [ { "role": "user", "content": "你好" } ],
@@ -87,6 +101,17 @@ interface PipeResult {
     text: string;
     thinking: string;
     usage: { promptTokens: number; completionTokens: number; totalTokens: number } | null;
+    // [US-HF-2] 聚合后的流式工具调用（供多轮循环判断「本轮是否又请求工具」）
+    toolCalls: Array<{
+        id: string;
+        type: string;
+        function: { name: string; arguments: string };
+    }>;
+    // [US-HF-6] 上游结束原因与最后一个带 finish_reason 的原始 chunk。
+    //   多轮循环下，中间轮不发 finish 事件，由调用方在循环结束后统一补发，
+    //   故需把 finish 所需信息（reason / raw）随返回值带出。
+    finishReason: string | null;
+    raw: unknown;
 }
 
 /**
@@ -98,10 +123,18 @@ interface PipeResult {
  *
  * [US-3.3] 捕获 AbortError：上游被 /cancel 取消时，reader.read() 会抛 AbortError，
  *   这是「用户主动打断」的正常路径，返回已累积内容交由调用方正常收尾，不误报为错误。
+ *
+ * [US-HF-2] 聚合流式 delta.tool_calls（按 index 累加 name/arguments）。
+ * [US-HF-4] 推送 content 前做 DSML 文本兜底过滤（累积缓冲区跨帧检测 + 前缀保留）。
+ * [US-HF-6] emitFinish 控制是否推送 finish 事件（多轮循环中间轮传 false）。
  */
 async function pipeStream(
     upstream: ReadableStream<Uint8Array>,
-    send: (obj: unknown) => void
+    send: (obj: unknown) => void,
+    // [US-HF-6] 是否在读到 finish_reason 时立即推送 finish 事件。
+    //   单轮路径（分支 B）保持 true；多轮循环（分支 A）中间轮传 false，
+    //   由调用方在循环结束后统一补发一次 finish，避免前端过早收尾置空气泡。
+    emitFinish: boolean = true
 ): Promise<PipeResult> {
     const reader = upstream.getReader();
     const decoder = new TextDecoder();
@@ -111,6 +144,20 @@ async function pipeStream(
     let fullText = "";                            // [US-2.2] 累积完整正文，供写回历史
     let fullThinking = "";                        // [A3] 累积思考过程，供写回 meta
     let lastUsage: PipeResult["usage"] = null;    // [A3] 记录上游 usage，供写回 meta
+    // [US-HF-6] 记录上游结束原因与最后一个带 finish_reason 的原始 chunk，
+    //   供调用方在循环结束后统一补发 finish 事件。
+    let lastFinishReason: string | null = null;
+    let lastRaw: unknown = null;
+
+    // [US-HF-2] 聚合流式 tool_calls 分片（按 index）
+    const toolCallsAcc: Array<{
+        id: string;
+        type: string;
+        function: { name: string; arguments: string };
+    }> = [];
+
+    // [US-HF-4] DSML 块过滤状态
+    let inDsmlBlock = false;
 
     try {
         while (true) {
@@ -136,11 +183,64 @@ async function pipeStream(
                         send({ type: "think", content: thinking });
                         fullThinking += thinking;     // [A3] 累积思考过程
                     }
+
+                    // [US-HF-2] 聚合流式 tool_calls 分片（按 index）
+                    const deltaToolCalls = parsed.choices?.[0]?.delta?.tool_calls;
+                    if (Array.isArray(deltaToolCalls)) {
+                        for (const tc of deltaToolCalls) {
+                            const idx = typeof tc.index === "number" ? tc.index : 0;
+                            if (!toolCallsAcc[idx]) {
+                                toolCallsAcc[idx] = {
+                                    id: tc.id || "",
+                                    type: tc.type || "function",
+                                    function: { name: "", arguments: "" },
+                                };
+                            }
+                            if (tc.id) toolCallsAcc[idx].id = tc.id;
+                            if (tc.function?.name) toolCallsAcc[idx].function.name += tc.function.name;
+                            if (tc.function?.arguments) toolCallsAcc[idx].function.arguments += tc.function.arguments;
+                        }
+                    }
+
                     if (delta) {
-                        // 累计输出字符数（兜底用）
-                        fallbackCompletionChars += delta.length;
-                        fullText += delta;            // [US-2.2] 同步累积完整正文
-                        send({ type: "text", content: delta });
+                        // [US-HF-4] DSML 兜底过滤
+                        // 说明：DSML 标记跨帧到达，用「进入/退出块」状态机判断更稳。
+                        // [US-HF-6] 检测正则：匹配「全角/半角竖线 + DSML + 竖线」形式的标记，
+                        //   例如 ｜DSML｜... 或 |DSML|...，兼容常见包裹符与前后空白。
+                        //   若实际日志中的标记形态不同，请以日志为准调整此正则。
+                        const DSML_OPEN_RE = /[|｜]\s*DSML\s*[|｜]/;
+                        const DSML_CLOSE_RE = /[|｜]\s*DSML\s*[|｜]/;
+
+                        let pushText = "";
+
+                        if (!inDsmlBlock) {
+                            const openIdx = delta.search(DSML_OPEN_RE);
+                            if (openIdx >= 0) {
+                                // 进入 DSML 块：保留 DSML_OPEN 之前的正文前缀
+                                pushText = delta.slice(0, openIdx);
+                                inDsmlBlock = true;
+                                // 若同一帧内又出现 DSML_CLOSE（短块），立即退出
+                                if (DSML_CLOSE_RE.test(delta.slice(openIdx))) {
+                                    inDsmlBlock = false;
+                                }
+                            } else {
+                                // 未进入块：本帧正常推送（跨帧拆分的 OPEN 由下一帧的 search 兜住）
+                                pushText = delta;
+                            }
+                        } else {
+                            // 块内：检测是否退出
+                            if (DSML_CLOSE_RE.test(delta)) {
+                                inDsmlBlock = false;
+                            }
+                            pushText = "";   // 块内文本不推送
+                        }
+
+                        if (pushText) {
+                            // 累计输出字符数（兜底用）
+                            fallbackCompletionChars += pushText.length;
+                            fullText += pushText;            // [US-2.2] 同步累积完整正文
+                            send({ type: "text", content: pushText });
+                        }
                     }
 
                     const finishReason = parsed.choices?.[0]?.finish_reason;
@@ -156,12 +256,19 @@ async function pipeStream(
                             completionTokens,
                             totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
                         };
-                        send({
-                            type: "finish",
-                            reason: finishReason,
-                            usage: lastUsage,
-                            raw: parsed,
-                        });
+                        // [US-HF-6] 记录结束原因与原始 chunk，供调用方统一补发 finish
+                        lastFinishReason = finishReason;
+                        lastRaw = parsed;
+                        // [US-HF-6] 仅当允许时才推送 finish。
+                        //   多轮循环中间轮 emitFinish=false，不推送，避免前端过早收尾。
+                        if (emitFinish) {
+                            send({
+                                type: "finish",
+                                reason: finishReason,
+                                usage: lastUsage,
+                                raw: parsed,
+                            });
+                        }
                     }
                 } catch {
                     // 忽略解析失败的行
@@ -172,12 +279,26 @@ async function pipeStream(
         // [US-3.3] 上游被取消（/cancel 触发 abort）：正常路径，返回已累积内容。
         if (err instanceof Error && err.name === "AbortError") {
             console.log("⏹️ [US-3.3] 上游请求已被取消，停止读取并收尾");
-            return { text: fullText, thinking: fullThinking, usage: lastUsage };
+            return {
+                text: fullText,
+                thinking: fullThinking,
+                usage: lastUsage,
+                toolCalls: toolCallsAcc,
+                finishReason: lastFinishReason,
+                raw: lastRaw,
+            };
         }
         throw err;                                           // 其他错误：继续上抛
     }
 
-    return { text: fullText, thinking: fullThinking, usage: lastUsage };
+    return {
+        text: fullText,
+        thinking: fullThinking,
+        usage: lastUsage,
+        toolCalls: toolCallsAcc,
+        finishReason: lastFinishReason,
+        raw: lastRaw,
+    };
 }
 
 /**
@@ -202,7 +323,6 @@ router.post("/stream", async (c) => {
         const useServerHistory = typeof message === "string" && message.length > 0;
 
         if (!useServerHistory) {
-            // 旧模式：messages 必须是非空数组（保持原校验）
             if (!messages || !Array.isArray(messages) || messages.length === 0) {
                 return c.json(
                     { error: "messages 参数必须是非空数组（或提供 message 单条消息）" },
@@ -210,14 +330,11 @@ router.post("/stream", async (c) => {
                 );
             }
         } else {
-            // 新模式：必须提供合法的 sessionId（否则无法定位会话历史）
             if (!isValidSessionId(sessionId)) {
                 return c.json({ error: "使用 message 时 sessionId 必须为合法会话 ID" }, 400);
             }
         }
 
-        // [US-2.3 / US-2.4] 旧模式（无状态）不接受格式合法的 sessionId：明确拒绝；
-        //   格式非法/任意非空值一律静默忽略，与旧接口对未知字段的容错一致。
         if (!useServerHistory && isValidSessionId(sessionId)) {
             return c.json(
                 {
@@ -228,9 +345,7 @@ router.post("/stream", async (c) => {
             );
         }
 
-        // [US-2.2] 计算本次请求的上下文消息数组：
-        //   - 新模式：读取服务端已存历史（快照） + 本次用户消息；先写用户消息。
-        //   - 旧模式：直接使用前端回传的 messages（无状态，行为不变）。
+        // [US-2.2] 计算本次请求的上下文消息数组
         let contextMessages: SessionMessage[];
         if (useServerHistory) {
             const sid = sessionId as string;
@@ -238,10 +353,10 @@ router.post("/stream", async (c) => {
             if (isNewSession) {
                 console.log(`🆕 新会话首次写入: ${sid}`);
             }
-            const historySnapshot = getHistory(sid);                 // 读取历史快照（深拷贝）
+            const historySnapshot = getHistory(sid);
             const userMsg: SessionMessage = { role: "user", content: message };
-            appendMessage(sid, userMsg);                             // 先写用户消息（写入即登记会话）
-            contextMessages = [...historySnapshot, userMsg];         // 快照 + 本次消息
+            appendMessage(sid, userMsg);
+            contextMessages = [...historySnapshot, userMsg];
         } else {
             contextMessages = messages as SessionMessage[];
         }
@@ -277,14 +392,12 @@ router.post("/stream", async (c) => {
             ? `${base}/chat/completions`
             : `${base}/v1/chat/completions`;
 
-        // 公共请求头
         const headers = {
             "Content-Type": "application/json",
             Authorization: `Bearer ${env.LLM_API_KEY}`,
         };
 
         // 公共请求体（不含 stream / tools，按阶段拼装）
-        // [问题 1 修复] 保留工具相关字段：tool_calls / tool_call_id / name。
         const baseBody = {
             model: env.LLM_MODEL,
             messages: contextMessages.map((m: SessionMessage) => {
@@ -308,11 +421,9 @@ router.post("/stream", async (c) => {
             function: { name: string; arguments: string };
         }> = [];
         let probeContent = "";
-        // [US-1.3] 记录「上游是否支持 tools」的判断结果
         let supportsTools = true;
 
         // ── [US-3.3] 创建取消句柄并登记 ────────────────────────────
-        // 整个 /stream 请求（阶段一探测 + 阶段二/分支 B 流式）共用同一 AbortController。
         const upstreamController = new AbortController();
         if (hasRequestId) {
             registerCancel(requestId as string, upstreamController);
@@ -371,95 +482,137 @@ router.post("/stream", async (c) => {
                     const collectedToolCalls: Array<{ name: string; arguments?: unknown; result?: string }> = [];
 
                     try {
-                        // 分支 A：模型请求了工具调用
-                        // [US-1.2] 工具场景保持流式：阶段二请求 stream:true 并调用 pipeStream 逐字推送。
+                        // 分支 A：模型请求了工具调用 → 多轮循环（US-HF-3）
                         if (toolCalls.length > 0) {
-                            // 4.1 逐个执行工具，推送 tool_call 事件，并构造回灌消息
-                            const toolResultMessages: Array<Record<string, unknown>> = [];
-                            for (const tc of toolCalls) {
-                                const wireName = tc.function?.name || "";
-                                const displayName = toDisplayName(wireName);
-                                let args: Record<string, unknown> = {};
-                                try {
-                                    args = tc.function?.arguments
-                                        ? JSON.parse(tc.function.arguments)
-                                        : {};
-                                } catch {
-                                    args = {};
+                            const MAX_TOOL_ROUNDS = 5;                 // 轮次上限，防死循环
+                            let round = 0;
+                            let currentToolCalls = toolCalls;          // 首轮来自阶段一探测
+                            let workingMessages: Array<Record<string, unknown>> = [...baseBody.messages];
+                            let finalText = "";
+                            let finalThinking = "";
+                            let finalUsage: PipeResult["usage"] = null;
+                            // [US-HF-6] 最后一轮的结束原因与原始 chunk，供循环后统一补发 finish
+                            let finalFinishReason: string | null = null;
+                            let finalRaw: unknown = null;
+
+                            while (currentToolCalls.length > 0 && round < MAX_TOOL_ROUNDS) {
+                                round++;
+
+                                // ① 执行本轮全部工具，推送事件，构造回灌消息
+                                const toolResultMessages: Array<Record<string, unknown>> = [];
+                                for (const tc of currentToolCalls) {
+                                    const wireName = tc.function?.name || "";
+                                    const displayName = toDisplayName(wireName);
+                                    let args: Record<string, unknown> = {};
+                                    try {
+                                        args = tc.function?.arguments
+                                            ? JSON.parse(tc.function.arguments)
+                                            : {};
+                                    } catch {
+                                        args = {};
+                                    }
+
+                                    // 推送「工具调用发生」事件（前端展示，默认收起）
+                                    send({
+                                        type: "tool_call",
+                                        id: tc.id,
+                                        name: displayName,
+                                        wireName,
+                                        arguments: args,
+                                    });
+
+                                    // 后端执行（executeTool 内部已兜底异常）
+                                    const result = await executeTool(wireName, args);
+
+                                    // 推送「工具结果」事件
+                                    send({
+                                        type: "tool_call",
+                                        id: tc.id,
+                                        name: displayName,
+                                        wireName,
+                                        arguments: args,
+                                        result,
+                                    });
+
+                                    // [A3] 收集工具调用记录，供写回 meta（历史重现工具段）
+                                    collectedToolCalls.push({
+                                        name: displayName,
+                                        arguments: args,
+                                        result,
+                                    });
+
+                                    toolResultMessages.push({
+                                        role: "tool",
+                                        tool_call_id: tc.id,
+                                        content: result,
+                                    });
                                 }
 
-                                // 推送「工具调用发生」事件（前端展示，默认收起）
-                                send({
-                                    type: "tool_call",
-                                    id: tc.id,
-                                    name: displayName,
-                                    wireName,
-                                    arguments: args,
-                                });
+                                // ② 回灌 assistant(tool_calls) + tool 结果，流式请求本轮
+                                //    首轮保留 probeContent（阶段一探测到的正文），后续轮次为 null
+                                workingMessages = [
+                                    ...workingMessages,
+                                    {
+                                        role: "assistant",
+                                        content: round === 1 ? (probeContent || null) : null,
+                                        tool_calls: currentToolCalls,
+                                    },
+                                    ...toolResultMessages,
+                                ];
 
-                                // 后端执行（executeTool 内部已兜底异常）
-                                const result = await executeTool(wireName, args);
-
-                                // 推送「工具结果」事件
-                                send({
-                                    type: "tool_call",
-                                    id: tc.id,
-                                    name: displayName,
-                                    wireName,
-                                    arguments: args,
-                                    result,
+                                const resp = await fetch(apiUrl, {
+                                    method: "POST",
+                                    headers,
+                                    signal: upstreamController.signal,
+                                    body: JSON.stringify({
+                                        ...baseBody,
+                                        messages: workingMessages,
+                                        stream: true,
+                                        // [US-HF-1] 阶段二/多轮请求补传 tools，
+                                        // 让模型有标准协议可用，减少退化为 DSML 文本的概率。
+                                        ...(supportsTools && toolDefs.length > 0
+                                            ? { tools: toolDefs }
+                                            : {}),
+                                    }),
                                 });
+                                if (!resp.ok || !resp.body) {
+                                    const t = await resp.text().catch(() => "");
+                                    send({ type: "error", message: `第${round}轮请求失败: ${t || resp.status}` });
+                                    return;
+                                }
 
-                                // [A3] 收集工具调用记录，供写回 meta（历史重现工具段）
-                                collectedToolCalls.push({
-                                    name: displayName,
-                                    arguments: args,
-                                    result,
-                                });
+                                // [US-HF-6] 中间轮不推送 finish（emitFinish=false），
+                                //   避免前端在第 1 轮就收尾置空气泡，导致后续轮次内容全部丢失。
+                                const result = await pipeStream(resp.body, send, false);
+                                // [US-HF-6] 正文/思考跨轮累积（而非覆盖），
+                                //   保证多轮回答的完整内容都能写回历史与展示。
+                                finalText += result.text;
+                                finalThinking += result.thinking;
+                                finalUsage = result.usage ?? finalUsage;
+                                finalFinishReason = result.finishReason;
+                                finalRaw = result.raw;
 
-                                toolResultMessages.push({
-                                    role: "tool",
-                                    tool_call_id: tc.id,
-                                    content: result,
-                                });
+                                // ③ 若本轮又请求了工具 → 继续循环；否则结束
+                                currentToolCalls = result.toolCalls || [];
                             }
 
-                            // 4.2 阶段二：回灌 assistant(tool_calls) + tool 结果，流式请求
-                            const secondMessages = [
-                                ...baseBody.messages,
-                                {
-                                    role: "assistant",
-                                    content: probeContent || null,
-                                    tool_calls: toolCalls,
-                                },
-                                ...toolResultMessages,
-                            ];
-
-                            const secondResp = await fetch(apiUrl, {
-                                method: "POST",
-                                headers,
-                                signal: upstreamController.signal,
-                                body: JSON.stringify({
-                                    ...baseBody,
-                                    messages: secondMessages,
-                                    stream: true,
-                                }),
+                            // [US-HF-6] 循环结束后统一补发一次 finish 事件。
+                            //   多轮循环中间轮已用 emitFinish=false 抑制 finish，
+                            //   此处补发，保证前端在「全部轮次完成后」才收尾置空气泡，
+                            //   从而完整显示思考 / 工具调用 / 回答三类内容。
+                            send({
+                                type: "finish",
+                                reason: finalFinishReason || "stop",
+                                usage: finalUsage,
+                                raw: finalRaw || {},
                             });
 
-                            if (!secondResp.ok || !secondResp.body) {
-                                const t = await secondResp.text().catch(() => "");
-                                send({ type: "error", message: `阶段二请求失败: ${t || secondResp.status}` });
-                                return;
-                            }
-
-                            const result = await pipeStream(secondResp.body, send);
-                            const assistantText = result.text;
-                            // [US-2.2 + A3] 助手回复写回会话历史（仅新模式），携带渲染元数据
-                            if (useServerHistory && assistantText) {
+                            // ④ 循环结束：写回历史（携带完整 meta）
+                            if (useServerHistory && finalText) {
                                 const meta: MessageMeta = {
-                                    thinking: result.thinking || undefined,
+                                    thinking: finalThinking || undefined,
                                     toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined,
-                                    usage: result.usage ?? undefined,
+                                    usage: finalUsage ?? undefined,
                                     model: env.LLM_MODEL,
                                     elapsedMs: Date.now() - startedAt,
                                     startedAt,
@@ -467,7 +620,7 @@ router.post("/stream", async (c) => {
                                 };
                                 appendMessage(
                                     sessionId as string,
-                                    { role: "assistant", content: assistantText },
+                                    { role: "assistant", content: finalText },
                                     meta
                                 );
                             }
@@ -475,7 +628,6 @@ router.post("/stream", async (c) => {
                         }
 
                         // 分支 B：无工具调用 → 一律走流式请求（US-1.1：消除一次性整段输出）
-                        // [US-1.3] 上游不支持工具时（supportsTools === false），流式请求去除工具参数。
                         const fallbackResp = await fetch(apiUrl, {
                             method: "POST",
                             headers,
