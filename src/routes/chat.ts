@@ -43,6 +43,25 @@
  *   - [US-HF-6] 正文 / 思考跨轮累积（finalText += ...），保证多轮内容完整。
  *   - [US-HF-6] DSML 兜底正则改为通用「竖线 + DSML + 竖线」匹配。
  *
+ * Sprint 5.1（LLM 对话日志，开关控制）：
+ *   - [US-LOG-3] 在 /stream 链路旁路采集对话日志（分支 A / 分支 B / catch 三处），
+ *     由 appendLlmLog 内部判开关与兜底异常，不改变 SSE 推送与返回结构。
+ *
+ * Sprint 5.1 修复（非正常结束时日志未写入）：
+ *   - [US-LOG-3-FIX] 错误路径下先写日志再发错误事件，且 send/close 包 try/catch，
+ *     避免 network error 导致 controller 失效时 send 抛错中断 catch 块、漏写日志。
+ *   - [US-LOG-3-FIX] pipeStream 非 AbortError 时以 UpstreamStreamError 携带已累积内容上抛，
+ *     使错误日志能记录已产生的正文 / 思考 / 工具调用，避免"内容清空 + 无日志"。
+ *
+ * Sprint 5.1 二次修复（客户端断开时内容与日志丢失）：
+ *   - [US-LOG-3-FIX2] send 永不抛错：客户端断开后 controller 已关闭，enqueue 会抛
+ *     "Invalid state: Controller is already closed"，若任其抛出会中断 pipeStream 读取循环，
+ *     导致已累积内容丢失且被误记为上游 error。改为捕获并静默（仅记录一次告警）。
+ *   - [US-LOG-3-FIX2] 分支 A 每轮 pipeStream 用 try/catch 合并 partial 后上抛，
+ *     保证异常轮次已产生的内容也并入 finalText / finalThinking。
+ *   - [US-LOG-3-FIX2] catch 区分「客户端断开」与「上游错误」：
+ *     客户端断开（Invalid state / clientGone）不记为 error。
+ *
  * 请求体 (JSON):
  * {
  *   "messages": [ { "role": "user", "content": "你好" } ],
@@ -73,6 +92,8 @@ import {
     type MessageMeta,
 } from "@/infra/session";
 import { registerCancel, cancelRequest, unregisterCancel } from "@/infra/cancel";
+// [Sprint 5.1 / US-LOG-3] LLM 对话日志（旁路采集）
+import { appendLlmLog } from "@/infra/llmLog";
 
 const router = new Hono();
 
@@ -112,6 +133,26 @@ interface PipeResult {
     //   故需把 finish 所需信息（reason / raw）随返回值带出。
     finishReason: string | null;
     raw: unknown;
+}
+
+/**
+ * [Sprint 5.1 / US-LOG-3-FIX] 上游流读取异常（非 AbortError）。
+ * 携带异常发生前已累积的内容，供调用方写日志 / 收尾，避免"内容清空 + 无日志"。
+ */
+class UpstreamStreamError extends Error {
+    partial: {
+        text: string;
+        thinking: string;
+        toolCalls: PipeResult["toolCalls"];
+        usage: PipeResult["usage"];
+        finishReason: string | null;
+        raw: unknown;
+    };
+    constructor(cause: unknown, partial: UpstreamStreamError["partial"]) {
+        super(cause instanceof Error ? cause.message : String(cause));
+        this.name = "UpstreamStreamError";
+        this.partial = partial;
+    }
 }
 
 /**
@@ -288,7 +329,16 @@ async function pipeStream(
                 raw: lastRaw,
             };
         }
-        throw err;                                           // 其他错误：继续上抛
+        // [Sprint 5.1 / US-LOG-3-FIX] 其他错误（如 network error）：
+        //   携带已累积内容上抛，供调用方写日志 / 收尾，避免内容与日志双丢失。
+        throw new UpstreamStreamError(err, {
+            text: fullText,
+            thinking: fullThinking,
+            toolCalls: toolCallsAcc,
+            usage: lastUsage,
+            finishReason: lastFinishReason,
+            raw: lastRaw,
+        });
     }
 
     return {
@@ -312,6 +362,9 @@ router.post("/stream", async (c) => {
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
         const { messages, sessionId, message, requestId } = body;
+
+        // [Sprint 5.1 / US-LOG-3] 采集请求侧时间（旁路，仅开关开启时有效）
+        const logStartedAt = Date.now();
 
         // [US-3.3] 校验 requestId（若提供）：非空字符串且长度受限；非法静默忽略。
         const hasRequestId =
@@ -474,8 +527,23 @@ router.post("/stream", async (c) => {
             new ReadableStream({
                 async start(controller) {
                     const encoder = new TextEncoder();
-                    const send = (obj: unknown) =>
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+                    // [Sprint 5.1 / US-LOG-3-FIX2] send 永不抛错：
+                    //   客户端断开后 controller 已关闭，enqueue 会抛
+                    //   "Invalid state: Controller is already closed"。
+                    //   若任其抛出，会中断 pipeStream 的读取循环，导致已累积内容丢失、
+                    //   且被误记为上游 error。此处吞掉，仅记录一次告警。
+                    let clientGone = false;
+                    const send = (obj: unknown) => {
+                        if (clientGone) return;
+                        try {
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+                        } catch (e) {
+                            if (!clientGone) {
+                                clientGone = true;
+                                console.warn("⚠️ [Sprint 5.1] SSE 客户端已断开，后续事件将丢弃:", e);
+                            }
+                        }
+                    };
 
                     // [A3] 本次回答的渲染元数据（供写回 meta）
                     const startedAt = Date.now();
@@ -583,7 +651,21 @@ router.post("/stream", async (c) => {
 
                                 // [US-HF-6] 中间轮不推送 finish（emitFinish=false），
                                 //   避免前端在第 1 轮就收尾置空气泡，导致后续轮次内容全部丢失。
-                                const result = await pipeStream(resp.body, send, false);
+                                // [Sprint 5.1 / US-LOG-3-FIX2] 即使本轮 pipeStream 抛错，
+                                //   也要把已累积内容合并进 finalText/finalThinking，避免内容丢失。
+                                let result: PipeResult;
+                                try {
+                                    result = await pipeStream(resp.body, send, false);
+                                } catch (e) {
+                                    if (e instanceof UpstreamStreamError) {
+                                        finalText += e.partial.text;
+                                        finalThinking += e.partial.thinking;
+                                        finalUsage = e.partial.usage ?? finalUsage;
+                                        finalFinishReason = e.partial.finishReason ?? finalFinishReason;
+                                        finalRaw = e.partial.raw ?? finalRaw;
+                                    }
+                                    throw e;
+                                }
                                 // [US-HF-6] 正文/思考跨轮累积（而非覆盖），
                                 //   保证多轮回答的完整内容都能写回历史与展示。
                                 finalText += result.text;
@@ -624,6 +706,23 @@ router.post("/stream", async (c) => {
                                     meta
                                 );
                             }
+
+                            // [Sprint 5.1 / US-LOG-3] 旁路采集日志（分支 A：工具调用多轮）
+                            //   无条件采集（含 finalText 为空的中断场景），由 appendLlmLog 内部判开关。
+                            appendLlmLog({
+                                sessionId: (sessionId as string) ?? null,
+                                requestId: hasRequestId ? (requestId as string) : null,
+                                model: env.LLM_MODEL,
+                                userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
+                                assistantText: finalText || null,
+                                thinking: finalThinking || null,
+                                toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : null,
+                                usage: finalUsage ?? null,
+                                finishReason: finalFinishReason,
+                                elapsedMs: Date.now() - logStartedAt,
+                                interrupted: upstreamController.signal.aborted || undefined,
+                                error: null,
+                            });
                             return;
                         }
 
@@ -663,20 +762,82 @@ router.post("/stream", async (c) => {
                                 meta
                             );
                         }
+
+                        // [Sprint 5.1 / US-LOG-3] 旁路采集日志（分支 B：纯文本流式）
+                        appendLlmLog({
+                            sessionId: (sessionId as string) ?? null,
+                            requestId: hasRequestId ? (requestId as string) : null,
+                            model: env.LLM_MODEL,
+                            userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
+                            assistantText: assistantText || null,
+                            thinking: result.thinking || null,
+                            toolCalls: null,
+                            usage: result.usage ?? null,
+                            finishReason: result.finishReason,
+                            elapsedMs: Date.now() - logStartedAt,
+                            interrupted: upstreamController.signal.aborted || undefined,
+                            error: null,
+                        });
                     } catch (err) {
+                        const isAbort = err instanceof Error && err.name === "AbortError";
+                        // [Sprint 5.1 / US-LOG-3-FIX2] 区分「客户端断开」与「上游错误」：
+                        //   客户端断开（Invalid state / clientGone）不应记为上游 error。
+                        const isClientGone =
+                            clientGone ||
+                            (err instanceof Error &&
+                                /Invalid state|already closed/i.test(err.message));
+
+                        // [Sprint 5.1 / US-LOG-3-FIX] 先写日志，再发错误事件。
+                        //   原因：network error 时 controller 可能已失效，send 会抛 TypeError，
+                        //   若 send 在前会中断 catch 块，导致日志永远写不进去。
+                        if (!isAbort) {
+                            const partial = err instanceof UpstreamStreamError ? err.partial : null;
+                            appendLlmLog({
+                                sessionId: (sessionId as string) ?? null,
+                                requestId: hasRequestId ? (requestId as string) : null,
+                                model: env.LLM_MODEL,
+                                userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
+                                assistantText: partial?.text || null,
+                                thinking: partial?.thinking || null,
+                                toolCalls: partial && partial.toolCalls.length > 0 ? partial.toolCalls : null,
+                                usage: partial?.usage ?? null,
+                                finishReason: partial?.finishReason ?? null,
+                                error: isClientGone
+                                    ? null
+                                    : err instanceof Error
+                                      ? err.message
+                                      : String(err),
+                                elapsedMs: Date.now() - logStartedAt,
+                                interrupted: upstreamController.signal.aborted || undefined,
+                            });
+                        }
+
                         // [US-3.3] 取消（AbortError）属正常路径，不误报为错误。
-                        if (err instanceof Error && err.name === "AbortError") {
+                        if (isAbort) {
                             console.log("⏹️ [US-3.3] 上游请求已取消（start 兜底）");
                         } else {
-                            const msg = err instanceof Error ? err.message : String(err);
-                            send({ type: "error", message: msg });
+                            // [Sprint 5.1 / US-LOG-3-FIX] send 包 try/catch：
+                            //   controller 已关闭/errored 时 enqueue 会抛错，此处吞掉，
+                            //   避免中断 catch 块并掩盖原始错误。
+                            try {
+                                const msg = err instanceof Error ? err.message : String(err);
+                                send({ type: "error", message: msg });
+                            } catch (sendErr) {
+                                console.warn("⚠️ [Sprint 5.1] 错误事件发送失败（流已关闭，忽略）:", sendErr);
+                            }
                         }
                     } finally {
                         // [US-3.3] 注销取消句柄（幂等）。
                         if (hasRequestId) {
                             unregisterCancel(requestId as string);
                         }
-                        controller.close();   // 主动关流：作为前端"排空完成"信号
+                        // [Sprint 5.1 / US-LOG-3-FIX] controller 可能已 errored/closed，
+                        //   close 会抛错，吞掉以免掩盖原始错误。
+                        try {
+                            controller.close();   // 主动关流：作为前端"排空完成"信号
+                        } catch (closeErr) {
+                            console.warn("⚠️ [Sprint 5.1] 关闭流失败（可能已关闭，忽略）:", closeErr);
+                        }
                     }
                 },
             })

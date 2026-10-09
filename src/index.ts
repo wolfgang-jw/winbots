@@ -16,6 +16,7 @@ import { env } from "@/infra/env";
 import { errorHandler, notFoundHandler } from "@/middleware/error";
 import healthRoute from "@/routes/health";
 import chatRoute from "@/routes/chat";
+import logRoute from "@/routes/log";   // [Sprint 5.1 / US-LOG-4]
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
@@ -37,6 +38,7 @@ app.use("*", originGuard);
 // ============================================
 app.route("/api/health", healthRoute);
 app.route("/api/chat", chatRoute);
+app.route("/api/log", logRoute);   // [Sprint 5.1 / US-LOG-4]
 
 // ============================================
 // 静态文件服务（前端页面）

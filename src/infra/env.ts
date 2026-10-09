@@ -28,6 +28,11 @@ export interface EnvConfig {
   FILE_READ_ENABLED: boolean;     // 读开关（默认 true）
   FILE_CREATE_ENABLED: boolean;   // 新建开关（默认 false）
   FILE_MODIFY_ENABLED: boolean;   // 修改开关（含删除，默认 false）
+
+  // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（全部可选，带默认值；不加入 REQUIRED_VARS）
+  LLM_LOG_ENABLED: boolean;       // 日志总开关（默认 false，关闭）
+  LLM_LOG_FILE: string;           // 日志文件路径（JSONL，默认 data/llm_logs.jsonl）
+  LLM_LOG_MAX_ROWS: number;       // 日志条数上限（默认 2000，超出清理最旧）
 }
 
 /** 必需的环境变量列表 */
@@ -103,6 +108,14 @@ function validateEnv(): EnvConfig {
     FILE_CREATE_ENABLED: Bun.env.FILE_CREATE_ENABLED === "true",
     //   修改开关：默认关闭（含删除，破坏性最强）
     FILE_MODIFY_ENABLED: Bun.env.FILE_MODIFY_ENABLED === "true",
+
+    // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（可选，带默认值）
+    //   开关：默认关闭（仅显式 "true" 才开启，与 LLM_THINKING 语义一致）
+    LLM_LOG_ENABLED: Bun.env.LLM_LOG_ENABLED === "true",
+    //   文件：默认 data/llm_logs.jsonl（JSONL，每行一条 JSON）
+    LLM_LOG_FILE: Bun.env.LLM_LOG_FILE || "data/llm_logs.jsonl",
+    //   上限：默认 2000 条；非法/缺失时回退默认值（防 parseInt 返回 NaN）
+    LLM_LOG_MAX_ROWS: parseInt(Bun.env.LLM_LOG_MAX_ROWS || "2000", 10) || 2000,
   };
 }
 
@@ -128,4 +141,9 @@ console.log(`  FILE_ROOT_DIR:         ${env.FILE_ROOT_DIR}`);
 console.log(`  FILE_READ_ENABLED:     ${env.FILE_READ_ENABLED ? "开启" : "关闭"}`);
 console.log(`  FILE_CREATE_ENABLED:   ${env.FILE_CREATE_ENABLED ? "开启" : "关闭"}`);
 console.log(`  FILE_MODIFY_ENABLED:   ${env.FILE_MODIFY_ENABLED ? "开启" : "关闭"}`);
+// [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（无敏感信息，直接打印）
+console.log("-".repeat(60));
+console.log(`  LLM_LOG_ENABLED:       ${env.LLM_LOG_ENABLED ? "开启" : "关闭"}`);
+console.log(`  LLM_LOG_FILE:          ${env.LLM_LOG_FILE}`);
+console.log(`  LLM_LOG_MAX_ROWS:      ${env.LLM_LOG_MAX_ROWS}`);
 console.log("=".repeat(60));

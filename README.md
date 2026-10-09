@@ -76,6 +76,17 @@ FILE_CREATE_ENABLED=false
 # 修改开关：控制「整篇覆盖/定点替换/移动重命名/删除」。
 #   默认关闭（含删除，破坏性最强，请谨慎开启）。
 FILE_MODIFY_ENABLED=false
+
+# ============================================
+# LLM 对话日志配置（Sprint 5.1）
+# ============================================
+# 日志总开关：true=记录与 LLM 的对话日志（供问题分析），false/留空=关闭。
+#   默认关闭，避免日常使用产生额外 IO 与磁盘占用。
+LLM_LOG_ENABLED=false
+# 日志文件路径（JSONL，每行一条 JSON；内容不截断）。
+LLM_LOG_FILE=data/llm_logs.jsonl
+# 日志条数上限：超出后自动清理最旧记录，防止无限增长。
+LLM_LOG_MAX_ROWS=2000
 ```
 
 | 配置项 | 说明 | 示例 | 是否必填 |
@@ -90,6 +101,9 @@ FILE_MODIFY_ENABLED=false
 | `FILE_READ_ENABLED` | 读操作开关（列目录/读文件/查信息/搜索） | `true` / `false` | 可选（默认 `true`） |
 | `FILE_CREATE_ENABLED` | 新建操作开关（建目录/建文件/追加） | `true` / `false` | 可选（默认 `false`） |
 | `FILE_MODIFY_ENABLED` | 修改操作开关（覆盖/替换/移动/**删除**） | `true` / `false` | 可选（默认 `false`） |
+| `LLM_LOG_ENABLED` | LLM 对话日志开关（供问题分析） | `true` / `false` | 可选（默认 `false`） |
+| `LLM_LOG_FILE` | 日志文件路径（JSONL） | `data/llm_logs.jsonl` | 可选（默认 `data/llm_logs.jsonl`） |
+| `LLM_LOG_MAX_ROWS` | 日志条数上限（超出清理最旧） | `2000` | 可选（默认 `2000`） |
 
 ### 2.2 修改 API Key（必做）
 
@@ -143,6 +157,18 @@ LLM_MODEL=deepseek-chat
 4. **破坏性确认**：覆盖、删除等操作需 AI 显式声明确认意图，降低误操作概率。
 
 > ⚠️ 请勿将 `FILE_ROOT_DIR` 指向项目根目录或系统重要目录，以免暴露源码或误改数据。
+
+### 2.7 日志隐私说明（重要）
+
+开启 `LLM_LOG_ENABLED` 后，系统会把与 LLM 的对话记录写入本地日志文件（默认 `data/llm_logs.jsonl`）：
+
+1. **敏感内容**：日志包含**用户输入**与**模型输出**（含思考过程、工具调用），属敏感数据；
+2. **仅本地存储**：日志仅保存在本机 `data/` 目录，**不会上传**任何服务器；
+3. **不提交仓库**：日志文件已纳入 `.gitignore`，**不会提交**到代码仓库；
+4. **默认关闭**：默认不记录，需显式设置 `LLM_LOG_ENABLED=true` 才开启；
+5. **规模可控**：超过 `LLM_LOG_MAX_ROWS` 条后自动清理最旧记录，避免无限增长。
+
+> 💡 日志用于排查「回答异常 / 工具调用失败 / 上游报错」等问题，可离线查看（JSONL 每行一条 JSON）。
 
 ---
 
@@ -208,6 +234,10 @@ LLM_MODEL=deepseek-chat
 
 ### Q5：如何查看服务运行状态？
 - 访问 `http://localhost:3001/status.html` 查看状态监控页，或访问 `http://localhost:3001/api/health` 查看健康检查接口返回的 JSON。
+
+### Q6：如何开启 LLM 对话日志？
+- 在 `.env` 中设置 `LLM_LOG_ENABLED=true`，保存后重启服务。启动日志会显示 `LLM_LOG_ENABLED: 开启`。
+- 日志文件默认位于 `data/llm_logs.jsonl`，可用文本编辑器直接查看（每行一条 JSON）。
 
 ---
 
