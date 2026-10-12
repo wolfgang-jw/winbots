@@ -62,6 +62,13 @@
  *   - [US-LOG-3-FIX2] catch 区分「客户端断开」与「上游错误」：
  *     客户端断开（Invalid state / clientGone）不记为 error。
  *
+ * Sprint 5.2（复杂问题稳定性）：
+ *   - [US-STAB-1] SSE 心跳保活：start 内启动心跳定时器，周期性下发注释帧（: ping），
+ *     覆盖工具执行 / 上游探测 / 多轮循环等全部静默期；finally 中清理定时器。
+ *   - [US-STAB-3] 截断显式告知：达 MAX_TOOL_ROUNDS 上限时，finish.reason 置 max_tool_rounds
+ *     并追加 notice 事件；轮次上限改为可配置（env.MAX_TOOL_ROUNDS，默认 8）。
+ *   - [US-STAB-4] 可观测性增强：catch 分支日志新增 clientGone 字段，区分客户端断开与上游错误。
+ *
  * 请求体 (JSON):
  * {
  *   "messages": [ { "role": "user", "content": "你好" } ],
@@ -73,6 +80,7 @@
  * data: {"type":"think","content":"思考过程..."}
  * data: {"type":"tool_call","id":"...","name":"local.common.get_current_time","arguments":{}}
  * data: {"type":"text","content":"你"}
+ * data: {"type":"notice","message":"已达工具调用轮次上限（8 轮），任务可能未完成，可继续追问。"}
  * data: {"type":"finish","reason":"stop","usage":{...},"raw":{...}}
  * data: {"type":"error","message":"错误信息"}
  */
@@ -545,6 +553,20 @@ router.post("/stream", async (c) => {
                         }
                     };
 
+                    // [Sprint 5.2 / US-STAB-1] SSE 心跳保活：
+                    //   复杂任务（多轮工具 / 上游探测）期间 SSE 通道可能长时间无数据，
+                    //   被中间层（如 Nginx proxy_read_timeout=60s）或浏览器判为空闲而掐断，
+                    //   导致前端报 "network error"。此处周期性下发 SSE 注释帧（: ping），
+                    //   保持连接活跃；注释帧不触发前端 data: 解析，无渲染副作用。
+                    const heartbeat = setInterval(() => {
+                        if (clientGone) return;   // 客户端已断开：不再发送
+                        try {
+                            controller.enqueue(encoder.encode(`: ping\n\n`));
+                        } catch {
+                            // 连接已断，忽略（clientGone 会在 send 中置位，此处兜底）
+                        }
+                    }, env.SSE_HEARTBEAT_MS);
+
                     // [A3] 本次回答的渲染元数据（供写回 meta）
                     const startedAt = Date.now();
                     const collectedToolCalls: Array<{ name: string; arguments?: unknown; result?: string }> = [];
@@ -552,7 +574,7 @@ router.post("/stream", async (c) => {
                     try {
                         // 分支 A：模型请求了工具调用 → 多轮循环（US-HF-3）
                         if (toolCalls.length > 0) {
-                            const MAX_TOOL_ROUNDS = 5;                 // 轮次上限，防死循环
+                            const MAX_TOOL_ROUNDS = env.MAX_TOOL_ROUNDS;   // [Sprint 5.2 / US-STAB-3] 可配置（默认 8）
                             let round = 0;
                             let currentToolCalls = toolCalls;          // 首轮来自阶段一探测
                             let workingMessages: Array<Record<string, unknown>> = [...baseBody.messages];
@@ -678,16 +700,31 @@ router.post("/stream", async (c) => {
                                 currentToolCalls = result.toolCalls || [];
                             }
 
+                            // [Sprint 5.2 / US-STAB-3] 判定是否「因达轮次上限而截断」：
+                            //   round 已达上限 且 模型仍请求了工具（currentToolCalls 非空）
+                            //   → 任务被截断，需显式告知用户。
+                            const hitMaxRounds =
+                                round >= MAX_TOOL_ROUNDS && currentToolCalls.length > 0;
+
                             // [US-HF-6] 循环结束后统一补发一次 finish 事件。
                             //   多轮循环中间轮已用 emitFinish=false 抑制 finish，
                             //   此处补发，保证前端在「全部轮次完成后」才收尾置空气泡，
                             //   从而完整显示思考 / 工具调用 / 回答三类内容。
+                            // [Sprint 5.2 / US-STAB-3] 达上限截断时，reason 置为 max_tool_rounds。
                             send({
                                 type: "finish",
-                                reason: finalFinishReason || "stop",
+                                reason: hitMaxRounds ? "max_tool_rounds" : (finalFinishReason || "stop"),
                                 usage: finalUsage,
                                 raw: finalRaw || {},
                             });
+
+                            // [Sprint 5.2 / US-STAB-3] 达上限截断：追加 notice 事件显式告知用户
+                            if (hitMaxRounds) {
+                                send({
+                                    type: "notice",
+                                    message: `已达工具调用轮次上限（${MAX_TOOL_ROUNDS} 轮），任务可能未完成，可继续追问。`,
+                                });
+                            }
 
                             // ④ 循环结束：写回历史（携带完整 meta）
                             if (useServerHistory && finalText) {
@@ -807,9 +844,18 @@ router.post("/stream", async (c) => {
                                     : err instanceof Error
                                       ? err.message
                                       : String(err),
+                                // [Sprint 5.2 / US-STAB-4] 标记客户端断开，便于事后区分
+                                clientGone: isClientGone || undefined,
                                 elapsedMs: Date.now() - logStartedAt,
                                 interrupted: upstreamController.signal.aborted || undefined,
                             });
+
+                            // [Sprint 5.2 / US-STAB-4] 客户端断开：记录可读告警，便于事后排查
+                            if (isClientGone) {
+                                console.warn(
+                                    `⚠️ [Sprint 5.2] 客户端已断开，本次回答中断（已生成内容已写入日志）`
+                                );
+                            }
                         }
 
                         // [US-3.3] 取消（AbortError）属正常路径，不误报为错误。
@@ -831,6 +877,8 @@ router.post("/stream", async (c) => {
                         if (hasRequestId) {
                             unregisterCancel(requestId as string);
                         }
+                        // [Sprint 5.2 / US-STAB-1] 清理心跳定时器，避免定时器泄漏
+                        clearInterval(heartbeat);
                         // [Sprint 5.1 / US-LOG-3-FIX] controller 可能已 errored/closed，
                         //   close 会抛错，吞掉以免掩盖原始错误。
                         try {

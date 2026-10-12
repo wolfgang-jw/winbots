@@ -82,10 +82,17 @@ console.log(`   状态监控:  http://localhost:${port}/status.html`);
 console.log("=".repeat(60) + "\n");
 
 // 显式启动 HTTP 服务器（返回即代表已开始监听）
+// [Sprint 5.2 / US-STAB-1-FIX] 关键修复：SSE 长连接空闲超时
+//   Bun.serve 默认 idleTimeout=10s，而 SSE 心跳默认 15s（>10s），
+//   导致连接在心跳到达前被 Bun 主动关闭（request timed out after 10 seconds），
+//   随后 send() 抛 ERR_INVALID_STATE。此处提升至 Bun 上限 255s。
+//   注意：只要有任意字节写出（含心跳注释帧）即重置空闲计时，
+//   因此只要 SSE_HEARTBEAT_MS < idleTimeout*1000，连接即可长期保活。
 const server = Bun.serve({
     port,
     hostname: "127.0.0.1",
     fetch: app.fetch,
+    idleTimeout: 255,   // [Sprint 5.2 / US-STAB-1-FIX] 秒；Bun 允许的最大值
 });
 
 // 启动成功后，自动打开系统默认浏览器（仅触发一次，失败静默降级）

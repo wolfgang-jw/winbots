@@ -33,6 +33,10 @@ export interface EnvConfig {
   LLM_LOG_ENABLED: boolean;       // 日志总开关（默认 false，关闭）
   LLM_LOG_FILE: string;           // 日志文件路径（JSONL，默认 data/llm_logs.jsonl）
   LLM_LOG_MAX_ROWS: number;       // 日志条数上限（默认 2000，超出清理最旧）
+
+  // [Sprint 5.2 / US-STAB-3] 复杂问题稳定性配置（可选，带默认值；不加入 REQUIRED_VARS）
+  MAX_TOOL_ROUNDS: number;        // 工具调用轮次上限（默认 8）
+  SSE_HEARTBEAT_MS: number;       // SSE 心跳间隔毫秒（默认 10000）
 }
 
 /** 必需的环境变量列表 */
@@ -116,6 +120,15 @@ function validateEnv(): EnvConfig {
     LLM_LOG_FILE: Bun.env.LLM_LOG_FILE || "data/llm_logs.jsonl",
     //   上限：默认 2000 条；非法/缺失时回退默认值（防 parseInt 返回 NaN）
     LLM_LOG_MAX_ROWS: parseInt(Bun.env.LLM_LOG_MAX_ROWS || "2000", 10) || 2000,
+
+    // [Sprint 5.2 / US-STAB-3] 复杂问题稳定性配置（可选，带默认值）
+    //   轮次上限：默认 8；非法/缺失时回退默认值（防 parseInt 返回 NaN）
+    MAX_TOOL_ROUNDS: parseInt(Bun.env.MAX_TOOL_ROUNDS || "8", 10) || 8,
+    //   心跳间隔：默认 10000ms；非法/缺失时回退默认值
+    //   [Sprint 5.2 / US-STAB-1-FIX] 由 15000 下调至 10000：
+    //     必须显著小于 Bun.serve 的 idleTimeout（index.ts 设为 255s），
+    //     且原 15s 与 Bun 默认空闲超时 10s 冲突，导致连接被提前关闭。
+    SSE_HEARTBEAT_MS: parseInt(Bun.env.SSE_HEARTBEAT_MS || "10000", 10) || 10000,
   };
 }
 
@@ -146,4 +159,8 @@ console.log("-".repeat(60));
 console.log(`  LLM_LOG_ENABLED:       ${env.LLM_LOG_ENABLED ? "开启" : "关闭"}`);
 console.log(`  LLM_LOG_FILE:          ${env.LLM_LOG_FILE}`);
 console.log(`  LLM_LOG_MAX_ROWS:      ${env.LLM_LOG_MAX_ROWS}`);
+// [Sprint 5.2 / US-STAB-3] 复杂问题稳定性配置（无敏感信息，直接打印）
+console.log("-".repeat(60));
+console.log(`  MAX_TOOL_ROUNDS:       ${env.MAX_TOOL_ROUNDS}`);
+console.log(`  SSE_HEARTBEAT_MS:      ${env.SSE_HEARTBEAT_MS}`);
 console.log("=".repeat(60));

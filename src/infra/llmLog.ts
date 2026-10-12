@@ -49,6 +49,8 @@ export interface LlmLogRecord {
     interrupted?: boolean;
     /** 错误信息（若有） */
     error?: string | null;
+    /** [Sprint 5.2 / US-STAB-4] 是否因客户端断开而中断（区分断开与上游错误） */
+    clientGone?: boolean;
 }
 
 /** 查询结果：日志记录 + 文件行序号 */

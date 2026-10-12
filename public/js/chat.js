@@ -37,6 +37,8 @@
  *     updateStreamContent 推送前过滤（最后防线，防止工具调用文本泄漏到界面）
  * 32. US-HF-6 多轮内容显示修复（前端防御）：finish 分支仅在 completed 时置空气泡引用，
  *     避免多轮循环下上游意外多发 finish 导致后续轮次内容被丢弃。
+ * 33. [Sprint 5.2 / US-STAB-2] 内容保护：错误分支仅当气泡为空时才移除，非空则保留已生成内容
+ * 34. [Sprint 5.2 / US-STAB-3] notice 处理：新增 case "notice"，以非错误样式展示截断提示
  */
 
 (function () {
@@ -1237,6 +1239,12 @@
                                 setStatus(`✅ 完成 (${getTimeStr()})`);
                                 break;
 
+                            case "notice":
+                                // [Sprint 5.2 / US-STAB-3] 截断/提示类事件（非错误样式）：
+                                //   如「已达工具调用轮次上限」。不视为失败，仅提示用户。
+                                setStatus(`ℹ️ ${data.message}`, "chat-status--notice");
+                                break;
+
                             case "error":
                                 // [US-3.4] 排空态下：用户已打断，此 error 很可能由"上游取消"引发
                                 if (state.draining) {
@@ -1304,14 +1312,26 @@
             const errorMsg = err.message || String(err);
             setStatus(`❌ 请求失败`, "chat-status--error");
 
-            // 移除空的助手消息
-            if (state.currentBubbleEl) {
+            // [Sprint 5.2 / US-STAB-2] 错误分支内容保护：
+            //   原实现无条件 remove() 助手气泡，导致已流式生成的正文/思考/工具
+            //   被一并清空。此处改为「仅当气泡为空时才移除」——
+            //   非空则保留内容，仅移除流式光标，避免"内容清空"。
+            const hasContent = !!state.currentAssistantContent
+                || !!state.currentThinkContent
+                || !!state.currentToolEl;
+
+            if (state.currentBubbleEl && !hasContent) {
+                // 气泡为空（未生成任何内容）：移除空占位气泡
                 state.currentBubbleEl.remove();
                 state.currentBubbleEl = null;
                 state.currentAssistantContent = "";
                 state.currentThinkEl = null;
                 state.currentThinkContent = "";
                 state.currentToolEl = null; // R1：一并清理工具段引用
+            } else if (state.currentBubbleEl) {
+                // 气泡非空：保留已生成内容，仅移除流式光标
+                const cursor = state.currentBubbleEl.querySelector(".message__cursor");
+                if (cursor) cursor.remove();
             }
 
             // 显示错误消息
@@ -1343,10 +1363,9 @@
             setInputEnabled(true);
         }
 
-        // 返回完整的助手回复内容
-        return fullContent;
-    }
-
+       // 返回完整的助手回复内容
+       return fullContent;
+   }
     // ============================================
     // 发送消息逻辑
     // ============================================
