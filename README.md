@@ -106,7 +106,7 @@ SSE_HEARTBEAT_MS=10000
 | `LLM_API_KEY` | 你的 API 密钥（**必须修改**） | `sk-xxxxxxxx` | ✅ 必填 |
 | `LLM_MODEL` | 使用的模型名称 | `deepseek-v4-flash` | ✅ 必填 |
 | `LLM_THINKING` | 思考模式开关 | `true` / `false` | 可选 |
-| `LLM_REASONING_EFFORT` | 推理强度 | `high` / `medium` / `low` | 可选 |
+| `LLM_REASONING_EFFORT` | 推理强度 | `low` / `high` / `max` | 可选 |
 | `FILE_ROOT_DIR` | AI 文件操作的沙箱总目录（与 `data` 平级） | `working` | 可选（默认 `working`） |
 | `FILE_READ_ENABLED` | 读操作开关（列目录/读文件/查信息/搜索） | `true` / `false` | 可选（默认 `true`） |
 | `FILE_CREATE_ENABLED` | 新建操作开关（建目录/建文件/追加） | `true` / `false` | 可选（默认 `false`） |

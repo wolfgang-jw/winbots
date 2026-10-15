@@ -87,7 +87,7 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   },
   {
     key: "LLM_REASONING_EFFORT", group: "llm", groupTitle: "LLM 配置", type: "enum",
-    label: "推理强度", defaultValue: "high", enumValues: ["low", "medium", "high"],
+    label: "推理强度", defaultValue: "high", enumValues: ["low", "high", "max"],
     desc: "思考模式下的推理强度。",
   },
 
