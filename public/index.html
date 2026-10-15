@@ -27,6 +27,8 @@
                     <a class="top-menu__item top-menu__item--active" data-view="chat" href="/?view=chat">会话</a>
                     <a class="top-menu__item" data-view="history" href="/?view=history">历史</a>
                     <a class="top-menu__item" data-view="status" href="/?view=status">状态</a>
+                    <!-- [配置页 / US-CFG-PAGE-1] 第 4 个视图：Web 编辑 .env -->
+                    <a class="top-menu__item" data-view="config" href="/?view=config">配置</a>
                     <!-- [US-2.3] 导航区 / 动作区 分隔符（F3-4）：明确区分左侧导航项与右侧动作项 -->
                     <span class="top-menu__divider" aria-hidden="true"></span>
                     <!-- [US-2.1] 新建会话动作项：位于菜单栏同一行右侧（F3-1），随菜单常驻，三视图均可见（F3-2） -->
@@ -89,9 +91,75 @@
         </div>
     </section>
 
-    <!-- ==================== 状态视图（US-4.8，iframe 复用既有状态页） ==================== -->
+    <!-- ==================== 状态视图（内联，US-STATUS-VIEW-1/2） ==================== -->
     <section class="status-view" id="view-status" hidden>
-        <iframe class="status-view__frame" src="status.html" title="系统状态"></iframe>
+        <div class="container status-view__scroll">
+
+            <!-- 系统概览卡片（沿用 .overview / .overview__card） -->
+            <section class="overview" id="overview">
+                <div class="overview__card" id="overview-status">
+                    <div class="overview__label">系统状态</div>
+                    <div class="overview__value" id="system-status">检测中...</div>
+                </div>
+                <div class="overview__card">
+                    <div class="overview__label">运行时间</div>
+                    <div class="overview__value" id="uptime">-</div>
+                </div>
+                <div class="overview__card">
+                    <div class="overview__label">总延迟</div>
+                    <div class="overview__value" id="total-latency">-</div>
+                </div>
+                <div class="overview__card">
+                    <div class="overview__label">最后更新</div>
+                    <div class="overview__value" id="update-time">-</div>
+                </div>
+            </section>
+
+            <!-- 服务卡片（沿用 .services / .service-card） -->
+            <section class="services" id="services">
+                <div class="service-card service-card--full" data-service="llm">
+                    <div class="service-card__header">
+                        <span class="service-card__icon">🤖</span>
+                        <h2 class="service-card__name">LLM</h2>
+                        <span class="service-card__badge" id="llm-badge">检测中</span>
+                    </div>
+                    <div class="service-card__body">
+                        <div class="service-card__row">
+                            <span class="service-card__label">延迟</span>
+                            <span class="service-card__value" id="llm-latency">-</span>
+                        </div>
+                        <div class="service-card__row">
+                            <span class="service-card__label">模型</span>
+                            <span class="service-card__value" id="llm-model">-</span>
+                        </div>
+                        <div class="service-card__row">
+                            <span class="service-card__label">API</span>
+                            <span class="service-card__value" id="llm-api-base">-</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 刷新条（沿用 .refresh-bar） -->
+            <div class="refresh-bar">
+                <span class="refresh-bar__text" id="refresh-text">⏱️ 自动刷新中...</span>
+                <button class="refresh-bar__btn" id="refresh-btn">🔄 手动刷新</button>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- ==================== 配置视图（配置页 / US-CFG-PAGE-1） ==================== -->
+    <section class="config-layout" id="view-config" hidden>
+        <div id="config-notice" class="config-notice" hidden></div>
+        <div class="config-scroll" id="config-form"><div class="config-loading">加载中…</div></div>
+        <div class="config-actions">
+            <button class="config-btn" id="config-save-btn" disabled>保存</button>
+            <span class="config-dirty" id="config-dirty" hidden>● 有未保存的更改</span>
+        </div>
+        <div class="config-result" id="config-result"></div>
+        <!-- [需求 §4.7 S6] 无认证声明（必须保留） -->
+        <div class="config-security">⚠️ 本页面无身份认证，仅限本机可信环境使用。</div>
     </section>
 
     <!-- ==================== 底部页脚 ==================== -->
@@ -106,6 +174,8 @@
 
     <!-- 聊天页面 JS -->
     <script src="js/chat.js"></script>
+    <!-- [US-STATUS-VIEW-3] 状态视图逻辑（jQuery，内容未改动，仅迁移加载位置到 </body> 之前、chat.js 之后） -->
+    <script src="js/app.js"></script>
 </body>
 
 </html>

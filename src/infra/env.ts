@@ -45,6 +45,9 @@ const REQUIRED_VARS: (keyof EnvConfig)[] = [
   "LLM_API_BASE", "LLM_API_KEY", "LLM_MODEL",
 ];
 
+/** [配置页 / US-CFG-PAGE-7] 被系统环境变量遮蔽的键（启动时快照，AC-CFG-8） */
+const shadowedKeys = new Set<string>();
+
 /**
  * 显式加载 .env 文件（兼容 debug 模式工作目录不一致的情况）
  * 固定路径：bots/.env（相对于当前文件 src/infra/../.env）
@@ -62,6 +65,11 @@ function loadDotenv(): void {
       const value = trimmed.slice(eqIdx + 1).trim();
       if (!Bun.env[key]) {
         Bun.env[key] = value;
+      } else if (Bun.env[key] !== value) {
+        // [配置页 / US-CFG-PAGE-7] 已存在且与 .env 不一致 → 判定为"被系统环境变量遮蔽"。
+        //   判据用「值不相同」而非「键已存在」：Bun 运行时自身可能已加载 .env，
+        //   若以"键已存在"判定，会把全部键误报为遮蔽，等于没有提示。
+        shadowedKeys.add(key);
       }
     }
   } catch {
@@ -135,7 +143,13 @@ function validateEnv(): EnvConfig {
 // 在模块加载时立即加载 .env（必须在 validateEnv 之前执行）
 loadDotenv();
 
-/** 类型安全的全局配置对象（单例） */
+/**
+ * [配置页 / US-CFG-PAGE-7] 被系统环境变量遮蔽的键（启动快照，只读）。
+ * 局限：运行中修改 OS 环境变量后需重启才准确（与需求 §4.9.4 一致）。
+ */
+export const envShadowedBySystem: ReadonlySet<string> = shadowedKeys;
+
+/** 类型安全的全局配置对象（单例）。热更请用 reloadEnvExcluding()，勿重新赋值。 */
 export const env = validateEnv();
 
 // 启动日志（隐藏敏感信息）
@@ -164,3 +178,49 @@ console.log("-".repeat(60));
 console.log(`  MAX_TOOL_ROUNDS:       ${env.MAX_TOOL_ROUNDS}`);
 console.log(`  SSE_HEARTBEAT_MS:      ${env.SSE_HEARTBEAT_MS}`);
 console.log("=".repeat(60));
+
+/**
+ * [配置页 / US-CFG-PAGE-6] 热更新：重新解析 .env 并就地更新 env 单例。
+ *
+ * 关键约束（需求 §4.9）：
+ * 1. 不走 loadDotenv()——其 `if (!Bun.env[key])` 判空会让重跑变成空操作；
+ * 2. 不重新赋值 env——全仓 import 的是同一引用，必须 Object.assign 就地改；
+ * 3. skipKeys 内的键保持旧值（如 APP_PORT：端口已绑定、origin.ts 白名单已构造）。
+ *
+ * @param skipKeys 不参与热更、需重启才生效的键
+ * @returns 实际已热更的键列表
+ */
+export function reloadEnvExcluding(skipKeys: readonly string[] = []): string[] {
+  const envPath = resolve(import.meta.dir, "../../.env");
+  const skip = new Set(skipKeys);
+  const applied: string[] = [];
+
+  let content: string;
+  try {
+    content = readFileSync(envPath, "utf-8");
+  } catch {
+    return applied;   // .env 不存在：无可热更内容
+  }
+
+  // ① 强制覆盖 Bun.env（绕过 loadDotenv 的判空）
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (skip.has(key)) continue;
+    Bun.env[key] = value;
+    applied.push(key);
+  }
+
+  // ② 重新计算并就地更新单例（引用不变）
+  const next = validateEnv();
+  for (const k of skipKeys) {
+    (next as unknown as Record<string, unknown>)[k] = (env as unknown as Record<string, unknown>)[k];
+  }
+  Object.assign(env, next);
+
+  return applied;
+}

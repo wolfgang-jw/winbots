@@ -19,7 +19,7 @@ import {
     isReadEnabled,
     ok,
     fail,
-    FILE_ROOT,
+    getFileRoot,          // [配置页 / US-CFG-PAGE-6] FILE_ROOT 常量 → 函数
 } from "./_shared";
 import { readdir, stat, readFile } from "fs/promises";
 import { join, relative, sep } from "path";
@@ -37,7 +37,7 @@ const MAX_SCAN_FILE_BYTES = 256 * 1024;
 
 /** 将绝对路径转为「相对沙箱根」的展示路径（统一用 / 分隔） */
 function toRel(abs: string): string {
-    const r = relative(FILE_ROOT, abs);
+    const r = relative(getFileRoot(), abs);
     return (r === "" ? "." : r).split(sep).join("/");
 }
 
@@ -264,7 +264,7 @@ export const tools: Tool[] = [
                     if (matches.length >= MAX_ENTRIES) { truncated = true; break; }
                     // 统一用 / 分隔，并拼上起始目录前缀
                     const norm = rel.split(sep).join("/");
-                    matches.push(base === FILE_ROOT ? norm : `${toRel(base)}/${norm}`);
+                    matches.push(base === getFileRoot() ? norm : `${toRel(base)}/${norm}`);
                 }
 
                 return ok({ matches, truncated });

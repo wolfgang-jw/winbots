@@ -39,6 +39,8 @@
  *     避免多轮循环下上游意外多发 finish 导致后续轮次内容被丢弃。
  * 33. [Sprint 5.2 / US-STAB-2] 内容保护：错误分支仅当气泡为空时才移除，非空则保留已生成内容
  * 34. [Sprint 5.2 / US-STAB-3] notice 处理：新增 case "notice"，以非错误样式展示截断提示
+ * 35. [配置页 / US-CFG-PAGE-1~8] 配置视图：新增第 4 视图（config），按分组渲染 15 项配置，
+ *     支持保存（二次确认 + confirm:true）、密钥不回显、逐项错误提示、脏值提醒
  */
 
 (function () {
@@ -82,6 +84,8 @@
         viewChat: document.getElementById("view-chat"),
         viewHistory: document.getElementById("view-history"),
         viewStatus: document.getElementById("view-status"),
+        // [配置页 / US-CFG-PAGE-1] 配置视图（第 4 视图）
+        viewConfig: document.getElementById("view-config"),
         historyList: document.getElementById("history-list"),
         historyEmpty: document.getElementById("history-empty"),
         // [US-2.4] 历史视图旧「新建会话」按钮已删除，此处不再缓存其引用（入口唯一，F3-5）
@@ -137,7 +141,7 @@
             totalTokens: 0,
             elapsedMs: 0,
         },
-        /** @type {string} [US-4.8] 当前视图：chat / history / status */
+        /** @type {string} [US-4.8] 当前视图：chat / history / status / config */
         currentView: "chat",
         /** @type {boolean} [US-HF-5] 是否处于 DSML 块内（前端兜底过滤状态） */
         dsmlBlocked: false,
@@ -1605,8 +1609,9 @@
      * @returns {boolean} - 是否切换成功
      */
     function switchView(view) {
-        // [US-1.3] 合法值守卫：非法 view 回退到 chat，避免三项全不选中导致"视图-选中态错位"（N4）
-        const VALID_VIEWS = ["chat", "history", "status"];
+        // [US-1.3] 合法值守卫：非法 view 回退到 chat，避免全不选中导致"视图-选中态错位"（N4）
+        // [配置页 / US-CFG-PAGE-1] 扩为 4 视图
+        const VALID_VIEWS = ["chat", "history", "status", "config"];
         if (!VALID_VIEWS.includes(view)) {
             console.warn("[US-1.3] 非法视图，回退到 chat:", view);
             view = "chat";
@@ -1618,8 +1623,10 @@
         if ($dom.viewChat) $dom.viewChat.hidden = view !== "chat";
         if ($dom.viewHistory) $dom.viewHistory.hidden = view !== "history";
         if ($dom.viewStatus) $dom.viewStatus.hidden = view !== "status";
+        if ($dom.viewConfig) $dom.viewConfig.hidden = view !== "config";   // [配置页 / US-CFG-PAGE-1]
 
         // 2. 菜单高亮
+        //    —— 无需改动：新增第 4 项后自动覆盖，天然满足「恰好一项选中」（AC-STATUS-1）
         $dom.menuItems.forEach((btn) => {
             btn.classList.toggle("top-menu__item--active", btn.dataset.view === view);
         });
@@ -1627,6 +1634,11 @@
         // 3. 切到历史视图时刷新列表
         if (view === "history") {
             renderSessionList();
+        }
+
+        // 4. [配置页 / US-CFG-PAGE-1] 切到配置视图时拉取配置（AC-CFG-1）
+        if (view === "config") {
+            loadConfigView();
         }
 
         // [US-1.4] 同步 URL（不刷新）：使地址栏与当前视图一致，便于分享/刷新
@@ -1708,6 +1720,208 @@
             console.warn("[US-4.8] 加载会话列表异常:", e);
         }
     }
+
+    // ============================================
+    // [配置页 / US-CFG-PAGE-1~8] 配置视图
+    // ============================================
+
+    /** 配置视图运行时状态（不放入全局 state，避免污染聊天状态机） */
+    const configState = {
+        /** @type {Array<object>|null} 服务端返回的 items */
+        items: null,
+        /** @type {boolean} 是否有未保存改动（F-CFG-1） */
+        dirty: false,
+    };
+
+    /** 拉取并渲染配置视图（进入视图 / 保存成功后调用） */
+    async function loadConfigView() {
+        const box = document.getElementById("config-form");
+        if (!box) return;
+        box.innerHTML = '<div class="config-loading">加载中…</div>';
+
+        try {
+            const resp = await fetch("/api/config", { cache: "no-store" });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            configState.items = data.items || [];
+            renderConfigForm(box);
+            setConfigDirty(false);
+            renderConfigEnvNotice(data);
+        } catch (e) {
+            box.innerHTML = `<div class="config-error">加载配置失败：${escapeHtml(String(e.message || e))}</div>`;
+        }
+    }
+
+    /** 按分组渲染 15 个控件（AC-CFG-1 / 需求 §4.8.2） */
+    function renderConfigForm(box) {
+        const titles = {
+            app: "应用配置", llm: "LLM 配置", file: "文件工具配置",
+            log: "LLM 对话日志配置", stab: "复杂问题稳定性配置",
+        };
+        const groups = ["app", "llm", "file", "log", "stab"];
+
+        box.innerHTML = groups.map((g) => {
+            const items = (configState.items || []).filter((it) => it.group === g);
+            if (items.length === 0) return "";
+            return `
+              <section class="config-section">
+                <h3 class="config-section__title">${escapeHtml(titles[g] || g)}</h3>
+                ${items.map((it) => renderConfigItem(it)).join("")}
+              </section>`;
+        }).join("");
+
+        // 绑定输入事件：任何修改 → 置脏（F-CFG-1）
+        box.querySelectorAll("[data-config-key]").forEach((el) => {
+            el.addEventListener("input", () => setConfigDirty(true));
+            el.addEventListener("change", () => setConfigDirty(true));
+        });
+    }
+
+    /** 单个控件：按 type 映射控件形态（需求 §4.8.2） */
+    function renderConfigItem(it) {
+        const id = `cfg-${it.key}`;
+        let control;
+        if (it.type === "bool") {
+            control = `<select class="config-input" id="${id}" data-config-key="${it.key}">
+                <option value="true"${it.value === "true" ? " selected" : ""}>true</option>
+                <option value="false"${it.value === "false" ? " selected" : ""}>false</option>
+              </select>`;
+        } else if (it.type === "enum") {
+            control = `<select class="config-input" id="${id}" data-config-key="${it.key}">
+                ${(it.enumValues || []).map((v) =>
+                    `<option value="${escapeHtml(v)}"${it.value === v ? " selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+              </select>`;
+        } else if (it.secret) {
+            // AC-CFG-4：不回显明文，占位符显示掩码，留空=不修改
+            control = `<input class="config-input" id="${id}" data-config-key="${it.key}"
+                type="password" autocomplete="new-password"
+                placeholder="${escapeHtml(it.mask || "****")}" value="">`;
+        } else {
+            const numeric = it.type === "int" ? ' inputmode="numeric"' : "";
+            control = `<input class="config-input" id="${id}" data-config-key="${it.key}"
+                type="text"${numeric} value="${escapeHtml(String(it.value ?? ""))}">`;
+        }
+
+        const badges = [];
+        if (it.restartRequired) badges.push('<span class="config-badge config-badge--restart">需重启</span>');
+        if (it.secret && it.hasValue) badges.push('<span class="config-badge config-badge--set">已设置</span>');
+        if (it.shadowed) badges.push('<span class="config-badge config-badge--shadow">被系统环境变量覆盖</span>');
+
+        return `
+          <div class="config-item">
+            <div class="config-item__head">
+              <label class="config-item__label" for="${id}">${escapeHtml(it.label)}</label>
+              <code class="config-item__key">${escapeHtml(it.key)}</code>
+              ${badges.join("")}
+            </div>
+            ${control}
+            <div class="config-item__desc">${escapeHtml(it.desc || "")}</div>
+            ${it.shadowed
+              ? '<div class="config-item__warn">⚠️ 该系统环境变量已存在，改 <code>.env</code> 需先清除系统环境变量方可生效（只读提示）。</div>'
+              : ""}
+            <div class="config-item__error" data-error-for="${it.key}" hidden></div>
+          </div>`;
+    }
+
+    /** 顶部提示：.env 不存在时告知将自动创建（F-CFG-6 / AC-CFG-9） */
+    function renderConfigEnvNotice(data) {
+        const el = document.getElementById("config-notice");
+        if (!el) return;
+        if (data.envExists === false) {
+            el.hidden = false;
+            el.textContent = `未找到 .env（${data.envPath}），保存时将自动创建。`;
+        } else {
+            el.hidden = true;
+            el.textContent = "";
+        }
+    }
+
+    /** 置脏/清脏（F-CFG-1/F-CFG-4） */
+    function setConfigDirty(dirty) {
+        configState.dirty = dirty;
+        const badge = document.getElementById("config-dirty");
+        const btn = document.getElementById("config-save-btn");
+        if (badge) badge.hidden = !dirty;
+        if (btn) btn.disabled = !dirty;
+    }
+
+    /** 采集改动：仅返回与当前值不同的键；secret 留空则不提交（AC-CFG-4） */
+    function collectConfigChanges() {
+        const out = {};
+        (configState.items || []).forEach((it) => {
+            const el = document.getElementById(`cfg-${it.key}`);
+            if (!el) return;
+            const raw = el.value;
+            if (it.secret) {
+                if (raw.trim() !== "") out[it.key] = raw.trim();   // 留空 = 不修改
+                return;
+            }
+            const next = String(raw).trim();
+            if (next !== String(it.value ?? "")) out[it.key] = next;
+        });
+        return out;
+    }
+
+    /** 保存（AC-CFG-2 / F-CFG-2~F-CFG-5） */
+    async function saveConfig() {
+        const changes = collectConfigChanges();
+        const keys = Object.keys(changes);
+        if (keys.length === 0) return;
+
+        // 二次确认（列出将被修改的键）
+        const okConfirm = window.confirm(`确认修改以下配置？\n\n${keys.join("\n")}\n\n修改前会自动备份 .env。`);
+        if (!okConfirm) return;
+
+        // 清空上一次的逐项错误
+        document.querySelectorAll("[data-error-for]").forEach((n) => { n.hidden = true; n.textContent = ""; });
+        const resultEl = document.getElementById("config-result");
+        if (resultEl) resultEl.textContent = "保存中…";
+
+        try {
+            const resp = await fetch("/api/config", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ confirm: true, changes }),
+            });
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                // AC-CFG-3/F-CFG-5：逐项显示原因，**不清空用户已填内容**
+                if (data.fields) {
+                    Object.entries(data.fields).forEach(([k, reason]) => {
+                        const box = document.querySelector(`[data-error-for="${k}"]`);
+                        if (box) { box.hidden = false; box.textContent = `❌ ${reason}`; }
+                    });
+                }
+                if (resultEl) resultEl.textContent = `❌ 保存失败（${data.code || resp.status}）：${data.error || ""}`;
+                return;
+            }
+
+            // 成功：分组提示（AC-CFG-5 / F-CFG-3）
+            const hot = data.hotApplied || [];
+            const need = data.restartRequired || [];
+            const lines = [`✅ 已保存 ${data.changed.length} 项。`];
+            if (data.backupFile) lines.push(`🗂 备份：data/envbk/${data.backupFile}`);
+            if (data.envCreated) lines.push("🆕 已创建 .env（首次保存）。");
+            if (hot.length) lines.push(`⚡ 已立即生效：${hot.join(", ")}`);
+            if (need.length) lines.push(`🔁 需重启服务后生效：${need.join(", ")}`);
+            if (data.degraded) lines.push(`⚠️ ${data.degraded}`);
+            if (resultEl) resultEl.textContent = lines.join("\n");
+
+            await loadConfigView();   // F-CFG-4：重拉使 mask 等派生字段刷新
+            setConfigDirty(false);
+        } catch (e) {
+            if (resultEl) resultEl.textContent = `❌ 请求失败：${String(e.message || e)}`;
+        }
+    }
+
+    /** 有脏值时离开页面提醒（F-CFG-1） */
+    window.addEventListener("beforeunload", (e) => {
+        if (configState.dirty) {
+            e.preventDefault();
+            e.returnValue = "";
+        }
+    });
 
     /**
      * 自动调整输入框高度
@@ -1791,6 +2005,10 @@
                 switchView("chat");
             });
         }
+
+        // [配置页 / US-CFG-PAGE-2] 绑定保存按钮
+        const saveBtn = document.getElementById("config-save-btn");
+        if (saveBtn) saveBtn.addEventListener("click", saveConfig);
 
         // [US-4.8] 暴露 switchView 供手动验证
         window.__winbotsSwitchView = switchView;

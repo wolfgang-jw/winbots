@@ -19,8 +19,8 @@ import {
     isModifyEnabled,
     ok,
     fail,
-    FILE_ROOT,
-    TRASH_DIR,
+    getFileRoot,      // [配置页 / US-CFG-PAGE-6] 常量 → 函数
+    getTrashDir,      // [配置页 / US-CFG-PAGE-6] 常量 → 函数
 } from "./_shared";
 import { readFile, writeFile, stat, rename, mkdir, readdir } from "fs/promises";
 import { dirname, relative, basename, join, sep } from "path";
@@ -30,7 +30,7 @@ const MAX_WRITE_BYTES = 1024 * 1024;
 
 /** 将绝对路径转为「相对沙箱根」的展示路径（统一用 / 分隔） */
 function toRel(abs: string): string {
-    const r = relative(FILE_ROOT, abs);
+    const r = relative(getFileRoot(), abs);
     return (r === "" ? "." : r).split(sep).join("/");
 }
 
@@ -263,7 +263,7 @@ export const tools: Tool[] = [
             }
 
             // ③ 源不能是沙箱根本身（避免把整个沙箱移走）
-            if (fromAbs === FILE_ROOT) {
+            if (fromAbs === getFileRoot()) {
                 return fail("ERR_OUT_OF_ROOT", "不允许移动总操作目录本身");
             }
 
@@ -353,11 +353,13 @@ export const tools: Tool[] = [
             } catch (e) {
                 return fail("ERR_OUT_OF_ROOT", (e as Error).message);
             }
-            // ④ 禁止删除沙箱根与回收站本身
-            if (abs === FILE_ROOT) {
+            // ④ 禁止删除沙箱根与回收站本身（本次调用内保持一致，避免热更途中取值漂移）
+            const fileRoot = getFileRoot();
+            const trashDir = getTrashDir();
+            if (abs === fileRoot) {
                 return fail("ERR_OUT_OF_ROOT", "不允许删除总操作目录本身");
             }
-            if (abs === TRASH_DIR || abs.startsWith(TRASH_DIR + sep)) {
+            if (abs === trashDir || abs.startsWith(trashDir + sep)) {
                 return fail("ERR_OUT_OF_ROOT", "不允许操作回收站目录");
             }
 
@@ -383,16 +385,16 @@ export const tools: Tool[] = [
                 }
 
                 // ⑦ 确保回收站存在（位于总操作目录内，F6-10）
-                await mkdir(TRASH_DIR, { recursive: true });
+                await mkdir(trashDir, { recursive: true });
 
                 // ⑧ 生成回收站目标名（带时间戳，F6-10 可追溯）
-                let dest = join(TRASH_DIR, trashName(basename(abs)));
+                let dest = join(trashDir, trashName(basename(abs)));
                 // 同一秒内同名冲突兜底：追加 -1 / -2 ...
                 let n = 1;
                 while (true) {
                     try {
                         await stat(dest);
-                        dest = join(TRASH_DIR, `${trashName(basename(abs))}-${n++}`);
+                        dest = join(trashDir, `${trashName(basename(abs))}-${n++}`);
                     } catch (e) {
                         if ((e as NodeJS.ErrnoException).code === "ENOENT") break;
                         throw e;

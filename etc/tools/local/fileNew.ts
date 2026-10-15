@@ -18,7 +18,7 @@ import {
     isCreateEnabled,
     ok,
     fail,
-    FILE_ROOT,
+    getFileRoot,          // [配置页 / US-CFG-PAGE-6] FILE_ROOT 常量 → 函数
 } from "./_shared";
 import { mkdir, writeFile, appendFile, stat } from "fs/promises";
 import { dirname, relative, sep } from "path";
@@ -28,7 +28,7 @@ const MAX_WRITE_BYTES = 1024 * 1024;
 
 /** 将绝对路径转为「相对沙箱根」的展示路径（统一用 / 分隔） */
 function toRel(abs: string): string {
-    const r = relative(FILE_ROOT, abs);
+    const r = relative(getFileRoot(), abs);
     return (r === "" ? "." : r).split(sep).join("/");
 }
 

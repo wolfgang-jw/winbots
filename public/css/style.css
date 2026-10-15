@@ -1226,20 +1226,20 @@ padding: 12px 16px;
     color: var(--gray-600);
 }
 
-/* ---------- M3 状态视图（iframe 复用既有状态页） ---------- */
+/* ---------- M3 状态视图（内联，US-STATUS-VIEW-2） ---------- */
 .status-view {
     /* [US-UI-2] 自适应填充（F2-5），替代 calc(100vh - 140px) */
     flex: 1;
     min-height: 0;
     width: 100%;
+    /* [US-STATUS-VIEW-2] 内联化后内容变长，须自己滚动
+       （body 为 100dvh + overflow:hidden，滚动必须由视图容器承担，同 .history-list） */
+    overflow-y: auto;
 }
 
-.status-view__frame {
-    display: block;
+/* 内联状态内容的内层容器（原独立状态页承担滚动，现由 .status-view 承担） */
+.status-view__scroll {
     width: 100%;
-    /* [US-UI-2] iframe 填满父容器（F2-6） */
-    height: 100%;
-    border: none;
 }
 
 /* ---------- M4 响应式 ---------- */
@@ -1345,17 +1345,104 @@ padding: 12px 16px;
 
 
 /* ============================================
-   [US-UI-3] 状态页独立打开时的滚动兜底（不影响聊天页）
-   说明：US-UI-2 将 body 锁定为 100dvh + overflow:hidden，
-   状态页通过 iframe 嵌入时不受影响；但独立打开 status.html 时，
-   其内容（概览 + 服务卡片 + 刷新栏）可能超出一屏而无法滚动。
-   故为 status.html 的 body 加 .page-scroll 类，覆盖为可滚动。
+   [配置页 / US-CFG-PAGE-1] 配置视图
+   布局对齐 .history-layout（flex:1 + min-height:0 + 容器内滚动）
    ============================================ */
-.page-scroll {
-    height: auto;
-    min-height: 100vh;
-    min-height: 100dvh;
-    overflow: auto;
+.config-layout {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px;
+    width: 100%;
+}
+
+.config-scroll {
+    overflow-y: auto;            /* 唯一滚动容器：body 已 overflow:hidden */
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.config-section {
+    background: var(--white);
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+}
+
+.config-section__title {
+    font-size: 1rem;
+    font-weight: 700;
+    color: var(--gray-800);
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--egg-yellow);
+}
+
+.config-item { padding: 10px 0; border-bottom: 1px dashed var(--gray-200); }
+.config-item:last-child { border-bottom: none; }
+
+.config-item__head {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+
+.config-item__label { font-size: 0.9rem; font-weight: 600; color: var(--gray-800); }
+
+.config-item__key {
+    font-size: 0.75rem; color: var(--gray-600);
+    background: var(--gray-100); padding: 2px 6px; border-radius: 4px;
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+}
+
+.config-badge { font-size: 0.7rem; font-weight: 600; padding: 2px 8px; border-radius: 20px; }
+.config-badge--restart { background: var(--egg-yellow); color: var(--gray-800); }
+.config-badge--set     { background: var(--green-onion-light); color: var(--white); }
+.config-badge--shadow  { background: #FFE0B2; color: var(--gray-800); }
+
+.config-input {
+    width: 100%; padding: 8px 12px; font-size: 0.9rem;
+    border: 2px solid var(--gray-200); border-radius: 8px;
+    font-family: inherit; background: var(--white); outline: none;
+}
+.config-input:focus { border-color: var(--tomato-red); }
+
+.config-item__desc { font-size: 0.78rem; color: var(--gray-600); margin-top: 4px; line-height: 1.5; }
+.config-item__warn {
+    font-size: 0.78rem; color: #EF6C00; background: #FFF3E0;
+    border-radius: 6px; padding: 6px 10px; margin-top: 6px;
+}
+.config-item__error { font-size: 0.78rem; color: var(--tomato-red); margin-top: 4px; }
+
+.config-actions {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 0; border-top: 1px solid var(--gray-200);
+    flex-shrink: 0;              /* 操作区常驻，不参与滚动 */
+}
+.config-btn {
+    background: linear-gradient(135deg, var(--tomato-red), var(--tomato-red-dark));
+    color: var(--white); border: none; padding: 10px 24px;
+    border-radius: 20px; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+}
+.config-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.config-dirty { font-size: 0.8rem; color: #EF6C00; }
+.config-notice {
+    font-size: 0.82rem; color: var(--gray-800); background: var(--egg-yellow-light);
+    border-radius: 8px; padding: 10px 14px;
+}
+.config-loading, .config-error { font-size: 0.85rem; color: var(--gray-600); padding: 12px 0; }
+.config-error { color: var(--tomato-red); }
+.config-result { font-size: 0.82rem; line-height: 1.6; white-space: pre-wrap; }
+.config-security {
+    font-size: 0.75rem; color: var(--gray-600); text-align: center;
+    padding: 12px 0; flex-shrink: 0;
 }
 
 

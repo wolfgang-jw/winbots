@@ -17,6 +17,7 @@ import { errorHandler, notFoundHandler } from "@/middleware/error";
 import healthRoute from "@/routes/health";
 import chatRoute from "@/routes/chat";
 import logRoute from "@/routes/log";   // [Sprint 5.1 / US-LOG-4]
+import configRoute from "@/routes/config";   // [配置页 / US-CFG-PAGE-1]
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
@@ -38,7 +39,8 @@ app.use("*", originGuard);
 // ============================================
 app.route("/api/health", healthRoute);
 app.route("/api/chat", chatRoute);
-app.route("/api/log", logRoute);   // [Sprint 5.1 / US-LOG-4]
+app.route("/api/log", logRoute);         // [Sprint 5.1 / US-LOG-4]
+app.route("/api/config", configRoute);   // [配置页 / US-CFG-PAGE-1]
 
 // ============================================
 // 静态文件服务（前端页面）
@@ -78,7 +80,7 @@ console.log(`   地址:      http://localhost:${port}`);
 console.log(`   健康检查:  http://localhost:${port}/api/health`);
 console.log(`   对话接口:  http://localhost:${port}/api/chat/stream`);
 console.log(`   聊天页面:  http://localhost:${port}/`);
-console.log(`   状态监控:  http://localhost:${port}/status.html`);
+console.log(`   状态监控:  http://localhost:${port}/?view=status`);   // [US-STATUS-VIEW-4] 内联视图入口
 console.log("=".repeat(60) + "\n");
 
 // 显式启动 HTTP 服务器（返回即代表已开始监听）

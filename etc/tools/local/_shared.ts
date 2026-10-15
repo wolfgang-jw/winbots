@@ -5,7 +5,7 @@
  * 职责：
  * 1. 路径白名单守卫：resolveInRoot() —— 所有文件操作路径统一经此校验
  * 2. 开关读取：isReadEnabled() / isCreateEnabled() / isModifyEnabled()
- * 3. 固定目录常量：TRASH_DIR（回收站，位于总操作目录内）
+ * 3. 目录函数：getFileRoot() / getTrashDir()（回收站，位于总操作目录内）
  * 4. 结果封装：ok() / fail()
  *
  * ⚠️ 本文件【不导出 tools】，因此不会被 src/tools/index.ts 注册为工具。
@@ -20,11 +20,19 @@ import { env } from "@/infra/env";
 /** 项目根目录：<项目根>/etc/tools/local/ 上溯三级 */
 const PROJECT_ROOT = resolve(import.meta.dir, "../../..");
 
-/** 沙箱总目录绝对路径：<项目根>/<FILE_ROOT_DIR>（默认 <项目根>/working） */
-export const FILE_ROOT = resolve(PROJECT_ROOT, env.FILE_ROOT_DIR);
+/**
+ * [配置页 / US-CFG-PAGE-6] 沙箱总目录：<项目根>/<FILE_ROOT_DIR>
+ *   由模块级常量改为函数——FILE_ROOT_DIR 需支持热更新（需求 §4.9.3）。
+ *   ⚠️ 不要在模块顶层缓存调用结果，否则热更失效。
+ */
+export function getFileRoot(): string {
+    return resolve(PROJECT_ROOT, env.FILE_ROOT_DIR);
+}
 
-/** 回收站目录绝对路径：<沙箱总目录>/.trash（F3-8，位于总操作目录内） */
-export const TRASH_DIR = resolve(FILE_ROOT, ".trash");
+/** 回收站目录：<沙箱总目录>/.trash（F3-8，位于总操作目录内） */
+export function getTrashDir(): string {
+    return resolve(getFileRoot(), ".trash");
+}
 
 /** 统一成功结果 */
 export function ok(data: unknown): { ok: true; data: unknown } {
@@ -46,15 +54,18 @@ export function fail(code: string, message: string): { ok: false; error: { code:
  * @throws Error（message 前缀 ERR_OUT_OF_ROOT）
  */
 export function resolveInRoot(relPath: string): string {
+    // 0. [配置页 / US-CFG-PAGE-6] 每次调用重新计算沙箱根（不缓存），使 FILE_ROOT_DIR 热更生效
+    const fileRoot = getFileRoot();
+
     // 1. 归一化输入：空 / 未提供视为沙箱根
     const raw = (relPath ?? "").trim();
-    const target = raw === "" || raw === "." ? FILE_ROOT : resolve(FILE_ROOT, raw);
+    const target = raw === "" || raw === "." ? fileRoot : resolve(fileRoot, raw);
 
-    // 2. 白名单校验：解析后的绝对路径必须以 FILE_ROOT + 分隔符 开头，
-    //    或恰好等于 FILE_ROOT 本身。
-    //    注意：FILE_ROOT 自身允许（如 list_directory 列根目录）。
-    const rootWithSep = FILE_ROOT.endsWith(sep) ? FILE_ROOT : FILE_ROOT + sep;
-    if (target !== FILE_ROOT && !target.startsWith(rootWithSep)) {
+    // 2. 白名单校验：解析后的绝对路径必须以 fileRoot + 分隔符 开头，
+    //    或恰好等于 fileRoot 本身。
+    //    注意：fileRoot 自身允许（如 list_directory 列根目录）。
+    const rootWithSep = fileRoot.endsWith(sep) ? fileRoot : fileRoot + sep;
+    if (target !== fileRoot && !target.startsWith(rootWithSep)) {
         throw new Error(
             `ERR_OUT_OF_ROOT: 路径越界，仅允许访问总操作目录内: ${relPath}`
         );
@@ -69,6 +80,8 @@ export function resolveInRoot(relPath: string): string {
  * 目标不存在时（如 create_file 的新文件）无需调用，由字面校验保证。
  */
 export function assertRealPathInRoot(absPath: string): void {
+    // [配置页 / US-CFG-PAGE-6] 每次调用重新计算沙箱根（不缓存）
+    const fileRoot = getFileRoot();
     let real: string;
     try {
         real = realpathSync(absPath);
@@ -76,8 +89,8 @@ export function assertRealPathInRoot(absPath: string): void {
         // 目标不存在：交给字面校验即可（新文件/新目录场景）
         return;
     }
-    const rootWithSep = FILE_ROOT.endsWith(sep) ? FILE_ROOT : FILE_ROOT + sep;
-    if (real !== FILE_ROOT && !real.startsWith(rootWithSep)) {
+    const rootWithSep = fileRoot.endsWith(sep) ? fileRoot : fileRoot + sep;
+    if (real !== fileRoot && !real.startsWith(rootWithSep)) {
         throw new Error(`ERR_OUT_OF_ROOT: 软链越界，真实路径不在总操作目录内: ${absPath}`);
     }
 }
