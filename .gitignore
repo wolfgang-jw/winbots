@@ -2,8 +2,5 @@
 .vscode/
 node_modules/
 .env
-docs/
 BotsAI-Portable-v*.zip
 data/
-*.log
-working/
