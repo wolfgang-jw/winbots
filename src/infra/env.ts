@@ -73,6 +73,27 @@ export interface EnvConfig {
   // [Sprint 5.2 / US-STAB-3] 复杂问题稳定性配置（可选，带默认值；不加入 REQUIRED_VARS）
   MAX_TOOL_ROUNDS: number;        // 工具调用轮次上限（默认 8）
   SSE_HEARTBEAT_MS: number;       // SSE 心跳间隔毫秒（默认 10000）
+  // [需求域 T / T-06] 平台兜底：工具结果总长度上限（字符，默认 32000）。
+  //   与具体工具无关，在 executeTool 唯一出口统一截断；不进配置页（§9.1「进配置页=否」），
+  //   也不进 REQUIRED_VARS（缺失回退默认值，§9.1 约束 2）。
+  TOOL_RESULT_MAX_CHARS: number;
+
+  // [需求域 R / US-R-01] 互联网工具配置（全部可选，带默认值；不加入 REQUIRED_VARS）
+  //   §9.1 约束：新增项须进入本字面量（否则热更静默失效），且不得加入必填校验。
+  INTERNET_ENABLED: boolean;                    // 总开关：是否暴露联网工具（R-13，热更生效）
+  INTERNET_SEARCH_PROVIDER: string;             // 检索供应商（R-07）
+  INTERNET_FETCH_PROVIDER: string;              // 抓取供应商（R-07）
+  INTERNET_DEEPSEEK_API_KEY: string;            // 供应商密钥（R-11：按供应商独立，空=免鉴权）
+  INTERNET_DEEPSEEK_BASE_URL: string;           // 供应商基址（可覆盖，§9.1「基址」不进配置页）
+  INTERNET_DEEPSEEK_SEARCH_PATH: string;        // 检索端点路径（R-08 第 1 类差异）
+  INTERNET_DEEPSEEK_FETCH_PATH: string;         // 抓取端点路径（R-08 第 1 类差异）
+  INTERNET_DEFAULT_COUNT: number;               // 检索默认条数（R-18，默认 5）
+  INTERNET_TIMEOUT_MS: number;                  // 单次请求超时毫秒（R-39，默认 20000）
+  INTERNET_FETCH_MAX_CHARS: number;             // 抓取回灌上限字符（R-41，默认 8000）
+  INTERNET_STORE_TTL_S: number;                 // 暂存 TTL 秒（R-30，默认 300）
+  INTERNET_STORE_MAX_ITEMS_PER_SESSION: number; // 暂存单会话条数上限（R-30，默认 8）
+  INTERNET_STORE_MAX_CHARS_PER_ITEM: number;    // 暂存单条字符上限（R-30，默认 200000）
+  INTERNET_STORE_MAX_CHARS_TOTAL: number;       // 暂存全局字符上限（R-30，默认 4 MB）
 }
 
 /** 必需的环境变量列表 */
@@ -175,6 +196,34 @@ function validateEnv(): EnvConfig {
     //     必须显著小于 Bun.serve 的 idleTimeout（index.ts 设为 255s），
     //     且原 15s 与 Bun 默认空闲超时 10s 冲突，导致连接被提前关闭。
     SSE_HEARTBEAT_MS: parseInt(Bun.env.SSE_HEARTBEAT_MS || "10000", 10) || 10000,
+    // [需求域 T / T-06] 工具结果总长度上限：默认 32000；非法/缺失回退默认值（防 parseInt 返回 NaN）
+    TOOL_RESULT_MAX_CHARS:
+      parseInt(Bun.env.TOOL_RESULT_MAX_CHARS || "32000", 10) || 32000,
+
+    // [需求域 R / US-R-01] 互联网工具配置（可选，带默认值；缺失/非法一律回退，不退出进程）
+    //   总开关：默认开启，仅显式 "false" 才关闭（与 FILE_READ_ENABLED 语义一致）
+    INTERNET_ENABLED: Bun.env.INTERNET_ENABLED !== "false",
+    //   供应商选择：空值回退 deepseek；非法值不在此处拦截，由工具调用时返回 invalid_provider（R-12）
+    INTERNET_SEARCH_PROVIDER: Bun.env.INTERNET_SEARCH_PROVIDER || "deepseek",
+    INTERNET_FETCH_PROVIDER: Bun.env.INTERNET_FETCH_PROVIDER || "deepseek",
+    //   密钥：按供应商独立，空串 = 免鉴权（R-11）；默认空，**不设全局回退**（X-06）
+    INTERNET_DEEPSEEK_API_KEY: Bun.env.INTERNET_DEEPSEEK_API_KEY || "",
+    //   基址/端点路径：允许覆盖，便于接自建网关（R-08 第 1 类差异）
+    INTERNET_DEEPSEEK_BASE_URL: Bun.env.INTERNET_DEEPSEEK_BASE_URL || "https://api.deepseek.com",
+    INTERNET_DEEPSEEK_SEARCH_PATH: Bun.env.INTERNET_DEEPSEEK_SEARCH_PATH || "/v1/search",
+    INTERNET_DEEPSEEK_FETCH_PATH: Bun.env.INTERNET_DEEPSEEK_FETCH_PATH || "/v1/fetch",
+    //   默认条数：代码侧最终仍会钳制到 1–10（R-18）
+    INTERNET_DEFAULT_COUNT: parseInt(Bun.env.INTERNET_DEFAULT_COUNT || "5", 10) || 5,
+    INTERNET_TIMEOUT_MS: parseInt(Bun.env.INTERNET_TIMEOUT_MS || "20000", 10) || 20000,
+    INTERNET_FETCH_MAX_CHARS: parseInt(Bun.env.INTERNET_FETCH_MAX_CHARS || "8000", 10) || 8000,
+    //   暂存四要素（R-30）：TTL / 单会话条数 / 单条字符 / 全局字符
+    INTERNET_STORE_TTL_S: parseInt(Bun.env.INTERNET_STORE_TTL_S || "300", 10) || 300,
+    INTERNET_STORE_MAX_ITEMS_PER_SESSION:
+      parseInt(Bun.env.INTERNET_STORE_MAX_ITEMS_PER_SESSION || "8", 10) || 8,
+    INTERNET_STORE_MAX_CHARS_PER_ITEM:
+      parseInt(Bun.env.INTERNET_STORE_MAX_CHARS_PER_ITEM || "200000", 10) || 200000,
+    INTERNET_STORE_MAX_CHARS_TOTAL:
+      parseInt(Bun.env.INTERNET_STORE_MAX_CHARS_TOTAL || "4194304", 10) || 4194304,
   };
 }
 
@@ -216,6 +265,20 @@ console.log(`  LLM_LOG_MAX_ROWS:      ${env.LLM_LOG_MAX_ROWS}`);
 console.log("-".repeat(60));
 console.log(`  MAX_TOOL_ROUNDS:       ${env.MAX_TOOL_ROUNDS}`);
 console.log(`  SSE_HEARTBEAT_MS:      ${env.SSE_HEARTBEAT_MS}`);
+// [需求域 T / T-06] 平台兜底：工具结果总长度上限（无敏感信息）
+console.log(`  TOOL_RESULT_MAX_CHARS: ${env.TOOL_RESULT_MAX_CHARS}（工具结果回灌前的截断上限）`);
+// [需求域 R / R-45] 互联网工具生效配置摘要（密钥打掩码；未配置时说明将按免鉴权调用）
+console.log("-".repeat(60));
+console.log(`  INTERNET_ENABLED:      ${env.INTERNET_ENABLED ? "开启" : "关闭"}`);
+console.log(`  INTERNET 供应商:       search=${env.INTERNET_SEARCH_PROVIDER} / fetch=${env.INTERNET_FETCH_PROVIDER}`);
+console.log(
+  `  INTERNET_DEEPSEEK_API_KEY: ${env.INTERNET_DEEPSEEK_API_KEY ? "******" : "未设置（将按免鉴权调用）"}`
+);
+console.log(`  INTERNET 基址:         ${env.INTERNET_DEEPSEEK_BASE_URL}`);
+console.log(`  INTERNET 超时/回灌上限: ${env.INTERNET_TIMEOUT_MS}ms / ${env.INTERNET_FETCH_MAX_CHARS} 字符`);
+console.log(
+  `  INTERNET 暂存:         TTL=${env.INTERNET_STORE_TTL_S}s｜单会话=${env.INTERNET_STORE_MAX_ITEMS_PER_SESSION} 条｜单条=${env.INTERNET_STORE_MAX_CHARS_PER_ITEM} 字符｜全局=${env.INTERNET_STORE_MAX_CHARS_TOTAL} 字符`
+);
 console.log("=".repeat(60));
 
 /**

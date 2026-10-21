@@ -43,6 +43,13 @@
  *   - C-06：解析上游思考内容（delta.reasoning_content）与本配置完全解耦 ——
  *     无论是否下发，`think` 事件与 meta.thinking 落库照旧。
  *
+ * [需求域 T / v0.0.7] 平台工具能力扩展（US-T-01 ~ US-T-05；本文件只承担 T-04 的接线）
+ *   - T-01/T-02：工具定义快照仍按「每次请求取一次」获取（见下方 `const toolDefs = getToolDefinitions()`），
+ *     过滤（enabled 判定）发生在 getToolDefinitions 内部，故热更后下一请求即刻生效，无需重启。
+ *   - T-03/T-04：工具执行时把 `{ signal, sessionId }` 作为上下文透传给 executeTool →
+ *     handler 第二参；用户点「停止」时在途工具可据此中止，本轮剩余工具也会被跳过。
+ *   - T-05/T-06 在 src/tools/index.ts 内实现（已禁用信封、结果长度兜底），本文件无需改动。
+ *
  * 历史修复记录（保留以便追溯，均已完成）：
  *   - [US-1.1~1.3] 统一流式输出；上游不支持工具时的流式兼容。
  *   - [US-2.1~2.4] 会话唯一标识 / 服务端持有历史 / 会话隔离 / 兼容旧接口。
@@ -700,6 +707,13 @@ router.post("/stream", async (c) => {
                             // ③ 执行本轮全部工具，推送事件，构造回灌消息
                             const toolResultMessages: Array<Record<string, unknown>> = [];
                             for (const tc of currentToolCalls) {
+                                // [需求域 T / T-04] 用户已中断：跳过本轮剩余工具，直接收尾。
+                                //   与既有中断早退的语义一致（不发 finish、不落库、不写调用日志），
+                                //   避免「已点停止仍在写文件」。
+                                if (upstreamController.signal.aborted) {
+                                    console.log("⏹️ [T-04] 已中断，跳过本次工具调用及后续轮次");
+                                    return;
+                                }
                                 const wireName = tc.function?.name || "";
                                 const displayName = toDisplayName(wireName);
                                 // [需求域 B / B-04] 与日志 / 落库共用同一份参数解析（parseToolArguments），
@@ -718,7 +732,12 @@ router.post("/stream", async (c) => {
                                 });
 
                                 // 后端执行（executeTool 内部已兜底异常）
-                                const toolResult = await executeTool(wireName, args);
+                                // [需求域 T / T-03、T-04] 透传上下文：中断信号 + 会话标识，
+                                //   使在途工具可在用户点「停止」时中止，也便于后续联网工具按会话暂存（R-30）。
+                                const toolResult = await executeTool(wireName, args, {
+                                    signal: upstreamController.signal,
+                                    sessionId: useServerHistory ? (sessionId as string) : undefined,
+                                });
 
                                 // 推送「工具结果」事件
                                 send({

@@ -1731,6 +1731,8 @@
         items: null,
         /** @type {boolean} 是否有未保存改动（F-CFG-1） */
         dirty: false,
+        /** @type {Set<string>} [需求域 R / R-17、§9.2] 已标记清空的密钥键（保存后生效） */
+        clearKeys: new Set(),
     };
 
     /** 拉取并渲染配置视图（进入视图 / 保存成功后调用） */
@@ -1745,6 +1747,7 @@
             const data = await resp.json();
             configState.items = data.items || [];
             renderConfigForm(box);
+            bindClearButtons(box);   // [需求域 R / R-17] 绑定密文项「清空」按钮（§9.2）
             setConfigDirty(false);
             renderConfigEnvNotice(data);
         } catch (e) {
@@ -1757,8 +1760,9 @@
         const titles = {
             app: "应用配置", llm: "LLM 配置", file: "文件工具配置",
             log: "LLM 对话日志配置", stab: "复杂问题稳定性配置",
+            internet: "互联网工具配置",
         };
-        const groups = ["app", "llm", "file", "log", "stab"];
+        const groups = ["app", "llm", "file", "log", "stab", "internet"];
 
         box.innerHTML = groups.map((g) => {
             const items = (configState.items || []).filter((it) => it.group === g);
@@ -1802,6 +1806,17 @@
                 type="text"${numeric} value="${escapeHtml(String(it.value ?? ""))}">`;
         }
 
+        // [需求域 R / R-17、§9.2] 密文且非必需项 → 「清空」按钮（已设置时可见；标记后换成「撤销」+ 提示）
+        //   必需项（如 LLM_API_KEY）不渲染该按钮：界面隐藏与接口拒绝两条必须同时具备（§9.2 约束 4）
+        const clearable = !!it.secret && !it.required;
+        const marked = clearable && configState.clearKeys.has(it.key);
+        const secretActions = clearable
+            ? `<div class="config-item__clear-row">
+                 <button type="button" class="config-item__clear" data-clear-for="${escapeHtml(it.key)}"${it.hasValue || marked ? "" : " hidden"}>清空</button>
+                 <button type="button" class="config-item__undo" data-undo-for="${escapeHtml(it.key)}"${marked ? "" : " hidden"}>撤销</button>
+                 <span class="config-item__clear-note" data-clear-note-for="${escapeHtml(it.key)}"${marked ? "" : " hidden"}>已标记清空，保存后生效</span>
+               </div>`
+            : "";
         const badges = [];
         if (it.restartRequired) badges.push('<span class="config-badge config-badge--restart">需重启</span>');
         if (it.secret && it.hasValue) badges.push('<span class="config-badge config-badge--set">已设置</span>');
@@ -1815,12 +1830,71 @@
               ${badges.join("")}
             </div>
             ${control}
+            ${secretActions}
             <div class="config-item__desc">${escapeHtml(it.desc || "")}</div>
             ${it.shadowed
               ? '<div class="config-item__warn">⚠️ 该系统环境变量已存在，改 <code>.env</code> 需先清除系统环境变量方可生效（只读提示）。</div>'
               : ""}
             <div class="config-item__error" data-error-for="${it.key}" hidden></div>
           </div>`;
+    }
+
+    /**
+     * [需求域 R / R-17、§9.2] 绑定密文项的「清空 / 撤销」按钮，以及「重新输入非空值自动取消标记」。
+     * 说明：清空意图只记录在 configState.clearKeys，保存时以独立 clear 字段提交；
+     *       输入框内的空串始终表示「不修改」，两者语义严格区分。
+     * @param {HTMLElement} box - 配置表单容器
+     */
+    function bindClearButtons(box) {
+        box.querySelectorAll("[data-clear-for]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const key = btn.dataset.clearFor;
+                if (!key) return;
+                configState.clearKeys.add(key);
+                syncClearUi(key, true);
+                setConfigDirty(true);
+            });
+        });
+
+        box.querySelectorAll("[data-undo-for]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const key = btn.dataset.undoFor;
+                if (!key) return;
+                configState.clearKeys.delete(key);
+                syncClearUi(key, false);
+                setConfigDirty(true);
+            });
+        });
+
+        // §9.2：若重新输入非空值，标记自动取消
+        (configState.items || []).forEach((it) => {
+            if (!it.secret || it.required) return;
+            const input = document.getElementById(`cfg-${it.key}`);
+            if (!input) return;
+            input.addEventListener("input", () => {
+                if (input.value.trim() !== "" && configState.clearKeys.has(it.key)) {
+                    configState.clearKeys.delete(it.key);
+                    syncClearUi(it.key, false);
+                }
+            });
+        });
+    }
+
+    /** 同步某一项的清空标记 UI（输入框禁用、按钮与提示显隐） */
+    function syncClearUi(key, marked) {
+        const meta = (configState.items || []).find((x) => x.key === key);
+        const hasValue = !!(meta && meta.hasValue);
+        const input = document.getElementById(`cfg-${key}`);
+        const clearBtn = document.querySelector(`[data-clear-for="${key}"]`);
+        const undoBtn = document.querySelector(`[data-undo-for="${key}"]`);
+        const note = document.querySelector(`[data-clear-note-for="${key}"]`);
+        if (input) {
+            input.disabled = marked;
+            if (marked) input.value = "";
+        }
+        if (clearBtn) clearBtn.hidden = marked || !hasValue;
+        if (undoBtn) undoBtn.hidden = !marked;
+        if (note) note.hidden = !marked;
     }
 
     /** 顶部提示：.env 不存在时告知将自动创建（F-CFG-6 / AC-CFG-9） */
@@ -1853,6 +1927,7 @@
             if (!el) return;
             const raw = el.value;
             if (it.secret) {
+                if (configState.clearKeys.has(it.key)) return;   // [R-17] 已标记清空 → 只经 clear 字段提交，不进 changes
                 if (raw.trim() !== "") out[it.key] = raw.trim();   // 留空 = 不修改
                 return;
             }
@@ -1866,10 +1941,15 @@
     async function saveConfig() {
         const changes = collectConfigChanges();
         const keys = Object.keys(changes);
-        if (keys.length === 0) return;
+        // [需求域 R / R-17] 清空项单独收集：与普通修改项分开确认、分开提交（§9.2 互斥校验）
+        const clearKeys = [...configState.clearKeys];
+        if (keys.length === 0 && clearKeys.length === 0) return;
 
         // 二次确认（列出将被修改的键）
-        const okConfirm = window.confirm(`确认修改以下配置？\n\n${keys.join("\n")}\n\n修改前会自动备份 .env。`);
+        const confirmParts = [];
+        if (keys.length > 0) confirmParts.push(`修改：\n${keys.join("\n")}`);
+        if (clearKeys.length > 0) confirmParts.push(`清空密钥（保存后写为空值）：\n${clearKeys.join("\n")}`);
+        const okConfirm = window.confirm(`确认应用以下变更？\n\n${confirmParts.join("\n\n")}\n\n修改前会自动备份 .env。`);
         if (!okConfirm) return;
 
         // 清空上一次的逐项错误
@@ -1881,7 +1961,7 @@
             const resp = await fetch("/api/config", {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ confirm: true, changes }),
+                body: JSON.stringify({ confirm: true, changes, clear: clearKeys }),
             });
             const data = await resp.json();
 
@@ -1902,12 +1982,14 @@
             const need = data.restartRequired || [];
             const lines = [`✅ 已保存 ${data.changed.length} 项。`];
             if (data.backupFile) lines.push(`🗂 备份：data/envbk/${data.backupFile}`);
+            if (Array.isArray(data.cleared) && data.cleared.length > 0) lines.push(`🧹 已清空：${data.cleared.join(", ")}`);
             if (data.envCreated) lines.push("🆕 已创建 .env（首次保存）。");
             if (hot.length) lines.push(`⚡ 已立即生效：${hot.join(", ")}`);
             if (need.length) lines.push(`🔁 需重启服务后生效：${need.join(", ")}`);
             if (data.degraded) lines.push(`⚠️ ${data.degraded}`);
             if (resultEl) resultEl.textContent = lines.join("\n");
 
+            configState.clearKeys.clear();   // [R-17] 保存成功后清空标记（服务端已落盘为空值）
             await loadConfigView();   // F-CFG-4：重拉使 mask 等派生字段刷新
             setConfigDirty(false);
         } catch (e) {

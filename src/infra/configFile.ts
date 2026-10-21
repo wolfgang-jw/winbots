@@ -37,7 +37,7 @@ const KEEP_BACKUPS = 20;
 // ============================================
 
 export type ConfigType = "int" | "bool" | "enum" | "string" | "secret";
-export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab";
+export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab" | "internet";
 
 export interface ConfigKeyMeta {
   key: string;
@@ -48,6 +48,11 @@ export interface ConfigKeyMeta {
   /** 文件缺失该键时的回填值（取自 src/infra/env.ts 的 validateEnv 默认值） */
   defaultValue: string;
   secret?: boolean;
+  /**
+   * [需求域 R / R-17、§9.2] 必需项：不允许清空（界面不显示按钮，接口收到清空须拒绝且不改写文件）。
+   * 仅为 true 时才受限制；未声明视为「非必需」——但非密文项本身也不支持清空（§9.2 适用范围）。
+   */
+  required?: boolean;
   enumValues?: readonly string[];
   min?: number;
   max?: number;
@@ -57,7 +62,7 @@ export interface ConfigKeyMeta {
   desc: string;
 }
 
-/** 16 项全量白名单（顺序与 .env.example 一致；需求 §4.2） */
+/** 22 项全量白名单（16 项原有 + 6 项互联网工具；顺序与 .env.example 一致；需求 §4.2 / §9.1） */
 export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   {
     key: "APP_PORT", group: "app", groupTitle: "应用配置", type: "int",
@@ -72,7 +77,7 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   },
   {
     key: "LLM_API_KEY", group: "llm", groupTitle: "LLM 配置", type: "secret",
-    label: "API 密钥", defaultValue: "sk-apikey", secret: true,
+    label: "API 密钥", defaultValue: "sk-apikey", secret: true, required: true,
     desc: "你的 API 密钥。页面不回显明文，留空表示不修改。",
   },
   {
@@ -144,13 +149,47 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
     label: "SSE 心跳间隔（毫秒）", defaultValue: "10000", min: 1000, max: 254999,
     desc: "必须显著小于 Bun.serve 的 idleTimeout（255 秒），切勿大于 254999。",
   },
+  // ============================================
+  // [需求域 R / US-R-01] 互联网工具配置（6 项进配置页，R-13/R-14/R-17）
+  //   进配置页的判定见 §9.1；其余（基址、默认条数、暂存四要素）手工维护，不在此白名单内。
+  // ============================================
+  {
+    key: "INTERNET_ENABLED", group: "internet", groupTitle: "互联网工具配置", type: "bool",
+    label: "联网工具总开关", defaultValue: "true",
+    desc: "控制网页检索/抓取工具是否出现在模型可见工具列表中；保存后热更立即生效（R-13）。",
+  },
+  {
+    key: "INTERNET_SEARCH_PROVIDER", group: "internet", groupTitle: "互联网工具配置", type: "enum",
+    label: "检索供应商", defaultValue: "deepseek", enumValues: ["deepseek"],
+    desc: "网页检索使用的供应商标识；与抓取供应商相互独立，缺密钥只影响各自的 kind（R-07/R-14）。",
+  },
+  {
+    key: "INTERNET_FETCH_PROVIDER", group: "internet", groupTitle: "互联网工具配置", type: "enum",
+    label: "抓取供应商", defaultValue: "deepseek", enumValues: ["deepseek"],
+    desc: "网页抓取使用的供应商标识；与检索供应商相互独立（R-07/R-14）。",
+  },
+  {
+    key: "INTERNET_DEEPSEEK_API_KEY", group: "internet", groupTitle: "互联网工具配置", type: "secret",
+    label: "DeepSeek 供应商密钥", defaultValue: "", secret: true,
+    desc: "留空表示不修改；需删除已保存的密钥请点『清空』。密钥为空时按免鉴权调用（不发送鉴权头，R-15），若该供应商实际需要鉴权则每次调用返回 auth_required（R-16）。",
+  },
+  {
+    key: "INTERNET_TIMEOUT_MS", group: "internet", groupTitle: "互联网工具配置", type: "int",
+    label: "单次请求超时（毫秒）", defaultValue: "20000", min: 1000,
+    desc: "联网工具单次上请求的超时上限（R-39）；超时挂在中止信号上，点「停止」也会中止在途请求（R-40）。",
+  },
+  {
+    key: "INTERNET_FETCH_MAX_CHARS", group: "internet", groupTitle: "互联网工具配置", type: "int",
+    label: "抓取回灌上限（字符）", defaultValue: "8000", min: 200,
+    desc: "单次抓取正文回灌给模型的字符上限，超限按三要素标注截断状态（R-41/R-24）。",
+  },
 ] as const;
 
 /** 键名白名单集合（PUT 校验用） */
 export const CONFIG_KEY_SET: ReadonlySet<string> = new Set(CONFIG_KEYS.map((m) => m.key));
 
 /** 分组顺序（前端渲染顺序） */
-export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab"];
+export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab", "internet"];
 
 // ============================================
 // 校验
@@ -333,6 +372,8 @@ export interface ConfigItem {
   /** 文件中的原始字符串（未做类型转换）；secret 键恒为 null */
   value: string | null;
   secret: boolean;
+  /** [R-17 / §9.2] 必需项不显示「清空」按钮（UI 依据）；未声明视为非必需 */
+  required?: boolean;
   /** secret 键：文件中是否已有非空值 */
   hasValue?: boolean;
   /** secret 键：掩码，如 sk-****cdef */
@@ -376,7 +417,7 @@ export function buildConfigItems(
     const base: ConfigItem = {
       key: meta.key, group: meta.group, groupTitle: meta.groupTitle,
       type: meta.type, label: meta.label, desc: meta.desc,
-      value: raw, secret: !!meta.secret,
+      value: raw, secret: !!meta.secret, required: meta.required === true,
       enumValues: meta.enumValues, min: meta.min, max: meta.max,
       shadowed: shadowed.has(meta.key),
       restartRequired: restartOnly.has(meta.key),
@@ -406,17 +447,58 @@ export interface ApplyResult {
   error?: string;
 }
 
-/** 应用一批改动：校验 → 备份 → 逐键替换 → 原子写 */
-export function applyConfigChanges(changes: Record<string, string>): ApplyResult {
+/**
+ * 应用一批改动：校验 → 备份 → 逐键替换 → 原子写
+ *
+ * [需求域 R / US-R-06 / R-17、§9.2] 新增 clearKeys：
+ *   清空**只能**经该参数表达（写入空串并持久化），不复用「changes 中传空串＝不修改」的既有约定。
+ *   校验（全部通过才写盘，与 §4.3 一致）：
+ *     1. 必须是白名单键；
+ *     2. 必须是密文类型（非密文键一律拒绝）；
+ *     3. 不得是必需项（必需项写空会导致热更校验判缺失并退出进程，§9.2 约束 4）；
+ *     4. 同一键不得同时出现在 changes 与 clearKeys。
+ *   任一不满足 → 整请求拒绝，文件不被改写。
+ */
+export function applyConfigChanges(
+  changes: Record<string, string>,
+  clearKeys: readonly string[] = [],
+): ApplyResult {
   const keys = Object.keys(changes);
 
-  // ① 白名单
-  const unknown = keys.filter((k) => !CONFIG_KEY_SET.has(k));
+  // ① 白名单（changes 与 clear 均需校验）
+  const unknown = [...keys, ...clearKeys].filter((k) => !CONFIG_KEY_SET.has(k));
   if (unknown.length > 0) {
     return {
       ok: false, changed: [], backupFile: null, envCreated: false,
       invalid: unknown.map((k) => ({ key: k, reason: "未知配置项（不在白名单内）" })),
     };
+  }
+
+  // ①-b [R-17 / §9.2] clear 的合法性校验（在任何写盘动作之前）
+  const clearInvalid: Array<{ key: string; reason: string }> = [];
+  const seenClear = new Set<string>();
+  for (const k of clearKeys) {
+    if (seenClear.has(k)) continue;          // 重复项去重，不算错误
+    seenClear.add(k);
+    if (keys.includes(k)) {
+      clearInvalid.push({ key: k, reason: "同一项不得同时出现在 changes 与 clear 中" });
+      continue;
+    }
+    const meta = CONFIG_KEYS.find((m) => m.key === k);
+    if (!meta) continue;                     // 未知键已在 ① 拦下
+    if (!meta.secret) {
+      clearInvalid.push({ key: k, reason: "仅密文项支持清空（非密文项请直接改值）" });
+      continue;
+    }
+    if (meta.required) {
+      clearInvalid.push({
+        key: k,
+        reason: "必需项不支持清空：写空后热更会判定缺失并导致进程退出，请填入新的有效值",
+      });
+    }
+  }
+  if (clearInvalid.length > 0) {
+    return { ok: false, changed: [], backupFile: null, envCreated: false, invalid: clearInvalid };
   }
 
   // ② 校验（全部通过才写盘；需求 §4.3：失败不写文件）
@@ -434,15 +516,17 @@ export function applyConfigChanges(changes: Record<string, string>): ApplyResult
   const snap = readEnvFile();
   const backupFile = backupEnv();
 
-  // ④ 合并 + 原子写
-  const next = mergeEnvText(snap, changes);
+  // ④ 合并 + 原子写（清空项以空串进入同一写入映射，逐键替换后落盘为 KEY=）
+  const writeMap: Record<string, string> = { ...changes };
+  for (const k of clearKeys) writeMap[k] = "";
+  const next = mergeEnvText(snap, writeMap);
   const w = writeEnvAtomic(next);
   if (!w.ok) {
     return { ok: false, changed: [], backupFile: null, envCreated: false, error: w.error };
   }
 
   return {
-    ok: true, changed: keys, backupFile,
+    ok: true, changed: [...keys, ...clearKeys], backupFile,
     envCreated: !snap.exists, degraded: w.degraded,
   };
 }

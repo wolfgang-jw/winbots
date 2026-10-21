@@ -3,8 +3,8 @@
  * 配置读写接口（配置页专用）
  *
  * 挂载点：/api/config
- *   - GET  /api/config        读取 16 项配置（密钥不回显）
- *   - PUT  /api/config        修改配置并写回 .env（需 confirm: true）
+ *   - GET  /api/config        读取全部配置（当前 22 项，密钥不回显）
+ *   - PUT  /api/config        修改配置并写回 .env（需 confirm: true；[R-17] 支持 clear 字段清空密钥）
  *
  * 安全：仅写入白名单键；值禁换行；不回显/不记录密钥明文（需求 §4.7）。
  */
@@ -67,7 +67,7 @@ router.get("/", (c) => {
 // PUT /api/config —— 修改配置并写回 .env
 router.put("/", async (c) => {
   // ① 解析 body
-  let body: { confirm?: unknown; changes?: unknown };
+  let body: { confirm?: unknown; changes?: unknown; clear?: unknown };
   try {
     body = await c.req.json();
   } catch {
@@ -82,14 +82,28 @@ router.put("/", async (c) => {
     );
   }
 
-  // ③ changes 必须为非空对象
-  const changes = body.changes;
-  if (!changes || typeof changes !== "object" || Array.isArray(changes)) {
+  // ③ changes 必须为对象（[R-17] 允许缺省或空对象：仅清空密钥时不提交 changes）
+  const rawChanges = body.changes === undefined ? {} : body.changes;
+  if (!rawChanges || typeof rawChanges !== "object" || Array.isArray(rawChanges)) {
     return c.json({ ok: false, code: "ERR_EMPTY_CHANGES", error: "changes 必须为对象" }, 400);
   }
-  const entries = Object.entries(changes as Record<string, unknown>);
-  if (entries.length === 0) {
-    return c.json({ ok: false, code: "ERR_EMPTY_CHANGES", error: "changes 不能为空" }, 400);
+  const entries = Object.entries(rawChanges as Record<string, unknown>);
+
+  // ③-b [需求域 R / R-17、§9.2] clear：字符串数组，语义唯一——把这些键写为空串。
+  //   与「留空＝不修改」严格区分：changes 中该键为空串仍按既有约定跳过（AC-49）。
+  let clearKeys: string[] = [];
+  if (body.clear !== undefined) {
+    if (!Array.isArray(body.clear) || body.clear.some((x) => typeof x !== "string")) {
+      return c.json({ ok: false, code: "ERR_INVALID_CLEAR", error: "clear 必须为字符串数组" }, 400);
+    }
+    clearKeys = [...new Set((body.clear as string[]).map((x) => x.trim()).filter((x) => x !== ""))];
+  }
+
+  if (entries.length === 0 && clearKeys.length === 0) {
+    return c.json(
+      { ok: false, code: "ERR_EMPTY_CHANGES", error: "changes 与 clear 均为空，没有实际改动" },
+      400,
+    );
   }
 
   // ④ 归一化 + 拦未知键与非法字符
@@ -120,15 +134,15 @@ router.put("/", async (c) => {
       400,
     );
   }
-  if (Object.keys(normalized).length === 0) {
+  if (Object.keys(normalized).length === 0 && clearKeys.length === 0) {
     return c.json(
       { ok: false, code: "ERR_EMPTY_CHANGES", error: "没有实际改动（密钥留空视为不修改）" },
       400,
     );
   }
 
-  // ⑤ 校验 + 备份 + 写盘
-  const result = applyConfigChanges(normalized);
+  // ⑤ 校验 + 备份 + 写盘（[R-17] clear 与 changes 一并校验，任一不合法则整请求拒绝、文件不改写）
+  const result = applyConfigChanges(normalized, clearKeys);
   if (!result.ok) {
     if (result.invalid) {
       const fields: Record<string, string> = {};
@@ -152,9 +166,14 @@ router.put("/", async (c) => {
   }
 
   const changed = result.changed;
+  // [需求域 R / §9.2 审计] 记录一行日志说明哪些配置项被清空，**不回显原值**
+  if (clearKeys.length > 0) {
+    console.log(`🧹 [R-17] 配置项已清空：${clearKeys.join(", ")}（不回显原值）`);
+  }
   return c.json({
     ok: true,
     changed,
+    cleared: clearKeys,
     hotApplied,
     restartRequired: restartKeysFor(changed),
     backupFile: result.backupFile,

@@ -1455,3 +1455,61 @@ padding: 12px 16px;
 .chat-status--notice {
     color: #607D8B;
 }
+
+
+/* ============================================
+   [需求域 R / R-17、§9.2] 配置页密文项「清空」按钮
+   语义：清空由显式按钮触发，请求体以独立 clear 字段表达；
+        输入框留空仍表示「不修改」，二者严格区分。
+   ============================================ */
+.config-item__clear-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+}
+
+.config-item__clear,
+.config-item__undo {
+    background: transparent;
+    color: var(--tomato-red);
+    border: 1px solid var(--tomato-red-light);
+    padding: 4px 12px;
+    border-radius: 14px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+}
+
+.config-item__clear:hover,
+.config-item__undo:hover {
+    background: var(--tomato-red);
+    color: var(--white);
+}
+
+.config-item__undo {
+    color: var(--gray-700);
+    border-color: var(--gray-300);
+}
+
+.config-item__undo:hover {
+    background: var(--gray-600);
+    color: var(--white);
+}
+
+.config-item__clear-note {
+    font-size: 0.75rem;
+    color: #EF6C00;
+    background: #FFF3E0;
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+
+/* 标记清空后输入框禁用（§9.2「按钮交互」） */
+.config-input:disabled {
+    background: var(--gray-100);
+    color: var(--gray-600);
+    cursor: not-allowed;
+}
