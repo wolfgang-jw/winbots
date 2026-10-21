@@ -209,9 +209,11 @@ function validateEnv(): EnvConfig {
     //   密钥：按供应商独立，空串 = 免鉴权（R-11）；默认空，**不设全局回退**（X-06）
     INTERNET_DEEPSEEK_API_KEY: Bun.env.INTERNET_DEEPSEEK_API_KEY || "",
     //   基址/端点路径：允许覆盖，便于接自建网关（R-08 第 1 类差异）
+    //   ✅ 端点已按 DeepSeek 官方文档核实（2026-10-21）：Search = /v1/tools/search，Fetch = /v1/tools/fetch。
+    //      旧默认值 /v1/search、/v1/fetch 在官方不存在 → 稳定 404 → not_extractable（见 FIX 文档）。
     INTERNET_DEEPSEEK_BASE_URL: Bun.env.INTERNET_DEEPSEEK_BASE_URL || "https://api.deepseek.com",
-    INTERNET_DEEPSEEK_SEARCH_PATH: Bun.env.INTERNET_DEEPSEEK_SEARCH_PATH || "/v1/search",
-    INTERNET_DEEPSEEK_FETCH_PATH: Bun.env.INTERNET_DEEPSEEK_FETCH_PATH || "/v1/fetch",
+    INTERNET_DEEPSEEK_SEARCH_PATH: Bun.env.INTERNET_DEEPSEEK_SEARCH_PATH || "/v1/tools/search",
+    INTERNET_DEEPSEEK_FETCH_PATH: Bun.env.INTERNET_DEEPSEEK_FETCH_PATH || "/v1/tools/fetch",
     //   默认条数：代码侧最终仍会钳制到 1–10（R-18）
     INTERNET_DEFAULT_COUNT: parseInt(Bun.env.INTERNET_DEFAULT_COUNT || "5", 10) || 5,
     INTERNET_TIMEOUT_MS: parseInt(Bun.env.INTERNET_TIMEOUT_MS || "20000", 10) || 20000,
@@ -238,6 +240,17 @@ export const envShadowedBySystem: ReadonlySet<string> = shadowedKeys;
 
 /** 类型安全的全局配置对象（单例）。热更请用 reloadEnvExcluding()，勿重新赋值。 */
 export const env = validateEnv();
+
+/**
+ * [修订 / R-45] 拼接「基址 + 端点路径」，仅用于启动摘要展示。
+ * 与 `etc/tools/internet/_common.ts` 的 joinUrl 同规则（去尾斜杠 / 补首斜杠），
+ * 让「实际会被请求的完整地址」在启动日志里一眼可见——端点配错时无需再猜。
+ */
+function joinEndpoint(base: string, path: string): string {
+  const b = base.replace(/\/+$/, "");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${b}${p}`;
+}
 
 // 启动日志（隐藏敏感信息）
 console.log("=".repeat(60));
@@ -275,6 +288,13 @@ console.log(
   `  INTERNET_DEEPSEEK_API_KEY: ${env.INTERNET_DEEPSEEK_API_KEY ? "******" : "未设置（将按免鉴权调用）"}`
 );
 console.log(`  INTERNET 基址:         ${env.INTERNET_DEEPSEEK_BASE_URL}`);
+// [修订] 启动即打印「拼好的完整端点」：端点配错是历史上最难定位的一类故障（见 docs/FIX-internet-endpoint-v0.0.7.md）
+console.log(
+  `  INTERNET 检索端点:     ${joinEndpoint(env.INTERNET_DEEPSEEK_BASE_URL, env.INTERNET_DEEPSEEK_SEARCH_PATH)}`
+);
+console.log(
+  `  INTERNET 抓取端点:     ${joinEndpoint(env.INTERNET_DEEPSEEK_BASE_URL, env.INTERNET_DEEPSEEK_FETCH_PATH)}`
+);
 console.log(`  INTERNET 超时/回灌上限: ${env.INTERNET_TIMEOUT_MS}ms / ${env.INTERNET_FETCH_MAX_CHARS} 字符`);
 console.log(
   `  INTERNET 暂存:         TTL=${env.INTERNET_STORE_TTL_S}s｜单会话=${env.INTERNET_STORE_MAX_ITEMS_PER_SESSION} 条｜单条=${env.INTERNET_STORE_MAX_CHARS_PER_ITEM} 字符｜全局=${env.INTERNET_STORE_MAX_CHARS_TOTAL} 字符`

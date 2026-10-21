@@ -141,6 +141,20 @@ export function hostOf(url: string): string {
     }
 }
 
+/**
+ * [R-43 / R-44] 日志与错误文案用的端点标识：host + path（**不含 query，不含密钥**）。
+ * 存在的理由：旧版日志只有 tool/provider/status，看不出「到底打到了哪个地址」，
+ * 端点配错时只能靠猜（本案即因此被两次误判）。
+ */
+export function endpointOf(url: string): string {
+    try {
+        const u = new URL(url);
+        return `${u.host}${u.pathname}`;
+    } catch {
+        return "-";
+    }
+}
+
 /** 安全地把 unknown 视为普通对象 */
 function asRecord(v: unknown): Record<string, unknown> {
     return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
@@ -149,11 +163,21 @@ function asRecord(v: unknown): Record<string, unknown> {
 /**
  * 内置供应商：deepseek（§9.1 默认供应商）。
  *
- * ⚠️ V-R-1（实施前置确认项）：端点路径 `/v1/search`、`/v1/fetch` 与请求/响应字段
- *    名**未在真实环境验证**，本实现只提供「可配置的默认值」：
+ * ✅ V-R-1 已核实（2026-10-21，依据 DeepSeek 官方「网页搜索与抓取」文档）：
+ *      - Search：POST {base}/v1/tools/search，请求体 { query, count, need_content, ... }
+ *      - Fetch ：POST {base}/v1/tools/fetch ，请求体 { url }
+ *      - 鉴权：Authorization: Bearer <key> + Content-Type: application/json
+ *      - Search 响应：{ results: [{ rerank_score, title, url, snippet, summary,
+ *                      content, site_name, site_icon, date, authority }] }
+ *      - Fetch  响应：{ title, content }（content 为 Markdown 正文）
+ *    端点仍保留环境变量覆盖能力（便于接自建网关）：
  *      - 改基址：INTERNET_DEEPSEEK_BASE_URL
  *      - 改路径：INTERNET_DEEPSEEK_SEARCH_PATH / INTERNET_DEEPSEEK_FETCH_PATH
- *    若与实际供应商不符，改环境变量即可，无需改本文件。
+ *
+ * ⚠️ 历史缺陷（已修）：旧默认值 `/v1/search`、`/v1/fetch` 在官方并不存在，
+ *    网关对未知路由返回 404，被 mapStatus 归为 not_extractable（「网页抓不到」），
+ *    导致模型反复更换检索词空转。现修正为 `/v1/tools/search`、`/v1/tools/fetch`。
+ *    详见 docs/FIX-internet-endpoint-v0.0.7.md。
  */
 const DEEPSEEK: ProviderDef = {
     id: "deepseek",
@@ -166,8 +190,12 @@ const DEEPSEEK: ProviderDef = {
     search: {
         method: () => "POST",
         path: () => env.INTERNET_DEEPSEEK_SEARCH_PATH,
-        // 请求体字段映射：query / max_results（R-19：检索语法原样透传，不做拆分）
-        body: (a) => ({ query: a.query, max_results: a.count }),
+        // 请求体字段映射：query / count / need_content（R-19：检索语法原样透传，不做拆分）
+        //   - count：官方字段名（1–50）。旧实现用 max_results，官方「未知字段忽略」→ 条数静默回落 10，
+        //     且结果文本里的「（请求 N 条）」与实际不符。
+        //   - need_content=false：不返回网页正文（省带宽）；摘要取 snippet / summary 足够。
+        //   - 不上行 ori_question / localization（N-04：不上行用户原始问题与定位信息）。
+        body: (a) => ({ query: a.query, count: a.count, need_content: false }),
         // 响应字段映射：兼容 data[] / results[] / 裸数组三种常见形状
         parse: (raw) => {
             const o = asRecord(raw);
@@ -354,6 +382,8 @@ function mapStatus(
     upstreamText: string,
     provider: ProviderDef,
     keyMissing: boolean,
+    kind: Kind | undefined,
+    url: string,
 ): { code: ErrorCode; message: string } {
     const detail = truncate((upstreamText || "").trim(), 300);
     const withDetail = (base: string) => (detail ? `${base} 上游信息：${detail}` : base);
@@ -395,6 +425,23 @@ function mapStatus(
                 ),
             };
         case 404:
+            // 404 在两种能力上的语义不同（官方错误表）：
+            //   - Fetch ：目标页取不到可用正文（URL 不可用 / 被拦截 / 无可提取 Markdown）→ 原文案正确；
+            //   - Search：检索端点不存在（基址或路径配错）远比「搜索无结果」常见——
+            //             真实搜索无结果返回的是 200 + 空数组（R-21），**不是** 404。
+            //     因此对检索单独补一条「先查端点」的提示，避免模型误判成「网页抓不到」而空转换词。
+            if (kind === "search") {
+                return {
+                    code: "not_extractable",
+                    message: withDetail(
+                        `检索请求返回 404（not_extractable）：实际请求 ${endpointOf(url)}。` +
+                            "搜索引擎不会用 404 表达「没有结果」（那是 200 + 空数组），" +
+                            "因此这通常是端点路径与供应商不一致。请核对 INTERNET_DEEPSEEK_BASE_URL 与 " +
+                            "INTERNET_DEEPSEEK_SEARCH_PATH（DeepSeek 官方为 /v1/tools/search）后重试；" +
+                            "属配置问题，更换检索词不会成功。",
+                    ),
+                };
+            }
             return {
                 code: "not_extractable",
                 message: withDetail(
@@ -475,6 +522,8 @@ export async function callProvider<A, R>(
     endpoint: EndpointDef<A, R>,
     args: A,
     ctx: ToolContext | undefined,
+    /** 能力类别：仅用于错误文案分化（检索 404 指向端点配置，抓取 404 指向页面） */
+    kind?: Kind,
 ): Promise<CallResult> {
     const key = provider.apiKey();
     const keyMissing = key === "";                       // R-11：空串 = 免鉴权
@@ -545,7 +594,7 @@ export async function callProvider<A, R>(
                 }
                 return { ok: true, raw: parsed, retries, url };
             }
-            const mapped = mapStatus(status, r.text ?? "", provider, keyMissing);
+            const mapped = mapStatus(status, r.text ?? "", provider, keyMissing, kind, url);
             last = { ok: false, code: mapped.code, message: mapped.message, retries, url };
         }
 
@@ -590,6 +639,11 @@ export interface CallLogFields {
     code: string | null;
     retried: boolean;
     cacheHit: boolean;
+    /**
+     * [修订] 本次实际请求的端点（host + path，不含 query 与密钥）；本地未发请求（如续读命中暂存）时为 null。
+     * 旧版日志不含 URL，端点配错时只能靠猜（见 docs/FIX-internet-endpoint-v0.0.7.md）。
+     */
+    endpoint?: string | null;
 }
 
 /** [R-43] 每次调用输出一行结构化日志；[R-44] 密钥永不落日志（本函数不接受密钥入参） */
@@ -598,6 +652,7 @@ export function logCall(f: CallLogFields): void {
         "[R-43] internet",
         `tool=${f.tool}`,
         `provider=${f.provider}`,
+        `endpoint=${f.endpoint ?? "-"}`,
         `status=${f.status}`,
         `elapsed=${f.elapsedMs}ms`,
         `results=${f.resultCount === null ? "-" : f.resultCount}`,

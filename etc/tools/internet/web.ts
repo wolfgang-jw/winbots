@@ -20,6 +20,7 @@ import type { Tool, ToolContext } from "@/tools";
 import { env } from "@/infra/env";
 import {
     callProvider,
+    endpointOf,
     fail,
     getProvider,
     hostOf,
@@ -33,6 +34,8 @@ import * as store from "./_ephemeral";
 
 /** [R-18] 检索词长度上限 */
 const QUERY_MAX_CHARS = 128;
+/** [R-23] URL 长度上限（对齐供应商契约：≤ 8192，超长直接本地拒绝，不浪费一次请求） */
+const URL_MAX_CHARS = 8192;
 /** [R-18] 条数钳制区间（代码侧强制） */
 const COUNT_MIN = 1;
 const COUNT_MAX = 10;
@@ -102,11 +105,12 @@ async function runSearch(args: Record<string, unknown>, ctx?: ToolContext): Prom
     if (!endpoint) return fail("invalid_provider", `供应商 ${provider.id} 不支持检索能力。`);
 
     // ④ 发请求（超时/中断/重试/错误映射都在 _common）
-    const r = await callProvider(provider, endpoint, { query, count }, ctx);
+    const r = await callProvider(provider, endpoint, { query, count }, ctx, "search");
     if (!r.ok) {
         logCall({
             tool: "search",
             provider: provider.id,
+            endpoint: endpointOf(r.url),
             status: "error",
             elapsedMs: Date.now() - startedAt,
             resultCount: null,
@@ -141,6 +145,7 @@ async function runSearch(args: Record<string, unknown>, ctx?: ToolContext): Prom
     logCall({
         tool: "search",
         provider: provider.id,
+        endpoint: endpointOf(r.url),
         status: "ok",
         elapsedMs: Date.now() - startedAt,
         resultCount: hits.length,
@@ -176,6 +181,14 @@ function validateUrl(raw: unknown): { url: string } | { error: Envelope } {
             ),
         };
     }
+    if (s.length > URL_MAX_CHARS) {
+        return {
+            error: fail(
+                "invalid_request",
+                `url 过长：${s.length} 字符，上限 ${URL_MAX_CHARS} 字符。请使用更短的地址后重试。`,
+            ),
+        };
+    }
     let parsed: URL;
     try {
         parsed = new URL(s);
@@ -200,6 +213,15 @@ function validateUrl(raw: unknown): { url: string } | { error: Envelope } {
             error: fail(
                 "invalid_request",
                 `url 缺少 host：${truncate(s, 80)}。示例：https://example.com/article`,
+            ),
+        };
+    }
+    // 供应商契约：URL 不得携带用户名或密码（含凭据的地址会被上游 400，本地先拒以省一次请求）
+    if (parsed.username || parsed.password) {
+        return {
+            error: fail(
+                "invalid_request",
+                "url 不得包含用户名或密码（形如 https://user:pass@host/）。请去掉凭据后重试。",
             ),
         };
     }
@@ -249,6 +271,8 @@ async function runFetch(args: Record<string, unknown>, ctx?: ToolContext): Promi
     let providerId = env.INTERNET_FETCH_PROVIDER;
     let notice: string | null = null;
     let storeNote: string | null = null;
+    /** [修订] 本次实际请求端点（host+path）；续读命中暂存时为 null（未发请求） */
+    let endpointStr: string | null = null;
 
     if (lookup.live) {
         cacheHit = true;
@@ -263,13 +287,15 @@ async function runFetch(args: Record<string, unknown>, ctx?: ToolContext): Promi
         if (!endpoint) return fail("invalid_provider", `供应商 ${provider.id} 不支持抓取能力。`);
 
         // 未命中 → 重新抓取一次（R-31）
-        const r = await callProvider(provider, endpoint, { url }, ctx);
+        const r = await callProvider(provider, endpoint, { url }, ctx, "fetch");
         retries = r.retries;
+        endpointStr = endpointOf(r.url);
         if (!r.ok) {
             // [R-33] 续读阶段抓取失败：已暂存的旧内容不得被清空（本模块从不因失败淘汰条目）
             logCall({
                 tool: "fetch",
                 provider: provider.id,
+                endpoint: endpointStr,
                 status: "error",
                 elapsedMs: Date.now() - startedAt,
                 resultCount: null,
@@ -287,6 +313,7 @@ async function runFetch(args: Record<string, unknown>, ctx?: ToolContext): Promi
             logCall({
                 tool: "fetch",
                 provider: provider.id,
+                endpoint: endpointStr,
                 status: "error",
                 elapsedMs: Date.now() - startedAt,
                 resultCount: null,
@@ -348,6 +375,7 @@ async function runFetch(args: Record<string, unknown>, ctx?: ToolContext): Promi
     logCall({
         tool: "fetch",
         provider: providerId,
+        endpoint: endpointStr,
         status: "ok",
         elapsedMs: Date.now() - startedAt,
         resultCount: null,

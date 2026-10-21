@@ -129,9 +129,10 @@ INTERNET_FETCH_PROVIDER=deepseek
 #   删除已保存的密钥请用配置页的「清空」按钮，不要用留空表达清空。
 INTERNET_DEEPSEEK_API_KEY=
 # 基址与端点路径（手工维护，不进配置页）：仅当供应商实际地址与默认值不同时才需要改。
+#   ✅ 已按 DeepSeek 官方文档核实：Search = /v1/tools/search，Fetch = /v1/tools/fetch。
 INTERNET_DEEPSEEK_BASE_URL=https://api.deepseek.com
-INTERNET_DEEPSEEK_SEARCH_PATH=/v1/search
-INTERNET_DEEPSEEK_FETCH_PATH=/v1/fetch
+INTERNET_DEEPSEEK_SEARCH_PATH=/v1/tools/search
+INTERNET_DEEPSEEK_FETCH_PATH=/v1/tools/fetch
 # 检索默认条数（工具侧最终仍钳制到 1–10）。
 INTERNET_DEFAULT_COUNT=5
 # 单次上游请求超时（毫秒）；点「停止」同样会中止在途请求。
@@ -169,7 +170,7 @@ INTERNET_STORE_MAX_CHARS_TOTAL=4194304
 | `INTERNET_FETCH_PROVIDER` | 网页抓取供应商 | `deepseek` | 可选（默认 `deepseek`） |
 | `INTERNET_DEEPSEEK_API_KEY` | 供应商密钥；**留空＝免鉴权**，需删除请用配置页「清空」 | `sk-xxxxxxxx` | 可选（默认空） |
 | `INTERNET_DEEPSEEK_BASE_URL` | 供应商基址（可覆盖，手工维护） | `https://api.deepseek.com` | 可选 |
-| `INTERNET_DEEPSEEK_SEARCH_PATH` / `_FETCH_PATH` | 检索/抓取端点路径（默认值未经真实环境验证，见 §十） | `/v1/search` | 可选 |
+| `INTERNET_DEEPSEEK_SEARCH_PATH` / `_FETCH_PATH` | 检索/抓取端点路径（已按官方文档核实，见 §十） | `/v1/tools/search` | 可选 |
 | `INTERNET_DEFAULT_COUNT` | 检索默认条数（最终钳制 1–10） | `5` | 可选（默认 `5`） |
 | `INTERNET_TIMEOUT_MS` | 单次上游请求超时（毫秒） | `20000` | 可选（默认 `20000`） |
 | `INTERNET_FETCH_MAX_CHARS` | 抓取回灌上限（字符） | `8000` | 可选（默认 `8000`） |
@@ -339,7 +340,8 @@ LLM_MODEL=deepseek-chat
 - **返回 `auth_required`**：该供应商需要密钥而你留空了（留空＝**免鉴权**，不会发送空凭据）。填入 `INTERNET_DEEPSEEK_API_KEY` 并保存即可；若此前用配置页「清空」过，填入有效值会自动恢复「已设置」状态。
 - **返回 `invalid_provider`**：`INTERNET_SEARCH_PROVIDER` / `INTERNET_FETCH_PROVIDER` 只能填内置供应商名（当前仅 `deepseek`），检索与抓取各自独立。
 - **返回 `not_extractable` / `too_large` / `blocked_by_policy` / `rate_limited`**：属上游结果（页面无正文 / 体积超限 / 被策略拦截 / 限流），前三种重试无用，换个 URL 试试；`rate_limited` 与 `timeout`、`upstream_error` 会自动重试最多 2 次（合计最多 3 次请求）。
-- **端点 404 或一直解析不出正文**：默认端点路径未经真实环境验证，按 §10.2 调整 `INTERNET_DEEPSEEK_SEARCH_PATH` / `INTERNET_DEEPSEEK_FETCH_PATH`，无需改代码。
+- **端点 404（检索）或一直解析不出正文**：启动日志里会打印 `INTERNET 检索端点` / `INTERNET 抓取端点` 两行，先核对它们是否与供应商文档一致（DeepSeek 官方为 `/v1/tools/search`、`/v1/tools/fetch`）。若确认配错，改 `INTERNET_DEEPSEEK_SEARCH_PATH` / `INTERNET_DEEPSEEK_FETCH_PATH` 即可，无需改代码。
+  > 提示：检索返回 **404 不等于「没搜到」**（无结果是 `200` + 空列表）。检索报 404 时请优先怀疑端点配置，而不是换检索词。
 
 ---
 
@@ -441,8 +443,15 @@ LLM_MODEL=deepseek-chat
 - 密钥**按供应商独立**，留空即**免鉴权**（请求完全省略鉴权头，不会发送空凭据）；**不设全局回退**。
 - 若该供应商实际需要密钥，调用会返回 `auth_required`，文案会指明具体环境变量名，
   并说明这属于配置问题、不要重试；若密钥曾被「清空」，填入有效值即可恢复。
-- ⚠️ **端点路径待确认**：默认 `/v1/search`、`/v1/fetch` 未经真实环境验证。
-  若与本机供应商不符，改 `INTERNET_DEEPSEEK_BASE_URL` / `_SEARCH_PATH` / `_FETCH_PATH` 即可，无需改代码。
+- ✅ **端点已核实**（2026-10-21，依据 DeepSeek 官方「网页搜索与抓取」文档）：
+  Search = `POST /v1/tools/search`，Fetch = `POST /v1/tools/fetch`，均为 Bearer 鉴权。
+  两者的默认值即为官方地址，通常**无需修改**；仅接自建网关时才需改 `INTERNET_DEEPSEEK_BASE_URL` / `_SEARCH_PATH` / `_FETCH_PATH`。
+- 🔎 **端点可观测**：启动日志会打印 `INTERNET 检索端点` / `INTERNET 抓取端点`（拼好的完整地址）；
+  每次调用的 `[R-43] internet` 日志行也新增 `endpoint=<host><path>` 字段（不含 query 与密钥），
+  端点配错时可直接看出「打到了哪里」。
+- 🧭 **检索 404 的语义**：搜索引擎不会用 404 表示「没有结果」（那是 `200` + 空数组）。
+  因此检索侧返回 404 时，错误文案会直接指向端点路径配置，提示先核对 `INTERNET_DEEPSEEK_SEARCH_PATH`，
+  而不是让模型反复更换检索词。
 
 ### 10.3 密钥清空（配置页「清空」按钮）
 
