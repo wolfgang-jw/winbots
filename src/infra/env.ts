@@ -11,6 +11,38 @@ import { resolve } from "path";
  * 4. 缺失变量时打印清晰错误并终止进程
  */
 
+/**
+ * [需求域 C / C-04] 思考相关字段的下发方式。
+ * 取值固定为四值枚举，不得用单一布尔表达「只发开关 / 只发强度」两种语义。
+ */
+export type ThinkingMode = "none" | "effort" | "thinking" | "both";
+
+/** 合法取值（顺序即配置页下拉顺序） */
+export const THINKING_MODES: readonly ThinkingMode[] = ["none", "effort", "thinking", "both"];
+
+/** 默认值：均不下发（C-05：接入非 DeepSeek 的 OpenAI 兼容服务商时不因未知字段被拒） */
+export const DEFAULT_THINKING_MODE: ThinkingMode = "none";
+
+/**
+ * [需求域 C / C-04、C-07] 解析「思考字段下发方式」。
+ * 缺失 / 非法 / 大小写不符一律回退默认值 none：
+ * §9.1 约束——新增配置项不得加入必填校验，缺失时回退默认值而非退出进程。
+ */
+export function parseThinkingMode(raw: string | undefined): ThinkingMode {
+  const v = (raw ?? "").trim().toLowerCase();
+  return (THINKING_MODES as readonly string[]).includes(v)
+    ? (v as ThinkingMode)
+    : DEFAULT_THINKING_MODE;
+}
+
+/** 各取值的中文说明（启动日志与配置页描述共用同一措辞，C-07 一致性） */
+export const THINKING_MODE_LABEL: Record<ThinkingMode, string> = {
+  none: "均不下发",
+  effort: "仅下发推理强度",
+  thinking: "仅下发思考开关",
+  both: "两者都下发",
+};
+
 export interface EnvConfig {
   // 服务端口
   APP_PORT: number;
@@ -22,6 +54,10 @@ export interface EnvConfig {
   // 思考模式配置（可选）
   LLM_THINKING: boolean;
   LLM_REASONING_EFFORT: string;
+  // [需求域 C / C-01~C-05] 思考相关字段的下发方式（none / effort / thinking / both）
+  //   上面两项 LLM_THINKING / LLM_REASONING_EFFORT 只是「取值来源」，
+  //   不再各自决定请求体是否携带对应字段。
+  LLM_THINKING_MODE: ThinkingMode;
 
   // [US-CFG-1] 文件工具配置（全部可选，带默认值；不加入 REQUIRED_VARS）
   FILE_ROOT_DIR: string;          // 沙箱总目录（默认 working，与 data 平级）
@@ -110,6 +146,8 @@ function validateEnv(): EnvConfig {
     LLM_MODEL: Bun.env.LLM_MODEL!,
     LLM_THINKING: Bun.env.LLM_THINKING === "true",
     LLM_REASONING_EFFORT: Bun.env.LLM_REASONING_EFFORT || "high",
+    // [需求域 C / C-01~C-05] 下发方式：缺失/非法回退 none；不进 REQUIRED_VARS（§9.1）
+    LLM_THINKING_MODE: parseThinkingMode(Bun.env.LLM_THINKING_MODE),
 
     // [US-CFG-1] 文件工具配置（可选，带默认值）
     //   总目录：默认 "working"（与 data 平级）；仅存目录名，绝对路径由 _shared.ts 拼接
@@ -160,8 +198,9 @@ console.log(`  APP_PORT:              ${env.APP_PORT}`);
 console.log(`  LLM_API_BASE:          ${env.LLM_API_BASE}`);
 console.log(`  LLM_MODEL:             ${env.LLM_MODEL}`);
 console.log(`  LLM_API_KEY:           ${env.LLM_API_KEY ? "******" : "未设置"}`);
-console.log(`  LLM_THINKING:          ${env.LLM_THINKING ? "开启" : "关闭"}`);
-console.log(`  LLM_REASONING_EFFORT:  ${env.LLM_REASONING_EFFORT}`);
+console.log(`  LLM_THINKING_MODE:     ${env.LLM_THINKING_MODE}（${THINKING_MODE_LABEL[env.LLM_THINKING_MODE]}）`);
+console.log(`  LLM_THINKING:          ${env.LLM_THINKING ? "开启" : "关闭"}（仅取值来源）`);
+console.log(`  LLM_REASONING_EFFORT:  ${env.LLM_REASONING_EFFORT}（仅取值来源）`);
 // [US-CFG-1] 文件工具配置（无敏感信息，直接打印）
 console.log("-".repeat(60));
 console.log(`  FILE_ROOT_DIR:         ${env.FILE_ROOT_DIR}`);

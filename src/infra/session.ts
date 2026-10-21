@@ -81,8 +81,8 @@ export interface SessionMessage {
 export interface MessageMeta {
     /** 思考过程（reasoning_content 累积） */
     thinking?: string;
-    /** 工具调用记录（名称/参数/结果） */
-    toolCalls?: Array<{ name: string; arguments?: unknown; result?: string }>;
+    /** 工具调用记录（名称/参数/结果；id 与 tool_call 事件一致，供日志与事件逐条比对） */
+    toolCalls?: Array<{ id?: string; name: string; arguments?: unknown; result?: string }>;
     /** token 用量（被打断时全 0） */
     usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
     /** 是否被打断（US-3.6） */

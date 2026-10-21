@@ -10,64 +10,49 @@
  * 而 DeepSeek 等第三方 API 只兼容传统的 Chat Completions API（/v1/chat/completions），
  * 会导致 404 错误。因此直接使用 fetch + 原生 API 更通用、更可控。
  *
- * R1 工具调用能力（方案 A：后端执行 + 单轮）：
- * 采用「两阶段链路」——
- *   阶段一：携带 tools 定义，非流式探测模型是否请求工具调用（tool_calls）；
- *   阶段二：若命中工具，后端执行工具并回灌 role:"tool" 消息，再流式生成最终回答。
- * 无工具调用 / 上游不支持 tools / 工具异常时，均优雅降级为纯文本流式对话。
+ * [需求域 A / v0.0.7] 上游请求单链路化（US-A-01 ~ US-A-05）
+ *   - 一次用户请求只走一条链路：以流式请求为唯一生成入口，以流式聚合出的
+ *     tool_calls 作为「是否进入工具轮次」的唯一判据（A-03）。
+ *   - 上游生成次数：无工具 = 1；N 轮工具 = 1 + N（A-01）。每次生成打一行
+ *     `📡 [A-05] 上游生成 #n`，链路结束打一行 `📊 [A-05] 上游生成次数=…`，
+ *     便于按「请求次数 + usage」验收（A-05）。
+ *   - 已删除：阶段一非流式探测请求、探测返回正文的回灌路径、
+ *     「分支 A / 分支 B」两套并行逻辑（A-02、A-04、B-02）。
+ *   - 首轮遭遇「上游拒绝带 tools 的请求」（4xx）时，去掉 tools 重试一次，
+ *     保持原有「上游不支持工具则优雅降级」的对外行为（A-06）。
+ *   - pipeStream 的流式聚合逻辑未改动（A-07）；工具轮数上限沿用
+ *     env.MAX_TOOL_ROUNDS（默认 8，语义不变，A-08）。
  *
- * 本次修复：
- *   - [US-1.1] 统一流式输出：移除分支 B「探测拿到文本后整段回吐」，
- *     无工具调用的回答一律改走流式请求，消除一次性整段输出路径。
- *   - [US-1.2] 保留工具场景流式：分支 A（工具调用 → 阶段二流式）保持 stream:true。
- *   - [US-1.3] 上游不支持工具时的流式兼容：supportsTools 门控。
+ * [需求域 B / v0.0.7] 工具调用全链路不丢失（US-B-01 ~ US-B-04）
+ *   - B-01/B-02：工具的执行、事件推送、记录、回灌只有一处调用点（主循环内
+ *     `for (const tc of currentToolCalls)` → `executeTool`），不存在「只取正文、
+ *     忽略 tool_calls」的第二条路径；`stream:false` 探测已随 A 域删除。
+ *   - B-03：是否结束链路只看「本轮是否聚合出 tool_calls」，与正文是否为空无关；
+ *     链路收尾时若正文为空但确实执行过工具，追加一条 notice 显式告知，
+ *     不让前端停在空气泡。
+ *   - B-04：调用日志与历史 meta 的工具字段统一为 `{ id, name, arguments, result }`，
+ *     id 与 tool_call 事件一致；异常路径也不再写入未经整形的原始 wire 结构。
+ *   - B-06：以上改动均在服务端历史模式（useServerHistory）分支内，旧消息模式
+ *     （直接传 messages 数组）的请求/响应行为与事件序列不变。
+ *
+ * [需求域 C / v0.0.7] 思考相关字段按配置可选下发（US-C-01 ~ US-C-05）
+ *   - C-01/C-02：`thinking` 与 `reasoning_effort` 不再无条件写入请求体；仅在
+ *     LLM_THINKING_MODE 允许时才下发，none（默认）时请求体不含这两个字段。
+ *   - C-04：下发方式为四值枚举 none / effort / thinking / both，由纯函数
+ *     buildThinkingFields 组装，不做「单一布尔 + 组合猜测」。
+ *   - C-06：解析上游思考内容（delta.reasoning_content）与本配置完全解耦 ——
+ *     无论是否下发，`think` 事件与 meta.thinking 落库照旧。
+ *
+ * 历史修复记录（保留以便追溯，均已完成）：
+ *   - [US-1.1~1.3] 统一流式输出；上游不支持工具时的流式兼容。
  *   - [US-2.1~2.4] 会话唯一标识 / 服务端持有历史 / 会话隔离 / 兼容旧接口。
  *   - [US-3.3] 上游取消（止损）：带外取消 + AbortController。
  *   - [US-4.3~4.6] 会话列表 / 详情 / 删除接口。
- *   - [A3 修复] 助手消息落盘时补传渲染元数据（meta）：
- *     pipeStream 现返回 { text, thinking, usage }，两处 appendMessage 写回助手消息时
- *     携带 thinking / toolCalls / usage / model / elapsedMs / interrupted，
- *     使 US-4.4 的「完整重现」（思考/工具/信息栏/中断标识）在端到端数据链路上真正达成。
- *
- * Sprint 4.6 修复（工具调用泄漏 + 多轮工具调用）：
- *   - [US-HF-1] 阶段二请求补传 tools 定义（止血：让模型有标准协议可用）。
- *   - [US-HF-2] pipeStream 聚合流式 delta.tool_calls（按 index），扩展 PipeResult.toolCalls。
- *   - [US-HF-3] 分支 A 由「单轮」升级为「多轮循环」（上限 MAX_TOOL_ROUNDS），
- *     每轮执行工具 + 回灌 + 流式，直到模型不再请求工具为止。
- *   - [US-HF-4] pipeStream 推送 content 前做 DSML 文本兜底过滤（防御）。
- *
- * Sprint 4.6 二次修复（多轮内容显示不全）：
- *   - [US-HF-6] 多轮循环下，中间轮不再推送 finish（emitFinish=false），
- *     由调用方在循环结束后统一补发一次 finish，避免前端在第 1 轮就收尾置空气泡，
- *     导致后续轮次的思考 / 工具调用 / 回答全部被丢弃。
- *   - [US-HF-6] 正文 / 思考跨轮累积（finalText += ...），保证多轮内容完整。
- *   - [US-HF-6] DSML 兜底正则改为通用「竖线 + DSML + 竖线」匹配。
- *
- * Sprint 5.1（LLM 对话日志，开关控制）：
- *   - [US-LOG-3] 在 /stream 链路旁路采集对话日志（分支 A / 分支 B / catch 三处），
- *     由 appendLlmLog 内部判开关与兜底异常，不改变 SSE 推送与返回结构。
- *
- * Sprint 5.1 修复（非正常结束时日志未写入）：
- *   - [US-LOG-3-FIX] 错误路径下先写日志再发错误事件，且 send/close 包 try/catch，
- *     避免 network error 导致 controller 失效时 send 抛错中断 catch 块、漏写日志。
- *   - [US-LOG-3-FIX] pipeStream 非 AbortError 时以 UpstreamStreamError 携带已累积内容上抛，
- *     使错误日志能记录已产生的正文 / 思考 / 工具调用，避免"内容清空 + 无日志"。
- *
- * Sprint 5.1 二次修复（客户端断开时内容与日志丢失）：
- *   - [US-LOG-3-FIX2] send 永不抛错：客户端断开后 controller 已关闭，enqueue 会抛
- *     "Invalid state: Controller is already closed"，若任其抛出会中断 pipeStream 读取循环，
- *     导致已累积内容丢失且被误记为上游 error。改为捕获并静默（仅记录一次告警）。
- *   - [US-LOG-3-FIX2] 分支 A 每轮 pipeStream 用 try/catch 合并 partial 后上抛，
- *     保证异常轮次已产生的内容也并入 finalText / finalThinking。
- *   - [US-LOG-3-FIX2] catch 区分「客户端断开」与「上游错误」：
- *     客户端断开（Invalid state / clientGone）不记为 error。
- *
- * Sprint 5.2（复杂问题稳定性）：
- *   - [US-STAB-1] SSE 心跳保活：start 内启动心跳定时器，周期性下发注释帧（: ping），
- *     覆盖工具执行 / 上游探测 / 多轮循环等全部静默期；finally 中清理定时器。
- *   - [US-STAB-3] 截断显式告知：达 MAX_TOOL_ROUNDS 上限时，finish.reason 置 max_tool_rounds
- *     并追加 notice 事件；轮次上限改为可配置（env.MAX_TOOL_ROUNDS，默认 8）。
- *   - [US-STAB-4] 可观测性增强：catch 分支日志新增 clientGone 字段，区分客户端断开与上游错误。
+ *   - [A3] 助手消息落盘时补传渲染元数据（meta）。
+ *   - [US-HF-1~4] 阶段二补传 tools；pipeStream 聚合 delta.tool_calls；多轮工具循环；DSML 兜底。
+ *   - [US-HF-6] 中间轮不推送 finish，链路结束后统一补发；正文 / 思考跨轮累积。
+ *   - [US-LOG-3 / FIX / FIX2] LLM 对话日志旁路采集与异常路径收尾。
+ *   - [US-STAB-1/3/4] SSE 心跳保活；轮次上限截断显式告知；clientGone 可观测。
  *
  * 请求体 (JSON):
  * {
@@ -137,7 +122,7 @@ interface PipeResult {
         function: { name: string; arguments: string };
     }>;
     // [US-HF-6] 上游结束原因与最后一个带 finish_reason 的原始 chunk。
-    //   多轮循环下，中间轮不发 finish 事件，由调用方在循环结束后统一补发，
+    //   主链路中间轮不发 finish 事件，由调用方在链路结束后统一补发，
     //   故需把 finish 所需信息（reason / raw）随返回值带出。
     finishReason: string | null;
     raw: unknown;
@@ -164,6 +149,56 @@ class UpstreamStreamError extends Error {
 }
 
 /**
+ * [需求域 B / B-04] 解析流式聚合得到的工具参数 JSON 串。
+ *
+ * 用途：让「执行工具时用的参数」与「写进历史 meta / 调用日志的参数」走同一个解析器，
+ *   避免两处各写一遍 try/catch 后出现语义漂移。解析失败或非对象一律返回 {}，
+ *   与改造前主链路对非法参数的兜底行为一致（不因参数坏掉而中断整条链路）。
+ */
+function parseToolArguments(raw: string | undefined): Record<string, unknown> {
+    if (!raw) return {};
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            return parsed as Record<string, unknown>;
+        }
+        return {};
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * [需求域 C / C-01、C-02、C-04] 按「下发方式」组装思考相关字段（纯函数，便于单测，N-08）。
+ *
+ * 背景：改造前 `reasoning_effort` 与 `thinking` 被无条件写入每一次上游请求体，
+ *   接入非 DeepSeek 的 OpenAI 兼容服务商时可能因未知字段被拒（C-01 / C-05）。
+ *
+ * @param mode     下发方式：none / effort / thinking / both（其它值按 none 处理）
+ * @param thinking 思考开关字段的**取值来源**（env.LLM_THINKING）
+ * @param effort   推理强度字段的**取值来源**（env.LLM_REASONING_EFFORT）
+ * @returns 仅包含允许下发的字段；none 时为空对象（C-02）
+ *
+ * 四种取值的字段组合（AC-10）：
+ *   none     → {}
+ *   effort   → { reasoning_effort }
+ *   thinking → { thinking: { type } }
+ *   both     → { reasoning_effort, thinking: { type } }
+ */
+export function buildThinkingFields(
+    mode: string,
+    thinking: boolean,
+    effort: string,
+): Record<string, unknown> {
+    const fields: Record<string, unknown> = {};
+    if (mode === "effort" || mode === "both") fields.reasoning_effort = effort;
+    if (mode === "thinking" || mode === "both") {
+        fields.thinking = { type: thinking ? "enabled" : "disabled" };
+    }
+    return fields;
+}
+
+/**
  * 读取上游 SSE 流，解析 delta，转发为前端事件（think / text / finish）。
  *
  * [A3 修复] 返回值由「纯文本」升级为 PipeResult（text + thinking + usage），
@@ -175,14 +210,16 @@ class UpstreamStreamError extends Error {
  *
  * [US-HF-2] 聚合流式 delta.tool_calls（按 index 累加 name/arguments）。
  * [US-HF-4] 推送 content 前做 DSML 文本兜底过滤（累积缓冲区跨帧检测 + 前缀保留）。
- * [US-HF-6] emitFinish 控制是否推送 finish 事件（多轮循环中间轮传 false）。
+ * [US-HF-6] emitFinish 控制是否推送 finish 事件。
+ *   [需求域 A / A-07] 主链路（单链路）恒传 false，由调用方在链路结束后统一补发一次 finish，
+ *   避免前端过早收尾置空气泡。本函数的聚合逻辑在 A 域整改中未做任何改动。
  */
 async function pipeStream(
     upstream: ReadableStream<Uint8Array>,
     send: (obj: unknown) => void,
     // [US-HF-6] 是否在读到 finish_reason 时立即推送 finish 事件。
-    //   单轮路径（分支 B）保持 true；多轮循环（分支 A）中间轮传 false，
-    //   由调用方在循环结束后统一补发一次 finish，避免前端过早收尾置空气泡。
+    //   [A-07] 本文件已无「分支 B」单轮路径，唯一调用点恒传 false，
+    //   由主链路在结束后统一补发 finish，保证前端在所有轮次完成后才收尾。
     emitFinish: boolean = true
 ): Promise<PipeResult> {
     const reader = upstream.getReader();
@@ -194,7 +231,7 @@ async function pipeStream(
     let fullThinking = "";                        // [A3] 累积思考过程，供写回 meta
     let lastUsage: PipeResult["usage"] = null;    // [A3] 记录上游 usage，供写回 meta
     // [US-HF-6] 记录上游结束原因与最后一个带 finish_reason 的原始 chunk，
-    //   供调用方在循环结束后统一补发 finish 事件。
+    //   供调用方在链路结束后统一补发 finish 事件。
     let lastFinishReason: string | null = null;
     let lastRaw: unknown = null;
 
@@ -309,7 +346,7 @@ async function pipeStream(
                         lastFinishReason = finishReason;
                         lastRaw = parsed;
                         // [US-HF-6] 仅当允许时才推送 finish。
-                        //   多轮循环中间轮 emitFinish=false，不推送，避免前端过早收尾。
+                        //   主链路中间轮 emitFinish=false，不推送，避免前端过早收尾。
                         if (emitFinish) {
                             send({
                                 type: "finish",
@@ -361,7 +398,9 @@ async function pipeStream(
 
 /**
  * POST /api/chat/stream
- * 流式对话接口（R1：两阶段工具调用）
+ * 流式对话接口
+ *
+ * [需求域 A] 单链路：请求 → 流式聚合 → 判据（tool_calls）→ 执行工具 / 回灌 → 再请求
  */
 router.post("/stream", async (c) => {
     try {
@@ -458,31 +497,22 @@ router.post("/stream", async (c) => {
             Authorization: `Bearer ${env.LLM_API_KEY}`,
         };
 
-        // 公共请求体（不含 stream / tools，按阶段拼装）
+        // 公共请求体（不含 stream / tools / messages，按轮拼装）
+        // [需求域 C / C-01、C-02、C-04] 思考相关字段按「下发方式」拼装，不再无条件写入：
+        //   取值来源仍是 LLM_THINKING / LLM_REASONING_EFFORT，
+        //   但「是否下发」只由 LLM_THINKING_MODE（none/effort/thinking/both）决定。
+        //   none（默认）时请求体不含这两个字段（C-02），保证非 DeepSeek 服务商不被拒（C-05）。
         const baseBody = {
             model: env.LLM_MODEL,
-            messages: contextMessages.map((m: SessionMessage) => {
-                const out: Record<string, unknown> = { role: m.role, content: m.content };
-                if (m.tool_calls !== undefined) out.tool_calls = m.tool_calls;
-                if (m.tool_call_id !== undefined) out.tool_call_id = m.tool_call_id;
-                if (m.name !== undefined) out.name = m.name;
-                return out;
-            }),
-            reasoning_effort: env.LLM_REASONING_EFFORT,
-            ...(env.LLM_THINKING
-                ? { thinking: { type: "enabled" } }
-                : { thinking: { type: "disabled" } }),
+            ...buildThinkingFields(
+                env.LLM_THINKING_MODE,
+                env.LLM_THINKING,
+                env.LLM_REASONING_EFFORT,
+            ),
         };
 
-        // ── 阶段一：非流式探测工具调用意图 ─────────────────────────
+        // 工具定义快照（每次请求实时取，见 T-01）
         const toolDefs = getToolDefinitions();
-        let toolCalls: Array<{
-            id: string;
-            type: string;
-            function: { name: string; arguments: string };
-        }> = [];
-        let probeContent = "";
-        let supportsTools = true;
 
         // ── [US-3.3] 创建取消句柄并登记 ────────────────────────────
         const upstreamController = new AbortController();
@@ -491,46 +521,13 @@ router.post("/stream", async (c) => {
             console.log(`🔗 [US-3.3] 登记取消句柄: ${requestId}`);
         }
 
-        try {
-            const probeResp = await fetch(apiUrl, {
-                method: "POST",
-                headers,
-                signal: upstreamController.signal,
-                body: JSON.stringify({
-                    ...baseBody,
-                    stream: false,
-                    ...(toolDefs.length > 0 ? { tools: toolDefs } : {}),
-                }),
-            });
-
-            if (probeResp.ok) {
-                const probeJson = await probeResp.json();
-                const choice = probeJson.choices?.[0];
-                toolCalls = choice?.message?.tool_calls || [];
-                probeContent = choice?.message?.content || "";
-                supportsTools = true;
-            } else {
-                const errText = await probeResp.text().catch(() => "");
-                console.warn(
-                    `⚠️ 阶段一探测失败 (${probeResp.status})，降级为纯文本流式对话。上游返回: ${errText || "(空)"}`
-                );
-                supportsTools = false;
-            }
-        } catch (err) {
-            if (err instanceof Error && err.name === "AbortError") {
-                console.log("⏹️ [US-3.3] 阶段一探测已被取消");
-            } else {
-                console.warn("⚠️ 阶段一探测异常，降级为纯文本对话", err);
-            }
-        }
-
         // ── 3. 设置 SSE 响应头 ─────────────────────────────────────
         c.header("Content-Type", "text/event-stream");
         c.header("Cache-Control", "no-cache");
         c.header("Connection", "keep-alive");
         c.header("X-Accel-Buffering", "no"); // 禁用 Nginx 缓冲
 
-        // ── 4. 分支：有工具调用 → 执行 + 阶段二流式；无 → 降级流式 ──
+        // ── 4. 单一主链路（A-02/A-03）：不再有探测请求，也没有并行分支 ──
         return c.body(
             new ReadableStream({
                 async start(controller) {
@@ -554,7 +551,7 @@ router.post("/stream", async (c) => {
                     };
 
                     // [Sprint 5.2 / US-STAB-1] SSE 心跳保活：
-                    //   复杂任务（多轮工具 / 上游探测）期间 SSE 通道可能长时间无数据，
+                    //   复杂任务（多轮工具）期间 SSE 通道可能长时间无数据，
                     //   被中间层（如 Nginx proxy_read_timeout=60s）或浏览器判为空闲而掐断，
                     //   导致前端报 "network error"。此处周期性下发 SSE 注释帧（: ping），
                     //   保持连接活跃；注释帧不触发前端 data: 解析，无渲染副作用。
@@ -569,225 +566,245 @@ router.post("/stream", async (c) => {
 
                     // [A3] 本次回答的渲染元数据（供写回 meta）
                     const startedAt = Date.now();
-                    const collectedToolCalls: Array<{ name: string; arguments?: unknown; result?: string }> = [];
+                    // [需求域 B / B-01、B-04] 全链路唯一的工具调用记录源：历史 meta 与调用日志都只读它。
+                    //   id 与 tool_call 事件一致，便于「日志/落库 ↔ 事件流」逐条比对（AC-07）。
+                    const collectedToolCalls: Array<{
+                        id?: string;
+                        name: string;
+                        arguments?: unknown;
+                        result?: string;
+                    }> = [];
 
                     try {
-                        // 分支 A：模型请求了工具调用 → 多轮循环（US-HF-3）
-                        if (toolCalls.length > 0) {
-                            const MAX_TOOL_ROUNDS = env.MAX_TOOL_ROUNDS;   // [Sprint 5.2 / US-STAB-3] 可配置（默认 8）
-                            let round = 0;
-                            let currentToolCalls = toolCalls;          // 首轮来自阶段一探测
-                            let workingMessages: Array<Record<string, unknown>> = [...baseBody.messages];
-                            let finalText = "";
-                            let finalThinking = "";
-                            let finalUsage: PipeResult["usage"] = null;
-                            // [US-HF-6] 最后一轮的结束原因与原始 chunk，供循环后统一补发 finish
-                            let finalFinishReason: string | null = null;
-                            let finalRaw: unknown = null;
+                        const MAX_TOOL_ROUNDS = env.MAX_TOOL_ROUNDS;   // [US-STAB-3 / A-08] 语义与默认值不变
+                        let workingMessages: Array<Record<string, unknown>> = contextMessages.map(
+                            (m: SessionMessage) => {
+                                const out: Record<string, unknown> = { role: m.role, content: m.content };
+                                if (m.tool_calls !== undefined) out.tool_calls = m.tool_calls;
+                                if (m.tool_call_id !== undefined) out.tool_call_id = m.tool_call_id;
+                                if (m.name !== undefined) out.name = m.name;
+                                return out;
+                            }
+                        );
+                        // [A-03] 工具轮次的唯一判据：本轮流式聚合出的 tool_calls。
+                        //   首轮必然为空 —— 探测请求已删除（A-02/A-04）。
+                        let currentToolCalls: PipeResult["toolCalls"] = [];
+                        let toolRound = 0;              // 已执行的工具轮数（语义同改造前的 round）
+                        let reqSeq = 0;                 // 已发起的上游生成次数（A-01/A-05）
+                        let toolsEnabled = toolDefs.length > 0;   // 上游拒绝 tools 时降级（A-06）
+                        let finalText = "";
+                        let finalThinking = "";
+                        let finalUsage: PipeResult["usage"] = null;
+                        let finalFinishReason: string | null = null;
+                        let finalRaw: unknown = null;
+                        let hitMaxRounds = false;
 
-                            while (currentToolCalls.length > 0 && round < MAX_TOOL_ROUNDS) {
-                                round++;
+                        // 主链路循环：一次迭代 = 一次上游生成（+ 可选的一轮工具执行）
+                        while (true) {
+                            reqSeq++;
 
-                                // ① 执行本轮全部工具，推送事件，构造回灌消息
-                                const toolResultMessages: Array<Record<string, unknown>> = [];
-                                for (const tc of currentToolCalls) {
-                                    const wireName = tc.function?.name || "";
-                                    const displayName = toDisplayName(wireName);
-                                    let args: Record<string, unknown> = {};
-                                    try {
-                                        args = tc.function?.arguments
-                                            ? JSON.parse(tc.function.arguments)
-                                            : {};
-                                    } catch {
-                                        args = {};
-                                    }
+                            const buildBody = (withTools: boolean): Record<string, unknown> => ({
+                                ...baseBody,
+                                messages: workingMessages,
+                                stream: true,
+                                ...(withTools ? { tools: toolDefs } : {}),
+                            });
 
-                                    // 推送「工具调用发生」事件（前端展示，默认收起）
-                                    send({
-                                        type: "tool_call",
-                                        id: tc.id,
-                                        name: displayName,
-                                        wireName,
-                                        arguments: args,
-                                    });
+                            const reqStartedAt = Date.now();
+                            let resp = await fetch(apiUrl, {
+                                method: "POST",
+                                headers,
+                                signal: upstreamController.signal,
+                                body: JSON.stringify(buildBody(toolsEnabled)),
+                            });
 
-                                    // 后端执行（executeTool 内部已兜底异常）
-                                    const result = await executeTool(wireName, args);
-
-                                    // 推送「工具结果」事件
-                                    send({
-                                        type: "tool_call",
-                                        id: tc.id,
-                                        name: displayName,
-                                        wireName,
-                                        arguments: args,
-                                        result,
-                                    });
-
-                                    // [A3] 收集工具调用记录，供写回 meta（历史重现工具段）
-                                    collectedToolCalls.push({
-                                        name: displayName,
-                                        arguments: args,
-                                        result,
-                                    });
-
-                                    toolResultMessages.push({
-                                        role: "tool",
-                                        tool_call_id: tc.id,
-                                        content: result,
-                                    });
-                                }
-
-                                // ② 回灌 assistant(tool_calls) + tool 结果，流式请求本轮
-                                //    首轮保留 probeContent（阶段一探测到的正文），后续轮次为 null
-                                workingMessages = [
-                                    ...workingMessages,
-                                    {
-                                        role: "assistant",
-                                        content: round === 1 ? (probeContent || null) : null,
-                                        tool_calls: currentToolCalls,
-                                    },
-                                    ...toolResultMessages,
-                                ];
-
-                                const resp = await fetch(apiUrl, {
+                            // [A-06] 兼容性保持：改造前「上游不支持 tools」靠探测失败来发现并降级，
+                            //   探测删除后改为「首轮 4xx 且尚未执行任何工具」时去掉 tools 重试一次，
+                            //   保证对外行为（不因上游不认 tools 而整轮失败）不变。
+                            if (
+                                !resp.ok &&
+                                toolsEnabled &&
+                                reqSeq === 1 &&
+                                toolRound === 0 &&
+                                resp.status >= 400 &&
+                                resp.status < 500
+                            ) {
+                                const errText = await resp.text().catch(() => "");
+                                console.warn(
+                                    `⚠️ [A-06] 上游拒绝带 tools 的请求 (${resp.status})，改为不带 tools 重试一次。上游返回: ${errText || "(空)"}`
+                                );
+                                toolsEnabled = false;
+                                resp = await fetch(apiUrl, {
                                     method: "POST",
                                     headers,
                                     signal: upstreamController.signal,
-                                    body: JSON.stringify({
-                                        ...baseBody,
-                                        messages: workingMessages,
-                                        stream: true,
-                                        // [US-HF-1] 阶段二/多轮请求补传 tools，
-                                        // 让模型有标准协议可用，减少退化为 DSML 文本的概率。
-                                        ...(supportsTools && toolDefs.length > 0
-                                            ? { tools: toolDefs }
-                                            : {}),
-                                    }),
-                                });
-                                if (!resp.ok || !resp.body) {
-                                    const t = await resp.text().catch(() => "");
-                                    send({ type: "error", message: `第${round}轮请求失败: ${t || resp.status}` });
-                                    return;
-                                }
-
-                                // [US-HF-6] 中间轮不推送 finish（emitFinish=false），
-                                //   避免前端在第 1 轮就收尾置空气泡，导致后续轮次内容全部丢失。
-                                // [Sprint 5.1 / US-LOG-3-FIX2] 即使本轮 pipeStream 抛错，
-                                //   也要把已累积内容合并进 finalText/finalThinking，避免内容丢失。
-                                let result: PipeResult;
-                                try {
-                                    result = await pipeStream(resp.body, send, false);
-                                } catch (e) {
-                                    if (e instanceof UpstreamStreamError) {
-                                        finalText += e.partial.text;
-                                        finalThinking += e.partial.thinking;
-                                        finalUsage = e.partial.usage ?? finalUsage;
-                                        finalFinishReason = e.partial.finishReason ?? finalFinishReason;
-                                        finalRaw = e.partial.raw ?? finalRaw;
-                                    }
-                                    throw e;
-                                }
-                                // [US-HF-6] 正文/思考跨轮累积（而非覆盖），
-                                //   保证多轮回答的完整内容都能写回历史与展示。
-                                finalText += result.text;
-                                finalThinking += result.thinking;
-                                finalUsage = result.usage ?? finalUsage;
-                                finalFinishReason = result.finishReason;
-                                finalRaw = result.raw;
-
-                                // ③ 若本轮又请求了工具 → 继续循环；否则结束
-                                currentToolCalls = result.toolCalls || [];
-                            }
-
-                            // [Sprint 5.2 / US-STAB-3] 判定是否「因达轮次上限而截断」：
-                            //   round 已达上限 且 模型仍请求了工具（currentToolCalls 非空）
-                            //   → 任务被截断，需显式告知用户。
-                            const hitMaxRounds =
-                                round >= MAX_TOOL_ROUNDS && currentToolCalls.length > 0;
-
-                            // [US-HF-6] 循环结束后统一补发一次 finish 事件。
-                            //   多轮循环中间轮已用 emitFinish=false 抑制 finish，
-                            //   此处补发，保证前端在「全部轮次完成后」才收尾置空气泡，
-                            //   从而完整显示思考 / 工具调用 / 回答三类内容。
-                            // [Sprint 5.2 / US-STAB-3] 达上限截断时，reason 置为 max_tool_rounds。
-                            send({
-                                type: "finish",
-                                reason: hitMaxRounds ? "max_tool_rounds" : (finalFinishReason || "stop"),
-                                usage: finalUsage,
-                                raw: finalRaw || {},
-                            });
-
-                            // [Sprint 5.2 / US-STAB-3] 达上限截断：追加 notice 事件显式告知用户
-                            if (hitMaxRounds) {
-                                send({
-                                    type: "notice",
-                                    message: `已达工具调用轮次上限（${MAX_TOOL_ROUNDS} 轮），任务可能未完成，可继续追问。`,
+                                    body: JSON.stringify(buildBody(false)),
                                 });
                             }
 
-                            // ④ 循环结束：写回历史（携带完整 meta）
-                            if (useServerHistory && finalText) {
-                                const meta: MessageMeta = {
-                                    thinking: finalThinking || undefined,
-                                    toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined,
-                                    usage: finalUsage ?? undefined,
-                                    model: env.LLM_MODEL,
-                                    elapsedMs: Date.now() - startedAt,
-                                    startedAt,
-                                    interrupted: upstreamController.signal.aborted || undefined,
-                                };
-                                appendMessage(
-                                    sessionId as string,
-                                    { role: "assistant", content: finalText },
-                                    meta
+                            // [A-05] 每次上游生成留一行可核对的日志（请求次数验收依据）
+                            console.log(
+                                `📡 [A-05] 上游生成 #${reqSeq}｜状态=${resp.status}｜tools=${toolsEnabled ? "on" : "off"}｜messages=${workingMessages.length}｜响应头耗时=${Date.now() - reqStartedAt}ms`
+                            );
+
+                            if (!resp.ok || !resp.body) {
+                                const t = await resp.text().catch(() => "");
+                                const where = reqSeq === 1 ? "" : `（第 ${reqSeq} 次上游请求）`;
+                                send({ type: "error", message: `LLM API 返回错误${where}: ${t || resp.status}` });
+                                return;
+                            }
+
+                            // [US-HF-6] 中间轮不推送 finish（emitFinish=false），
+                            //   由本链路结束后统一补发，避免前端过早收尾置空气泡。
+                            // [Sprint 5.1 / US-LOG-3-FIX2] 即使本轮 pipeStream 抛错，
+                            //   也要把已累积内容合并进 finalText/finalThinking，避免内容丢失。
+                            let result: PipeResult;
+                            try {
+                                result = await pipeStream(resp.body, send, false);
+                            } catch (e) {
+                                if (e instanceof UpstreamStreamError) {
+                                    finalText += e.partial.text;
+                                    finalThinking += e.partial.thinking;
+                                    finalUsage = e.partial.usage ?? finalUsage;
+                                    finalFinishReason = e.partial.finishReason ?? finalFinishReason;
+                                    finalRaw = e.partial.raw ?? finalRaw;
+                                }
+                                throw e;
+                            }
+                            // 正文 / 思考跨轮累积（而非覆盖），保证多轮回答的完整内容都能写回历史与展示。
+                            finalText += result.text;
+                            finalThinking += result.thinking;
+                            finalUsage = result.usage ?? finalUsage;
+                            finalFinishReason = result.finishReason ?? finalFinishReason;
+                            finalRaw = result.raw ?? finalRaw;
+
+                            // ① [A-03] 唯一判据
+                            currentToolCalls = result.toolCalls || [];
+
+                            // ② 本轮结束判定
+                            if (currentToolCalls.length === 0) break;   // 未请求工具 → 链路结束（B-03：空正文也照此判定）
+                            // [A-06] 用户已中断：不再执行工具、不再续跑（避免「已点停止仍在写文件」），
+                            //   并按改造前的语义直接收尾 —— 不发 finish、不落库、不写调用日志，
+                            //   仅由 catch 外的 finally 清理（与旧分支 A 在工具轮中途被取消的表现一致）。
+                            if (upstreamController.signal.aborted) {
+                                console.log("⏹️ [US-3.3] 上游请求已取消（主链路中途收尾）");
+                                return;
+                            }
+                            // [A-08] 轮次上限：已达上限仍请求工具 → 截断，交由收尾逻辑显式告知
+                            if (toolRound >= MAX_TOOL_ROUNDS) {
+                                hitMaxRounds = true;
+                                break;
+                            }
+                            toolRound++;
+
+                            // ③ 执行本轮全部工具，推送事件，构造回灌消息
+                            const toolResultMessages: Array<Record<string, unknown>> = [];
+                            for (const tc of currentToolCalls) {
+                                const wireName = tc.function?.name || "";
+                                const displayName = toDisplayName(wireName);
+                                // [需求域 B / B-04] 与日志 / 落库共用同一份参数解析（parseToolArguments），
+                                //   保证「执行时用的参数」与「记录下来的参数」永远一致。
+                                const args: Record<string, unknown> = parseToolArguments(
+                                    tc.function?.arguments
                                 );
+
+                                // 推送「工具调用发生」事件（前端展示，默认收起）
+                                send({
+                                    type: "tool_call",
+                                    id: tc.id,
+                                    name: displayName,
+                                    wireName,
+                                    arguments: args,
+                                });
+
+                                // 后端执行（executeTool 内部已兜底异常）
+                                const toolResult = await executeTool(wireName, args);
+
+                                // 推送「工具结果」事件
+                                send({
+                                    type: "tool_call",
+                                    id: tc.id,
+                                    name: displayName,
+                                    wireName,
+                                    arguments: args,
+                                    result: toolResult,
+                                });
+
+                                // [A3] 收集工具调用记录，供写回 meta（历史重现工具段）与调用日志（B-04：真实值）
+                                // [需求域 B / B-01] 带 id：与上面两条 tool_call 事件的 id 完全一致，可逐条比对
+                                collectedToolCalls.push({
+                                    id: tc.id,
+                                    name: displayName,
+                                    arguments: args,
+                                    result: toolResult,
+                                });
+
+                                toolResultMessages.push({
+                                    role: "tool",
+                                    tool_call_id: tc.id,
+                                    content: toolResult,
+                                });
                             }
 
-                            // [Sprint 5.1 / US-LOG-3] 旁路采集日志（分支 A：工具调用多轮）
-                            //   无条件采集（含 finalText 为空的中断场景），由 appendLlmLog 内部判开关。
-                            appendLlmLog({
-                                sessionId: (sessionId as string) ?? null,
-                                requestId: hasRequestId ? (requestId as string) : null,
-                                model: env.LLM_MODEL,
-                                userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
-                                assistantText: finalText || null,
-                                thinking: finalThinking || null,
-                                toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : null,
-                                usage: finalUsage ?? null,
-                                finishReason: finalFinishReason,
-                                elapsedMs: Date.now() - logStartedAt,
-                                interrupted: upstreamController.signal.aborted || undefined,
-                                error: null,
-                            });
-                            return;
+                            // ④ 回灌 assistant(tool_calls) + tool 结果，进入下一轮生成。
+                            //   assistant.content 取本轮流式正文（改造前取探测请求的正文，
+                            //   探测删除后统一取同一次生成的正文，语义一致且无需额外请求）。
+                            workingMessages = [
+                                ...workingMessages,
+                                {
+                                    role: "assistant",
+                                    content: result.text || null,
+                                    tool_calls: currentToolCalls,
+                                },
+                                ...toolResultMessages,
+                            ];
                         }
 
-                        // 分支 B：无工具调用 → 一律走流式请求（US-1.1：消除一次性整段输出）
-                        const fallbackResp = await fetch(apiUrl, {
-                            method: "POST",
-                            headers,
-                            signal: upstreamController.signal,
-                            body: JSON.stringify({
-                                ...baseBody,
-                                stream: true,
-                                ...(supportsTools && toolDefs.length > 0
-                                    ? { tools: toolDefs }
-                                    : {}),
-                            }),
+                        // [A-05] 链路结束汇总：验收「1 或 1+N」的直接依据
+                        console.log(
+                            `📊 [A-05] 上游生成次数=${reqSeq}｜工具轮数=${toolRound}｜命中轮次上限=${hitMaxRounds ? "是" : "否"}`
+                        );
+
+                        // [US-HF-6] 链路结束后统一补发一次 finish 事件，
+                        //   保证前端在「全部轮次完成后」才收尾置空气泡。
+                        // [Sprint 5.2 / US-STAB-3] 达上限截断时，reason 置为 max_tool_rounds。
+                        send({
+                            type: "finish",
+                            reason: hitMaxRounds ? "max_tool_rounds" : (finalFinishReason || "stop"),
+                            usage: finalUsage,
+                            raw: finalRaw || {},
                         });
-                        if (!fallbackResp.ok || !fallbackResp.body) {
-                            const t = await fallbackResp.text().catch(() => "");
-                            send({ type: "error", message: `LLM API 返回错误: ${t || fallbackResp.status}` });
-                            return;
+
+                        // [Sprint 5.2 / US-STAB-3] 达上限截断：追加 notice 事件显式告知用户
+                        if (hitMaxRounds) {
+                            send({
+                                type: "notice",
+                                message: `已达工具调用轮次上限（${MAX_TOOL_ROUNDS} 轮），任务可能未完成，可继续追问。`,
+                            });
                         }
-                        const result = await pipeStream(fallbackResp.body, send);
-                        const assistantText = result.text;
-                        // [US-2.2 + A3] 助手回复写回会话历史（仅新模式），携带渲染元数据
-                        if (useServerHistory && assistantText) {
+
+                        // [需求域 B / B-03] 空正文兜底：链路已结束，但正文为空且确实执行过工具。
+                        //   此时若什么都不说，前端就是一个只挂着工具段的「空气泡」（B-03 禁止以空内容结束本轮）。
+                        //   事件顺序与其他事件契约保持不变（B-05）：仍在 finish 之后、且复用既有 notice 类型。
+                        //   达轮次上限时已有上一段 notice，不重复提示。
+                        if (!hitMaxRounds && !finalText.trim() && collectedToolCalls.length > 0) {
+                            const names = [...new Set(collectedToolCalls.map((t) => t.name))].join("、");
+                            send({
+                                type: "notice",
+                                message: `模型未返回正文，本轮已执行工具 ${collectedToolCalls.length} 次（${names}），结果见上方工具段，可继续追问。`,
+                            });
+                        }
+
+                        // ⑤ 写回历史（携带完整 meta；格式与改造前一致，A-06）
+                        // [需求域 B / B-01、B-03] 落库条件由「正文非空」放宽为「正文非空 或 已执行工具」：
+                        //   上游「只调工具、不返正文」时，工具结果与 meta 不再因正文为空而整条丢失（B-01）；
+                        //   同时避免「以空内容结束本轮」（B-03）。
+                        //   B-06：旧消息模式（useServerHistory=false）本就不落库，此处改动对它无影响。
+                        if (useServerHistory && (finalText || collectedToolCalls.length > 0)) {
                             const meta: MessageMeta = {
-                                thinking: result.thinking || undefined,
-                                usage: result.usage ?? undefined,
+                                thinking: finalThinking || undefined,
+                                toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined,
+                                usage: finalUsage ?? undefined,
                                 model: env.LLM_MODEL,
                                 elapsedMs: Date.now() - startedAt,
                                 startedAt,
@@ -795,22 +812,23 @@ router.post("/stream", async (c) => {
                             };
                             appendMessage(
                                 sessionId as string,
-                                { role: "assistant", content: assistantText },
+                                { role: "assistant", content: finalText },
                                 meta
                             );
                         }
 
-                        // [Sprint 5.1 / US-LOG-3] 旁路采集日志（分支 B：纯文本流式）
+                        // [Sprint 5.1 / US-LOG-3] 旁路采集日志（单链路，工具字段写真实值）
+                        //   无条件采集（含 finalText 为空的中断场景），由 appendLlmLog 内部判开关。
                         appendLlmLog({
                             sessionId: (sessionId as string) ?? null,
                             requestId: hasRequestId ? (requestId as string) : null,
                             model: env.LLM_MODEL,
                             userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
-                            assistantText: assistantText || null,
-                            thinking: result.thinking || null,
-                            toolCalls: null,
-                            usage: result.usage ?? null,
-                            finishReason: result.finishReason,
+                            assistantText: finalText || null,
+                            thinking: finalThinking || null,
+                            toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : null,
+                            usage: finalUsage ?? null,
+                            finishReason: finalFinishReason,
                             elapsedMs: Date.now() - logStartedAt,
                             interrupted: upstreamController.signal.aborted || undefined,
                             error: null,
@@ -836,7 +854,16 @@ router.post("/stream", async (c) => {
                                 userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
                                 assistantText: partial?.text || null,
                                 thinking: partial?.thinking || null,
-                                toolCalls: partial && partial.toolCalls.length > 0 ? partial.toolCalls : null,
+                                toolCalls:
+                                    partial && partial.toolCalls.length > 0
+                                        ? partial.toolCalls.map((tc) => ({
+                                              // [需求域 B / B-04] 与正常路径同一形状（可读名 + 对象参数），
+                                              //   异常路径下这些调用尚未执行，故无 result 字段。
+                                              id: tc.id,
+                                              name: toDisplayName(tc.function?.name || ""),
+                                              arguments: parseToolArguments(tc.function?.arguments),
+                                          }))
+                                        : null,
                                 usage: partial?.usage ?? null,
                                 finishReason: partial?.finishReason ?? null,
                                 error: isClientGone

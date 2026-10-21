@@ -39,7 +39,7 @@
  *     避免多轮循环下上游意外多发 finish 导致后续轮次内容被丢弃。
  * 33. [Sprint 5.2 / US-STAB-2] 内容保护：错误分支仅当气泡为空时才移除，非空则保留已生成内容
  * 34. [Sprint 5.2 / US-STAB-3] notice 处理：新增 case "notice"，以非错误样式展示截断提示
- * 35. [配置页 / US-CFG-PAGE-1~8] 配置视图：新增第 4 视图（config），按分组渲染 15 项配置，
+ * 35. [配置页 / US-CFG-PAGE-1~8] 配置视图：新增第 4 视图（config），按分组渲染 16 项配置，
  *     支持保存（二次确认 + confirm:true）、密钥不回显、逐项错误提示、脏值提醒
  */
 
@@ -1752,7 +1752,7 @@
         }
     }
 
-    /** 按分组渲染 15 个控件（AC-CFG-1 / 需求 §4.8.2） */
+    /** 按分组渲染 16 个控件（AC-CFG-1 / 需求 §4.8.2） */
     function renderConfigForm(box) {
         const titles = {
             app: "应用配置", llm: "LLM 配置", file: "文件工具配置",

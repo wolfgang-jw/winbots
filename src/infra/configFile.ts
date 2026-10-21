@@ -57,7 +57,7 @@ export interface ConfigKeyMeta {
   desc: string;
 }
 
-/** 15 项全量白名单（顺序与 .env.example 一致；需求 §4.2） */
+/** 16 项全量白名单（顺序与 .env.example 一致；需求 §4.2） */
 export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   {
     key: "APP_PORT", group: "app", groupTitle: "应用配置", type: "int",
@@ -81,14 +81,20 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
     desc: "使用的模型名称。",
   },
   {
+    key: "LLM_THINKING_MODE", group: "llm", groupTitle: "LLM 配置", type: "enum",
+    label: "思考字段下发方式", defaultValue: "none",
+    enumValues: ["none", "effort", "thinking", "both"],
+    desc: "控制请求体携带哪些思考相关字段：none=均不下发（默认，兼容非 DeepSeek 服务商）/ effort=仅下发推理强度 / thinking=仅下发思考开关 / both=两者都下发。下面两项只提供取值。",
+  },
+  {
     key: "LLM_THINKING", group: "llm", groupTitle: "LLM 配置", type: "bool",
-    label: "思考模式", defaultValue: "true",
-    desc: "true=开启，false=关闭。",
+    label: "思考开关取值", defaultValue: "true",
+    desc: "仅提供思考开关字段的取值（true=开启，false=关闭）；是否下发由「思考字段下发方式」决定。",
   },
   {
     key: "LLM_REASONING_EFFORT", group: "llm", groupTitle: "LLM 配置", type: "enum",
-    label: "推理强度", defaultValue: "high", enumValues: ["low", "high", "max"],
-    desc: "思考模式下的推理强度。",
+    label: "推理强度取值", defaultValue: "high", enumValues: ["low", "high", "max"],
+    desc: "仅提供推理强度字段的取值；是否下发由「思考字段下发方式」决定。",
   },
 
   {

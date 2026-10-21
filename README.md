@@ -56,9 +56,17 @@ APP_PORT=3001
 # ============================================
 LLM_API_BASE=https://api.deepseek.com
 LLM_API_KEY=sk-apikey
-LLM_MODEL=deepseek-v4-flash
-# 思考模式（true=开启，false/留空=关闭）
+LLM_MODEL=deepseek-flash
+# 思考字段下发方式（需求域 C）：控制请求体携带哪些思考相关字段。
+#   none     = 均不下发（默认；接入非 DeepSeek 的 OpenAI 兼容服务商不会被未知字段拒绝）
+#   effort   = 仅下发推理强度
+#   thinking = 仅下发思考开关
+#   both     = 两者都下发
+#   是否下发只看这一项；下面两项只提供「取值」，不再各自决定请求体是否携带字段。
+LLM_THINKING_MODE=none
+# 思考开关字段的取值来源（true=开启，false=关闭）；不下发时该值不进入请求体。
 LLM_THINKING=true
+# 推理强度字段的取值来源（low / high / max）；不下发时该值不进入请求体。
 LLM_REASONING_EFFORT=high
 
 # ============================================
@@ -104,9 +112,10 @@ SSE_HEARTBEAT_MS=10000
 | `APP_PORT` | 服务监听端口 | `3001` | ✅ 必填 |
 | `LLM_API_BASE` | LLM 服务 API 地址 | `https://api.deepseek.com` | ✅ 必填 |
 | `LLM_API_KEY` | 你的 API 密钥（**必须修改**） | `sk-xxxxxxxx` | ✅ 必填 |
-| `LLM_MODEL` | 使用的模型名称 | `deepseek-v4-flash` | ✅ 必填 |
-| `LLM_THINKING` | 思考模式开关 | `true` / `false` | 可选 |
-| `LLM_REASONING_EFFORT` | 推理强度 | `low` / `high` / `max` | 可选 |
+| `LLM_MODEL` | 使用的模型名称 | `deepseek-flash` | ✅ 必填 |
+| `LLM_THINKING_MODE` | 思考字段下发方式（`none` 均不下发 / `effort` 仅推理强度 / `thinking` 仅思考开关 / `both` 两者都下发） | `none` | 可选（默认 `none`） |
+| `LLM_THINKING` | 思考开关字段的**取值来源**（是否下发见上行） | `true` / `false` | 可选 |
+| `LLM_REASONING_EFFORT` | 推理强度字段的**取值来源**（是否下发见上行） | `low` / `high` / `max` | 可选 |
 | `FILE_ROOT_DIR` | AI 文件操作的沙箱总目录（与 `data` 平级） | `working` | 可选（默认 `working`） |
 | `FILE_READ_ENABLED` | 读操作开关（列目录/读文件/查信息/搜索） | `true` / `false` | 可选（默认 `true`） |
 | `FILE_CREATE_ENABLED` | 新建操作开关（建目录/建文件/追加） | `true` / `false` | 可选（默认 `false`） |
@@ -186,7 +195,7 @@ LLM_MODEL=deepseek-chat
 
 除用记事本修改 `.env` 外，也可在浏览器中打开 **配置页**（`http://localhost:3001/?view=config`，或点击顶部菜单「配置」）：
 
-1. **可视化编辑**：页面按分组列出全部 15 项配置，含当前值与说明；
+1. **可视化编辑**：页面按分组列出全部 16 项配置，含当前值与说明；
 2. **密钥不回显**：`LLM_API_KEY` 仅显示掩码（如 `sk-****cdef`），**留空表示不修改**；
 3. **保存需确认**：点击「保存」会弹二次确认，确认后写回 `.env`；
 4. **自动备份**：每次保存前会把旧 `.env` 备份到 `data/envbk/`（只保留最近 20 份），改错可回退；
