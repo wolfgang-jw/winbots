@@ -520,6 +520,17 @@ router.post("/stream", async (c) => {
 
         // 工具定义快照（每次请求实时取，见 T-01）
         const toolDefs = getToolDefinitions();
+        // [FIX-BOOT-05] 工具可见性留痕。
+        //   现场故障：用户以为开了开关，模型却回答「我没有浏览器工具」，而服务端日志里
+        //   没有任何一行能判断到底是「没注册」还是「被开关过滤」。这里每次请求打一行，
+        //   把「模型实际看到多少个工具、其中浏览器几个」固定成可核对的证据。
+        const browserVisible = toolDefs.filter((d) =>
+            d.function.name.startsWith("internet__browser__")
+        ).length;
+        console.log(
+            `🧰 模型可见工具 ${toolDefs.length} 个｜浏览器 ${browserVisible}/4｜` +
+                `BROWSER_ENABLED=${env.BROWSER_ENABLED ? "true" : "false"}`
+        );
 
         // ── [US-3.3] 创建取消句柄并登记 ────────────────────────────
         const upstreamController = new AbortController();

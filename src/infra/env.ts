@@ -43,6 +43,165 @@ export const THINKING_MODE_LABEL: Record<ThinkingMode, string> = {
   both: "两者都下发",
 };
 
+/**
+ * [需求域 BR / BR-61] 浏览器 profile 模式。
+ * persist 等于把登录态交给模型，配置页说明里必须写清（BR-39）。
+ */
+export type BrowserProfileMode = "temp" | "persist";
+
+export const BROWSER_PROFILE_MODES: readonly BrowserProfileMode[] = ["temp", "persist"];
+
+/** 枚举非法/缺失一律回退 temp（§13.2-2） */
+export function parseProfileMode(raw: string | undefined): BrowserProfileMode {
+  const v = (raw ?? "").trim().toLowerCase();
+  return (BROWSER_PROFILE_MODES as readonly string[]).includes(v)
+    ? (v as BrowserProfileMode)
+    : "temp";
+}
+
+/**
+ * 数值项：缺失/非法回退默认值并钳制到 [min, max]（§13.2-3）
+ *
+ * [R-02 附带] 原文先用 normalizeScalarText 归一：旧写法直接用 Number(原文)，
+ * 于是 `BROWSER_SESSION_TTL_S=600   # 10 分钟` 得到 NaN → 静默回退 180，
+ * 与布尔项「设了却不生效」是同一类病，只是换成了数值。
+ */
+export function parseIntClamped(
+  raw: string | undefined,
+  def: number,
+  min = 0,
+  max = Number.MAX_SAFE_INTEGER,
+  label = "",
+): number {
+  const text = normalizeScalarText(raw);
+  if (text === "") return def;
+  const n = Number(text);
+  if (!Number.isFinite(n)) {
+    console.warn(
+      `⚠️  ${label || "配置项"} 取值不是数字（${JSON.stringify(String(raw))}），已按默认值 ${def} 处理。`
+    );
+    return def;
+  }
+  const v = Math.trunc(n);
+  if (v < min) return min;
+  if (v > max) return max;
+  return v;
+}
+
+/** 内部沿用旧名，避免十几处调用点改名（语义见 parseIntClamped） */
+const numOr = parseIntClamped;
+
+/**
+ * [§13.2-3 关键点] BROWSER_DEBUG_PORT 的 0 是**合法且有语义**的值（随机端口），
+ * 因此不能用「空值/0 一律取默认」的写法，必须单独解析。
+ */
+export function parseDebugPort(raw: string | undefined): number {
+  // [R-02 附带] 同样容忍引号与行内注释；0 的语义（随机端口）保持不变
+  const text = normalizeScalarText(raw);
+  if (text === "") return 0;
+  const n = Number(text);
+  if (!Number.isInteger(n) || n < 0 || n > 65535) {
+    console.warn(
+      `⚠️  BROWSER_DEBUG_PORT 取值非法（${JSON.stringify(String(raw))}），已按 0（随机端口）处理；有效范围 0–65535。`
+    );
+    return 0;
+  }
+  return n;
+}
+
+/**
+ * [FIX-SILENT-01] 浏览器开关的布尔容错解析。
+ *
+ * 起因（现场故障 2026-10-22）：用户手工把 `.env` 写成 `BROWSER_ENABLED=True` /
+ * `=1` / `=yes`，而旧写法是严格的 `=== "true"`，于是被判为「关」：
+ * 四个浏览器工具直接从模型可见列表消失，模型连「开关没开」都说不出来，
+ * 表现正是「要求打开浏览器，但什么也没有发生」。
+ *
+ * 规则：缺省/空 → 默认值；真值词 → true；假值词 → false；
+ *       其余无法识别 → 取默认值**并在启动日志告警**（绝不静默）。
+ */
+export function parseBoolLoose(raw: string | undefined, def: boolean, label = ""): boolean {
+  const v = normalizeBoolText(raw);
+  if (v === "") return def;
+  if (v === "true" || v === "1" || v === "yes" || v === "on" || v === "y") return true;
+  if (v === "false" || v === "0" || v === "no" || v === "off" || v === "n") return false;
+  console.warn(
+    `⚠️  ${label || "配置项"} 取值无法识别（${JSON.stringify(String(raw))}），` +
+      `已按「${def ? "开启" : "关闭"}」处理；请写 true / false。`
+  );
+  return def;
+}
+
+/**
+ * [FIX-BOOT-03] 布尔原文归一化：剥掉成对引号与行内注释，再小写。
+ *
+ * 起因（现场故障 2026-10-22 第二例）：用户照抄示例把值写成
+ *   BROWSER_ENABLED=true      # 打开
+ * 或
+ *   BROWSER_ENABLED="true"
+ * 旧实现直接把整串拿去比较，`true      # 打开` 不等于任何真值词，
+ * 于是判为「关」→ 四个工具从模型可见列表消失（症状与开关没开完全一样）。
+ *
+ * 同一函数也用于数值项（parseIntClamped / parseDebugPort）与 .env 遮蔽比对，
+ * 三处共用一套归一化口径，避免「布尔认、数字不认」这类不一致。
+ *
+ * [FIX-QUOTE-CMT-01] 顺序必须是「先截注释、再剥引号」（用例实测暴露）：
+ *   原实现先判「首尾是否成对引号」再截注释，于是 `"true"  # 开` 因为尾部是 `开`
+ *   被判成「未加引号」，截注释后得到 `"true"`（引号仍在）→ 仍无法识别 → 回退默认值。
+ *   即「引号 + 行内注释」这一最常见的照抄写法依旧失效，与修复前的症状一模一样。
+ */
+function normalizeScalarText(raw: string | undefined): string {
+  return stripPairedQuotes(stripInlineComment(String(raw ?? "").trim()));
+}
+
+/**
+ * 截断行内注释：只有「成对引号之外」且「前一字符是空白」的 `#` 才算注释起点。
+ *
+ * 为什么不直接 `search(/\s#/)`：那样会把 `KEY="a # b"`（密码/URL 里带 `#`）
+ * 从引号内部截断。这里用一次线性扫描跳过引号区段，两类写法都能正确处理：
+ *   `true   # 开`      → `true`          （引号外 + 空白后 → 注释）
+ *   `"true"  # 开`     → `"true"`        （先截注释，再由下面剥引号）
+ *   `"a # b"`          → `"a # b"`       （`#` 在引号内 → 不是注释）
+ *   `tr#ue`            → `tr#ue`         （`#` 前无空白 → 不是注释）
+ */
+function stripInlineComment(v: string): string {
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < v.length; i++) {
+    const ch = v.charAt(i);
+    if (quote !== null) {
+      if (ch === "\\") {
+        i += 1;                          // 转义：跳过下一个字符
+        continue;
+      }
+      if (ch === quote) quote = null;     // 引号闭合
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && i > 0 && /\s/.test(v.charAt(i - 1))) {
+      return v.slice(0, i).trim();
+    }
+  }
+  return v;
+}
+
+/** 剥掉成对的首尾引号（只剥一层，要求首尾同种引号；不成对则原样返回） */
+function stripPairedQuotes(v: string): string {
+  if (v.length < 2) return v;
+  const first = v.charAt(0);
+  if ((first === '"' || first === "'") && first === v.charAt(v.length - 1)) {
+    return v.slice(1, -1).trim();
+  }
+  return v;
+}
+
+/** 布尔项在归一化后再小写比较；数值项直接用 normalizeScalarText（R-02） */
+function normalizeBoolText(raw: string | undefined): string {
+  return normalizeScalarText(raw).toLowerCase();
+}
+
 export interface EnvConfig {
   // 服务端口
   APP_PORT: number;
@@ -94,6 +253,32 @@ export interface EnvConfig {
   INTERNET_STORE_MAX_ITEMS_PER_SESSION: number; // 暂存单会话条数上限（R-30，默认 8）
   INTERNET_STORE_MAX_CHARS_PER_ITEM: number;    // 暂存单条字符上限（R-30，默认 200000）
   INTERNET_STORE_MAX_CHARS_TOTAL: number;       // 暂存全局字符上限（R-30，默认 4 MB）
+
+  // [需求域 BR / US-BR-01] 浏览器工具配置（21 项，全部可选，带默认值；不加入 REQUIRED_VARS，BR-61）
+  //   [R-07] 已删除 BROWSER_MAX_TABS：全仓零引用的死配置（单标签语义 XB-01 下无实际用途），
+  //   留着只会让人以为「改了有用」。若日后需要拦截弹窗新标签，应在驱动层按 Target 计数实现。
+  //   §13.2 解析规则：默认关闭的布尔「显式 true 才开」，默认开启的布尔「显式 false 才关」。
+  BROWSER_ENABLED: boolean;                     // 总开关（默认关闭，BR-51）
+  BROWSER_EXECUTABLE_PATH: string;              // 可执行文件路径；auto = 自动探测 Edge → Chrome
+  BROWSER_HEADLESS: boolean;                    // 无头（默认开启）
+  BROWSER_DEBUG_PORT: number;                   // 0 = 随机；固定值用于端口冲突场景
+  BROWSER_PROFILE_MODE: BrowserProfileMode;     // temp / persist
+  BROWSER_PROFILE_DIR: string;                  // 仅 persist 使用
+  BROWSER_SESSION_TTL_S: number;                // 会话空闲 TTL（默认 180s）
+  BROWSER_MAX_SESSIONS: number;                 // 并发会话上限（默认 2）
+  BROWSER_ACTION_TIMEOUT_MS: number;            // 单步动作超时（默认 8000）
+  BROWSER_NAV_TIMEOUT_MS: number;               // 导航超时（默认 20000）
+  BROWSER_STABLE_WINDOW_MS: number;             // 稳定窗口（默认 400）
+  BROWSER_SNAPSHOT_MAX_ELEMENTS: number;        // 快照元素上限（默认 120）
+  BROWSER_SNAPSHOT_MAX_CHARS: number;           // 快照正文字符上限（默认 6000）
+  BROWSER_MAX_ACTIONS: number;                  // 单次动作数上限（默认 10）
+  BROWSER_DOMAIN_ALLOWLIST: string;             // 域名白名单（逗号分隔，空=不额外限制）
+  BROWSER_DOMAIN_BLOCKLIST: string;             // 域名黑名单（优先于白名单）
+  BROWSER_BLOCK_PRIVATE_NET: boolean;           // 私有网段阻断（默认开启）
+  BROWSER_ALLOW_DOWNLOAD: boolean;              // 允许下载（默认关闭）
+  BROWSER_ALLOW_UPLOAD: boolean;                // 允许上传（默认关闭）
+  BROWSER_DRAG_STEPS: number;                   // 拖拽插值步数（默认 12，代码强制下限 10）
+  BROWSER_TYPE_DELAY_MS: number;                // 逐字输入间隔（默认 0，上限 100）
 }
 
 /** 必需的环境变量列表 */
@@ -113,6 +298,8 @@ function loadDotenv(): void {
   const envPath = resolve(import.meta.dir, "../../.env");
   try {
     const content = readFileSync(envPath, "utf-8");
+    /** [R-08] 文件内已出现过的键 → 取值（用于识别重复键，令「末次生效」） */
+    const fileValues = new Map<string, string>();
     for (const line of content.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
@@ -120,9 +307,18 @@ function loadDotenv(): void {
       if (eqIdx === -1) continue;
       const key = trimmed.slice(0, eqIdx).trim();
       const value = trimmed.slice(eqIdx + 1).trim();
+      // [R-08] 重复键一律「末次生效」，且不判遮蔽
+      //   （否则「首行 true / 末行 false」会被误报为「被系统环境变量遮蔽」）
+      const seenBefore = fileValues.has(key);
+      fileValues.set(key, value);
+      if (seenBefore) {
+        Bun.env[key] = value;
+        shadowedKeys.delete(key);
+        continue;
+      }
       if (!Bun.env[key]) {
         Bun.env[key] = value;
-      } else if (Bun.env[key] !== value) {
+      } else if (normalizeScalarText(Bun.env[key]) !== normalizeScalarText(value)) {
         // [配置页 / US-CFG-PAGE-7] 已存在且与 .env 不一致 → 判定为"被系统环境变量遮蔽"。
         //   判据用「值不相同」而非「键已存在」：Bun 运行时自身可能已加载 .env，
         //   若以"键已存在"判定，会把全部键误报为遮蔽，等于没有提示。
@@ -226,6 +422,40 @@ function validateEnv(): EnvConfig {
       parseInt(Bun.env.INTERNET_STORE_MAX_CHARS_PER_ITEM || "200000", 10) || 200000,
     INTERNET_STORE_MAX_CHARS_TOTAL:
       parseInt(Bun.env.INTERNET_STORE_MAX_CHARS_TOTAL || "4194304", 10) || 4194304,
+
+    // [需求域 BR / US-BR-01] 浏览器工具配置（21 项，缺失/非法一律回退默认，不退出进程，BR-61）
+    //   总开关：默认关闭（BR-51）；[FIX-SILENT-01] 容错 true/1/yes/on，无法识别时取默认并告警
+    BROWSER_ENABLED: parseBoolLoose(Bun.env.BROWSER_ENABLED, false, "BROWSER_ENABLED"),
+    //   可执行文件：auto（或留空）= 自动探测 Edge → Chrome；显式路径必须存在，否则启动失败并列出已尝试路径
+    BROWSER_EXECUTABLE_PATH: (Bun.env.BROWSER_EXECUTABLE_PATH || "auto").trim() || "auto",
+    //   无头：默认开启；[FIX-SILENT-01] 容错 false/0/no/off（写 False 也认）
+    BROWSER_HEADLESS: parseBoolLoose(Bun.env.BROWSER_HEADLESS, true, "BROWSER_HEADLESS"),
+    //   调试端口：0 = 随机（**合法语义**，不得被「0 取默认」吞掉，见 parseDebugPort）
+    BROWSER_DEBUG_PORT: parseDebugPort(Bun.env.BROWSER_DEBUG_PORT),
+    BROWSER_PROFILE_MODE: parseProfileMode(Bun.env.BROWSER_PROFILE_MODE),
+    BROWSER_PROFILE_DIR: (Bun.env.BROWSER_PROFILE_DIR || "").trim(),
+    BROWSER_SESSION_TTL_S: numOr(Bun.env.BROWSER_SESSION_TTL_S, 180, 10, 86400),
+    BROWSER_MAX_SESSIONS: numOr(Bun.env.BROWSER_MAX_SESSIONS, 2, 1, 10),
+    BROWSER_ACTION_TIMEOUT_MS: numOr(Bun.env.BROWSER_ACTION_TIMEOUT_MS, 8000, 500, 120000),
+    BROWSER_NAV_TIMEOUT_MS: numOr(Bun.env.BROWSER_NAV_TIMEOUT_MS, 20000, 1000, 300000),
+    BROWSER_STABLE_WINDOW_MS: numOr(Bun.env.BROWSER_STABLE_WINDOW_MS, 400, 0, 5000),
+    BROWSER_SNAPSHOT_MAX_ELEMENTS: numOr(Bun.env.BROWSER_SNAPSHOT_MAX_ELEMENTS, 120, 1, 1000),
+    BROWSER_SNAPSHOT_MAX_CHARS: numOr(Bun.env.BROWSER_SNAPSHOT_MAX_CHARS, 6000, 200, 12000),
+    BROWSER_MAX_ACTIONS: numOr(Bun.env.BROWSER_MAX_ACTIONS, 10, 1, 30),
+    BROWSER_DOMAIN_ALLOWLIST: (Bun.env.BROWSER_DOMAIN_ALLOWLIST || "").trim(),
+    BROWSER_DOMAIN_BLOCKLIST: (Bun.env.BROWSER_DOMAIN_BLOCKLIST || "").trim(),
+    //   私有网段阻断：默认开启（[R-02] 走容错解析，写 False/0/off 也认）
+    BROWSER_BLOCK_PRIVATE_NET: parseBoolLoose(
+      Bun.env.BROWSER_BLOCK_PRIVATE_NET,
+      true,
+      "BROWSER_BLOCK_PRIVATE_NET"
+    ),
+    //   [R-02] 下载/上传：默认关闭（走容错解析，写 True/1/yes 也认）
+    BROWSER_ALLOW_DOWNLOAD: parseBoolLoose(Bun.env.BROWSER_ALLOW_DOWNLOAD, false, "BROWSER_ALLOW_DOWNLOAD"),
+    BROWSER_ALLOW_UPLOAD: parseBoolLoose(Bun.env.BROWSER_ALLOW_UPLOAD, false, "BROWSER_ALLOW_UPLOAD"),
+    //   拖拽步数：下限强制 10（步数过小会被拖拽库判定为点击，BR-22）
+    BROWSER_DRAG_STEPS: Math.max(10, numOr(Bun.env.BROWSER_DRAG_STEPS, 12, 10, 60)),
+    BROWSER_TYPE_DELAY_MS: numOr(Bun.env.BROWSER_TYPE_DELAY_MS, 0, 0, 100),
   };
 }
 
@@ -240,6 +470,67 @@ export const envShadowedBySystem: ReadonlySet<string> = shadowedKeys;
 
 /** 类型安全的全局配置对象（单例）。热更请用 reloadEnvExcluding()，勿重新赋值。 */
 export const env = validateEnv();
+
+/**
+ * [FIX-BOOT-04] .env 结构性异常嗅探（只告警，不改值）。
+ *
+ * 现场故障（2026-10-22）：`.env` 里原本已有 `BROWSER_ENABLED=true`，
+ * 之后又把 `.env.example` 的整段浏览器配置块追加到文件末尾，而示例块里是
+ * `BROWSER_ENABLED=false` —— 同名键出现两次，**后者覆盖前者**，
+ * 于是「我明明改成 true 了」与「工具就是不出现」同时成立，且没有任何提示。
+ *
+ * 这里把两类会被静默吃掉的情况显式喊出来：
+ *   ① 同名键重复且取值不同 —— 说明最后一行才生效；
+ *   ② 值里带行内注释（` #` 之后）—— 布尔类配置会解析失败（见 normalizeBoolText）。
+ */
+function detectEnvAnomalies(): void {
+  const envPath = resolve(import.meta.dir, "../../.env");
+  let text: string;
+  try {
+    text = readFileSync(envPath, "utf-8");
+  } catch {
+    return; // .env 不存在时 loadDotenv 已告警
+  }
+
+  const seen = new Map<string, string[]>();
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const value = trimmed.slice(eqIdx + 1).trim();
+    const list = seen.get(key);
+    if (list) list.push(value);
+    else seen.set(key, [value]);
+  }
+
+  for (const [key, values] of seen) {
+    if (values.length < 2) continue;
+    const first = values[0] ?? "";
+    const last = values[values.length - 1] ?? "";
+    if (first === last) continue;
+    console.warn(
+      `⚠️  [.env] ${key} 出现了 ${values.length} 次且取值不同，实际生效的是最后一行（"${last}"）；` +
+        `第一行是 "${first}"。请删掉多余的那一行，否则会出现「改了却不生效」。`
+    );
+  }
+
+  for (const [key, values] of seen) {
+    const last = (values[values.length - 1] ?? "").trim();
+    // [FIX-QUOTE-CMT-01] 判据必须与解析同一口径：引号内的 `#` 不算注释，
+    //   否则 `KEY="a # b"`（密码/URL 带 #）会被误报「含行内注释」。
+    if (stripInlineComment(last) === last) continue;
+    // 只提示布尔/数值这类「不该带注释」的键，避免对路径、密钥类误报
+    if (!/(_ENABLED|_HEADLESS|_PRIVATE_NET|_ALLOW_[A-Z]+|_THINKING)$/.test(key)) continue;
+    console.warn(
+      `⚠️  [.env] ${key} 的值里含行内注释，实际解析按注释前的部分处理（原始值 "${last}"）。` +
+        `建议把注释单独写一行，避免歧义。`
+    );
+  }
+}
+
+detectEnvAnomalies();
 
 /**
  * [修订 / R-45] 拼接「基址 + 端点路径」，仅用于启动摘要展示。
@@ -299,6 +590,65 @@ console.log(`  INTERNET 超时/回灌上限: ${env.INTERNET_TIMEOUT_MS}ms / ${en
 console.log(
   `  INTERNET 暂存:         TTL=${env.INTERNET_STORE_TTL_S}s｜单会话=${env.INTERNET_STORE_MAX_ITEMS_PER_SESSION} 条｜单条=${env.INTERNET_STORE_MAX_CHARS_PER_ITEM} 字符｜全局=${env.INTERNET_STORE_MAX_CHARS_TOTAL} 字符`
 );
+// [需求域 BR / BR-63] 浏览器工具生效摘要（不含任何敏感值）
+console.log("-".repeat(60));
+console.log(
+  `  BROWSER_ENABLED:       ${env.BROWSER_ENABLED ? "开启" : "关闭"}` +
+    `（.env 原始值=${
+      Bun.env.BROWSER_ENABLED === undefined ? "未设置" : JSON.stringify(Bun.env.BROWSER_ENABLED)
+    }）`
+);
+console.log(
+  `  BROWSER_EXECUTABLE:    ${
+    env.BROWSER_EXECUTABLE_PATH.toLowerCase() === "auto"
+      ? "自动探测（Edge → Chrome）"
+      : env.BROWSER_EXECUTABLE_PATH
+  }`
+);
+console.log(
+  `  BROWSER 窗口:          ${env.BROWSER_HEADLESS ? "无头" : "有头（显示窗口）"}` +
+    `（原始值=${
+      Bun.env.BROWSER_HEADLESS === undefined ? "未设置" : JSON.stringify(Bun.env.BROWSER_HEADLESS)
+    }）`
+);
+console.log(
+  `  BROWSER profile:       ${
+    env.BROWSER_PROFILE_MODE === "persist"
+      ? `持久${env.BROWSER_PROFILE_DIR ? `（${env.BROWSER_PROFILE_DIR}）` : "（未配置目录，将回退临时并告警）"}`
+      : "临时（关闭即删）"
+  }`
+);
+console.log(`  BROWSER 调试端口:      ${env.BROWSER_DEBUG_PORT === 0 ? "随机分配" : env.BROWSER_DEBUG_PORT}`);
+console.log(
+  `  BROWSER 超时:          单步=${env.BROWSER_ACTION_TIMEOUT_MS}ms｜导航=${env.BROWSER_NAV_TIMEOUT_MS}ms｜稳定窗口=${env.BROWSER_STABLE_WINDOW_MS}ms`
+);
+console.log(
+  `  BROWSER 快照:          元素=${env.BROWSER_SNAPSHOT_MAX_ELEMENTS} 个｜正文=${env.BROWSER_SNAPSHOT_MAX_CHARS} 字符｜单次动作=${env.BROWSER_MAX_ACTIONS} 个`
+);
+console.log(
+  `  BROWSER 域名策略:      白名单=${
+    env.BROWSER_DOMAIN_ALLOWLIST || "空（不额外限制）"
+  }｜黑名单=${env.BROWSER_DOMAIN_BLOCKLIST || "空"}｜私有网段阻断=${
+    env.BROWSER_BLOCK_PRIVATE_NET ? "开启" : "关闭"
+  }`
+);
+console.log(
+  `  BROWSER 下载/上传:     ${env.BROWSER_ALLOW_DOWNLOAD ? "允许下载" : "拒绝下载"} / ${
+    env.BROWSER_ALLOW_UPLOAD ? "允许上传" : "拒绝上传"
+  }`
+);
+console.log(
+  `  BROWSER 会话:          空闲 TTL=${env.BROWSER_SESSION_TTL_S}s｜并发上限=${env.BROWSER_MAX_SESSIONS}｜拖拽步数=${env.BROWSER_DRAG_STEPS}`
+);
+// [FIX-SILENT-02] 关闸时把「为什么会什么也没发生」写在启动日志里：
+//   开关关闭 → 四个工具不在模型可见列表，模型连拒绝的理由都拿不到。
+if (!env.BROWSER_ENABLED) {
+  console.log("  ⚠️  浏览器工具未启用：open/observe/act/close 四个工具不在模型可见列表内，");
+  console.log("      模型收到「打开浏览器」只会说做不到，不会产生任何浏览器动作。启用方式二选一：");
+  console.log("      ① 配置页 › 浏览器工具配置 › 浏览器工具总开关 → 打开（保存即生效，无需重启）");
+  console.log("      ② .env 写入 BROWSER_ENABLED=true 后重启");
+  console.log("      如需亲眼看到浏览器窗口，再设 BROWSER_HEADLESS=false（默认无头，窗口不可见）。");
+}
 console.log("=".repeat(60));
 
 /**

@@ -189,7 +189,11 @@ export async function loadTools(): Promise<void> {
         for await (const rel of glob.scan({ cwd: TOOLS_ROOT, absolute: false })) {
             // [US-CFG-1] 跳过以 _ 开头的共享模块（如 local/_shared.ts），
             // 它们不导出 tools，仅被其他工具 import。
-            const base = rel.split("/").pop() ?? "";
+            // [FIX-WIN-01] Windows 下 glob 返回反斜杠相对路径（如 internet\_browser_cdp.ts），
+            //   旧写法 rel.split("/") 切不开 → base 变成整串 → 下面「_ 前缀跳过」完全失效，
+            //   启动日志会刷出一串「工具文件未导出 tools 数组，已跳过: internet\_browser_xxx.ts」。
+            const relPath = rel.replace(/\\/g, "/");
+            const base = relPath.split("/").pop() ?? "";
             if (base.startsWith("_")) continue;
 
             const full = resolve(TOOLS_ROOT, rel);

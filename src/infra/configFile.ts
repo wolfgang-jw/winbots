@@ -37,7 +37,7 @@ const KEEP_BACKUPS = 20;
 // ============================================
 
 export type ConfigType = "int" | "bool" | "enum" | "string" | "secret";
-export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab" | "internet";
+export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab" | "internet" | "browser";
 
 export interface ConfigKeyMeta {
   key: string;
@@ -53,6 +53,11 @@ export interface ConfigKeyMeta {
    * 仅为 true 时才受限制；未声明视为「非必需」——但非密文项本身也不支持清空（§9.2 适用范围）。
    */
   required?: boolean;
+  /**
+   * [R-04] 允许写空值：仅用于「留空 = 未配置」这类语义（如 BROWSER_PROFILE_DIR）。
+   * 未声明时按原规则——string/secret 一律不允许留空（§9.2）。
+   */
+  allowEmpty?: boolean;
   enumValues?: readonly string[];
   min?: number;
   max?: number;
@@ -62,7 +67,9 @@ export interface ConfigKeyMeta {
   desc: string;
 }
 
-/** 22 项全量白名单（16 项原有 + 6 项互联网工具；顺序与 .env.example 一致；需求 §4.2 / §9.1） */
+/** 34 项全量白名单（16 项原有 + 6 项互联网工具 + 12 项浏览器工具；需求 §4.2 / §9.1 / BR-62）
+ *  [R-04] 浏览器组由 10 项扩到 12 项：补 BROWSER_PROFILE_DIR（选 persist 却无处填目录）
+ *         与 BROWSER_SESSION_TTL_S（「浏览器自己就关掉」的直接旋钮，原先只能手工改 .env + 重启）。 */
 export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   {
     key: "APP_PORT", group: "app", groupTitle: "应用配置", type: "int",
@@ -183,13 +190,82 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
     label: "抓取回灌上限（字符）", defaultValue: "8000", min: 200,
     desc: "单次抓取正文回灌给模型的字符上限，超限按三要素标注截断状态（R-41/R-24）。",
   },
+
+  // ============================================
+  // [需求域 BR / US-BR-05] 浏览器工具配置（12 项进配置页，BR-62）
+  //   进配置页的是「用户需要决定的策略」；端口、TTL、并发、名单等手工维护，不进白名单。
+  //   校验类型：布尔→bool、整数→int、枚举→enum、路径→string（§13.3-3）。
+  //   ⚠️ 文本项默认不能留空（validateValue 对 string 返回「不能为空」），
+  //      因此「空 = 自动探测」改用固定取值 auto 表达（§13.3-4）。
+  //      [R-04] 例外：BROWSER_PROFILE_DIR 显式声明 allowEmpty，用于表达「留空 = 未配置」。
+  // ============================================
+  {
+    key: "BROWSER_ENABLED", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
+    label: "浏览器工具总开关", defaultValue: "false",
+    desc: "控制 open / observe / act / close 四个工具是否出现在模型可见工具列表中；保存后热更立即生效。默认关闭：开启后模型可让真实浏览器点击真实按钮（可能产生下单、发帖等真实后果）。",
+  },
+  {
+    key: "BROWSER_EXECUTABLE_PATH", group: "browser", groupTitle: "浏览器工具配置", type: "string",
+    label: "浏览器可执行文件路径", defaultValue: "auto",
+    desc: "填 auto 表示自动探测（Edge → Chrome，含 32/64 位 Program Files 与用户级安装目录）；也可填绝对路径覆盖探测结果，路径不存在时启动会失败并列出已尝试路径。",
+  },
+  {
+    key: "BROWSER_HEADLESS", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
+    label: "无头模式", defaultValue: "true",
+    desc: "true=不显示窗口（默认）；false=显示窗口，便于观察模型操作、也便于拖拽一类对无头环境敏感的交互。",
+  },
+  {
+    key: "BROWSER_PROFILE_MODE", group: "browser", groupTitle: "浏览器工具配置", type: "enum",
+    label: "用户数据目录模式", defaultValue: "temp", enumValues: ["temp", "persist"],
+    desc: "temp=每次新建临时目录、会话关闭即删（默认，不继承日常 cookie）；persist=复用固定目录，等于把登录态交给模型，需同时配置 BROWSER_PROFILE_DIR。",
+  },
+  {
+    key: "BROWSER_PROFILE_DIR", group: "browser", groupTitle: "浏览器工具配置", type: "string",
+    label: "持久化用户数据目录", defaultValue: "", allowEmpty: true,
+    desc: "仅在「用户数据目录模式=persist」时使用；留空＝未配置，会回退为临时目录并在日志告警。请填独立目录（如 data/browser-profile），切勿指向你日常 Edge/Chrome 的用户数据目录——那样模型会拿到你真实的 Cookie 与登录态。",
+  },
+  {
+    key: "BROWSER_SESSION_TTL_S", group: "browser", groupTitle: "浏览器工具配置", type: "int",
+    label: "会话空闲回收（秒）", defaultValue: "180", min: 10, max: 86400,
+    desc: "模型超过该时长未调用浏览器工具，会话会被自动回收（浏览器随之关闭）。注意：你在窗口里自己点、自己滚不算「活动」，只有工具调用才算。觉得窗口关得太快就把这里调大（如 1800 = 30 分钟）。",
+  },
+  {
+    key: "BROWSER_ACTION_TIMEOUT_MS", group: "browser", groupTitle: "浏览器工具配置", type: "int",
+    label: "单步动作超时（毫秒）", defaultValue: "8000", min: 500, max: 120000,
+    desc: "单个动作（定位 + 交互 + 变更等待）的超时上限；超时返回 action_timeout，可重试一次。页面脚本繁忙时适当调大。",
+  },
+  {
+    key: "BROWSER_NAV_TIMEOUT_MS", group: "browser", groupTitle: "浏览器工具配置", type: "int",
+    label: "导航超时（毫秒）", defaultValue: "20000", min: 1000, max: 300000,
+    desc: "open 与 action=nav 的导航超时上限（判据是加载完成 + 稳定窗口，不是命令返回）；超时返回 navigation_timeout。",
+  },
+  {
+    key: "BROWSER_SNAPSHOT_MAX_CHARS", group: "browser", groupTitle: "浏览器工具配置", type: "int",
+    label: "快照正文字符上限", defaultValue: "6000", min: 200, max: 12000,
+    desc: "单次返回的正文切片上限；超长正文可用 observe 的 offset 分页续读。上限过高会挤占模型上下文，总结果另有 24000 字符硬预算。",
+  },
+  {
+    key: "BROWSER_BLOCK_PRIVATE_NET", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
+    label: "私有网段阻断", defaultValue: "true",
+    desc: "在浏览器内部对每个请求判定目标地址，命中回环/私有/链路本地地址即阻断（覆盖页面内跳转、子资源与脚本请求）。关闭后仅校验入参 URL，存在内网探测风险。",
+  },
+  {
+    key: "BROWSER_ALLOW_DOWNLOAD", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
+    label: "允许下载", defaultValue: "false",
+    desc: "默认拒绝：页面触发的下载会被取消且不落盘。开启后模型可让页面把文件写到本机，请自行评估风险；该开关不对模型可见。",
+  },
+  {
+    key: "BROWSER_ALLOW_UPLOAD", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
+    label: "允许上传/文件选择", defaultValue: "false",
+    desc: "默认拒绝：文件选择弹窗被拦截，涉及上传的动作会失败。开启后模型可让页面读取本机文件，请自行评估风险；该开关不对模型可见。",
+  },
 ] as const;
 
 /** 键名白名单集合（PUT 校验用） */
 export const CONFIG_KEY_SET: ReadonlySet<string> = new Set(CONFIG_KEYS.map((m) => m.key));
 
 /** 分组顺序（前端渲染顺序） */
-export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab", "internet"];
+export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab", "internet", "browser"];
 
 // ============================================
 // 校验
@@ -220,7 +296,9 @@ export function validateValue(meta: ConfigKeyMeta, raw: string): string | null {
     case "secret":
       return t === "" ? "不能为空" : null;
     default:
-      return t === "" ? "不能为空" : null;
+      // [R-04] allowEmpty 的项允许留空（语义由该项 desc 说明）
+      if (t === "") return meta.allowEmpty ? null : "不能为空";
+      return null;
   }
 }
 
@@ -262,12 +340,28 @@ export function parseEnvText(text: string): Map<string, string> {
 /**
  * 逐键替换：仅改写 changes 中出现的键，其余行（含注释、空行、无法解析的行）原样保留。
  * 文件中不存在的新键 → 追加到末尾。
+ *
+ * [FIX-DUP-01] 同名键出现多次时必须**全部改写**，不能只改第一处。
+ *
+ * 起因（现场故障 2026-10-22 第三例）：用户把 `.env.example` 的整段浏览器配置块
+ * 追加到 `.env` 末尾，于是 `BROWSER_ENABLED` 出现两次（前 true / 后 false）。
+ * 旧实现用 `pending.delete(key)` 命中第一处后即从待改集合移除，后续同名行原样保留：
+ *   - 配置页保存 → 只把**第一行**改成新值，末尾那行 false 仍在；
+ *   - `reloadEnvExcluding` / `parseEnvText` 都是「按文件顺序，后者覆盖前者」，
+ *     于是运行时读到的仍是末尾的 false —— 页面回执「已保存并热更」，
+ *     但开关状态毫无变化，且没有任何提示。
+ *
+ * 修法：命中一处后**不**从 pending 移除（只记入 found），使同名行全部被改成同一个值；
+ * 这样无论按「首个」还是「最后一个」生效，结果都一致，重复键退化为无害。
+ * 不改动行的位置、缩进与注释，避免误删用户内容。
  */
 export function mergeEnvText(snapshot: EnvFileSnapshot, changes: Record<string, string>): string {
   const pending = new Map<string, string>(
     Object.entries(changes).map(([k, v]) => [k, String(v).trim()] as [string, string]),
   );
   const lines = snapshot.exists ? snapshot.text.split(/\r?\n/) : [];
+  /** 文件中确实存在过的键（用于区分「需追加的新键」/「同名多处」） */
+  const found = new Set<string>();
 
   const out = lines.map((line) => {
     const trimmed = line.trim();
@@ -280,16 +374,37 @@ export function mergeEnvText(snapshot: EnvFileSnapshot, changes: Record<string, 
     if (!pending.has(key)) return line;
 
     // 保留原行「= 之前的一切」，只替换 = 之后的内容（不改动缩进与行尾空白风格）
+    found.add(key);
     const value = pending.get(key)!;
-    pending.delete(key);
     const eqIdxInLine = line.indexOf("=");
     return line.slice(0, eqIdxInLine + 1) + value;
   });
 
-  // 未在文件中出现的键 → 追加（单独成行）
-  for (const [k, v] of pending) out.push(`${k}=${v}`);
+  // 仅「文件中完全没有出现」的键 → 追加（单独成行）
+  for (const [k, v] of pending) {
+    if (found.has(k)) continue;
+    out.push(`${k}=${v}`);
+  }
 
   return out.join(snapshot.eol);
+}
+
+/**
+ * [FIX-DUP-01] 统计文本中同名键的出现次数（>1 即重复键）。
+ * 供保存路径显式告警：重复键是「改了却不生效」最常见的原因，必须喊出来。
+ */
+export function countDuplicateKeys(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  for (const [k, n] of [...counts]) if (n < 2) counts.delete(k);
+  return counts;
 }
 
 // ============================================
@@ -374,6 +489,8 @@ export interface ConfigItem {
   secret: boolean;
   /** [R-17 / §9.2] 必需项不显示「清空」按钮（UI 依据）；未声明视为非必需 */
   required?: boolean;
+  /** [R-04] 该项允许留空（前端应放行空值提交，如 BROWSER_PROFILE_DIR） */
+  allowEmpty?: boolean;
   /** secret 键：文件中是否已有非空值 */
   hasValue?: boolean;
   /** secret 键：掩码，如 sk-****cdef */
@@ -418,6 +535,7 @@ export function buildConfigItems(
       key: meta.key, group: meta.group, groupTitle: meta.groupTitle,
       type: meta.type, label: meta.label, desc: meta.desc,
       value: raw, secret: !!meta.secret, required: meta.required === true,
+      allowEmpty: meta.allowEmpty === true,
       enumValues: meta.enumValues, min: meta.min, max: meta.max,
       shadowed: shadowed.has(meta.key),
       restartRequired: restartOnly.has(meta.key),
@@ -519,6 +637,17 @@ export function applyConfigChanges(
   // ④ 合并 + 原子写（清空项以空串进入同一写入映射，逐键替换后落盘为 KEY=）
   const writeMap: Record<string, string> = { ...changes };
   for (const k of clearKeys) writeMap[k] = "";
+  // [FIX-DUP-01] 重复键显式告警：本次写盘会把**所有同名行**改成同一个值，
+  //   但仍建议用户删掉多余行 —— 否则日后手工编辑第一行时会出现「改了不生效」。
+  const dupInFile = countDuplicateKeys(snap.text);
+  const dupTouched = [...dupInFile.entries()].filter(([k]) => k in writeMap);
+  if (dupTouched.length > 0) {
+    console.warn(
+      `⚠️  [.env] 以下键在文件中重复出现，本次已把全部同名行改成同一值：` +
+        dupTouched.map(([k, n]) => `${k}×${n}`).join(", ") +
+        `；建议删掉多余行，避免日后手工改第一行却不生效。`,
+    );
+  }
   const next = mergeEnvText(snap, writeMap);
   const w = writeEnvAtomic(next);
   if (!w.ok) {

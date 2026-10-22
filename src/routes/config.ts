@@ -3,7 +3,7 @@
  * 配置读写接口（配置页专用）
  *
  * 挂载点：/api/config
- *   - GET  /api/config        读取全部配置（当前 22 项，密钥不回显）
+ *   - GET  /api/config        读取全部配置（当前 34 项，密钥不回显）
  *   - PUT  /api/config        修改配置并写回 .env（需 confirm: true；[R-17] 支持 clear 字段清空密钥）
  *
  * 安全：仅写入白名单键；值禁换行；不回显/不记录密钥明文（需求 §4.7）。
