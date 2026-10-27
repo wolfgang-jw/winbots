@@ -254,23 +254,34 @@ export interface EnvConfig {
   INTERNET_STORE_MAX_CHARS_PER_ITEM: number;    // 暂存单条字符上限（R-30，默认 200000）
   INTERNET_STORE_MAX_CHARS_TOTAL: number;       // 暂存全局字符上限（R-30，默认 4 MB）
 
-  // [需求域 BR / US-BR-01] 浏览器工具配置（21 项，全部可选，带默认值；不加入 REQUIRED_VARS，BR-61）
-  //   [R-07] 已删除 BROWSER_MAX_TABS：全仓零引用的死配置（单标签语义 XB-01 下无实际用途），
-  //   留着只会让人以为「改了有用」。若日后需要拦截弹窗新标签，应在驱动层按 Target 计数实现。
+  // [需求域 BR / US-BR-01] 浏览器工具配置（25 项，全部可选，带默认值；不加入 REQUIRED_VARS，BR-61）
+  //   [R-07 → REQ-browser BR-22] BROWSER_MAX_TABS 曾以「单标签语义 XB-01 下无实际用途」为由删除，
+  //   P3 交付标签栈后它是**必需**的：既是单会话标签数上限，也是唯一的回滚旋钮
+  //   （NB-04：设为 1 即退回单标签语义 —— 同标签导航、不登记站点新标签、不输出标签清单）。
   //   §13.2 解析规则：默认关闭的布尔「显式 true 才开」，默认开启的布尔「显式 false 才关」。
   BROWSER_ENABLED: boolean;                     // 总开关（默认关闭，BR-51）
   BROWSER_EXECUTABLE_PATH: string;              // 可执行文件路径；auto = 自动探测 Edge → Chrome
+  // [REQ-browser BR-10 / NB-04] 窗口置前开关（默认开启）。关闭后 open 不做任何窗口激活，
+  //   且 buildArgs 也不再追加 --start-maximized —— INC-02 的唯一回滚旋钮。
+  BROWSER_FOREGROUND_ON_OPEN: boolean;
   BROWSER_HEADLESS: boolean;                    // 无头（默认开启）
   BROWSER_DEBUG_PORT: number;                   // 0 = 随机；固定值用于端口冲突场景
   BROWSER_PROFILE_MODE: BrowserProfileMode;     // temp / persist
   BROWSER_PROFILE_DIR: string;                  // 仅 persist 使用
   BROWSER_SESSION_TTL_S: number;                // 会话空闲 TTL（默认 180s）
   BROWSER_MAX_SESSIONS: number;                 // 并发会话上限（默认 2）
+  // [REQ-browser BR-22/NB-04] 单会话标签数上限（默认 10，范围 1–20）；=1 即退回单标签语义
+  BROWSER_MAX_TABS: number;
   BROWSER_ACTION_TIMEOUT_MS: number;            // 单步动作超时（默认 8000）
   BROWSER_NAV_TIMEOUT_MS: number;               // 导航超时（默认 20000）
   BROWSER_STABLE_WINDOW_MS: number;             // 稳定窗口（默认 400）
   BROWSER_SNAPSHOT_MAX_ELEMENTS: number;        // 快照元素上限（默认 120）
   BROWSER_SNAPSHOT_MAX_CHARS: number;           // 快照正文字符上限（默认 6000）
+  // [REQ-browser BR-33] extract 的两个上限。**语义独立于快照上限**：
+  //   快照是「整页概览」（元素多、正文短），extract 是「局部细读」（单元素深、清单短），
+  //   共用一个键会让调大取文上限时把快照一起撑爆（违反 BR-32 的单次结果硬预算）。
+  BROWSER_EXTRACT_MAX_CHARS: number;            // 单次 extract 回灌字符上限（默认 12000，硬上限 24000）
+  BROWSER_EXTRACT_MAX_ELEMENTS: number;         // extract 命中清单条数上限（默认 20）
   BROWSER_MAX_ACTIONS: number;                  // 单次动作数上限（默认 10）
   BROWSER_DOMAIN_ALLOWLIST: string;             // 域名白名单（逗号分隔，空=不额外限制）
   BROWSER_DOMAIN_BLOCKLIST: string;             // 域名黑名单（优先于白名单）
@@ -423,11 +434,17 @@ function validateEnv(): EnvConfig {
     INTERNET_STORE_MAX_CHARS_TOTAL:
       parseInt(Bun.env.INTERNET_STORE_MAX_CHARS_TOTAL || "4194304", 10) || 4194304,
 
-    // [需求域 BR / US-BR-01] 浏览器工具配置（21 项，缺失/非法一律回退默认，不退出进程，BR-61）
+    // [需求域 BR / US-BR-01] 浏览器工具配置（25 项，缺失/非法一律回退默认，不退出进程，BR-61）
     //   总开关：默认关闭（BR-51）；[FIX-SILENT-01] 容错 true/1/yes/on，无法识别时取默认并告警
     BROWSER_ENABLED: parseBoolLoose(Bun.env.BROWSER_ENABLED, false, "BROWSER_ENABLED"),
     //   可执行文件：auto（或留空）= 自动探测 Edge → Chrome；显式路径必须存在，否则启动失败并列出已尝试路径
     BROWSER_EXECUTABLE_PATH: (Bun.env.BROWSER_EXECUTABLE_PATH || "auto").trim() || "auto",
+    //   [REQ-browser BR-10] 置前：默认开启（显式 false/0/no/off 才关）；不进配置页（需求 §5）
+    BROWSER_FOREGROUND_ON_OPEN: parseBoolLoose(
+      Bun.env.BROWSER_FOREGROUND_ON_OPEN,
+      true,
+      "BROWSER_FOREGROUND_ON_OPEN"
+    ),
     //   无头：默认开启；[FIX-SILENT-01] 容错 false/0/no/off（写 False 也认）
     BROWSER_HEADLESS: parseBoolLoose(Bun.env.BROWSER_HEADLESS, true, "BROWSER_HEADLESS"),
     //   调试端口：0 = 随机（**合法语义**，不得被「0 取默认」吞掉，见 parseDebugPort）
@@ -436,11 +453,16 @@ function validateEnv(): EnvConfig {
     BROWSER_PROFILE_DIR: (Bun.env.BROWSER_PROFILE_DIR || "").trim(),
     BROWSER_SESSION_TTL_S: numOr(Bun.env.BROWSER_SESSION_TTL_S, 180, 10, 86400),
     BROWSER_MAX_SESSIONS: numOr(Bun.env.BROWSER_MAX_SESSIONS, 2, 1, 10),
+    //   [REQ-browser BR-22/NB-04] 标签上限：默认 10，钳制到 1–20；=1 即「退回单标签语义」的回滚旋钮
+    BROWSER_MAX_TABS: numOr(Bun.env.BROWSER_MAX_TABS, 10, 1, 20),
     BROWSER_ACTION_TIMEOUT_MS: numOr(Bun.env.BROWSER_ACTION_TIMEOUT_MS, 8000, 500, 120000),
     BROWSER_NAV_TIMEOUT_MS: numOr(Bun.env.BROWSER_NAV_TIMEOUT_MS, 20000, 1000, 300000),
     BROWSER_STABLE_WINDOW_MS: numOr(Bun.env.BROWSER_STABLE_WINDOW_MS, 400, 0, 5000),
     BROWSER_SNAPSHOT_MAX_ELEMENTS: numOr(Bun.env.BROWSER_SNAPSHOT_MAX_ELEMENTS, 120, 1, 1000),
     BROWSER_SNAPSHOT_MAX_CHARS: numOr(Bun.env.BROWSER_SNAPSHOT_MAX_CHARS, 6000, 200, 12000),
+    //   [REQ-browser BR-33] extract：回灌上限默认 12000（硬上限 24000，见 HARD_MAX_CHARS），清单默认 20 条
+    BROWSER_EXTRACT_MAX_CHARS: numOr(Bun.env.BROWSER_EXTRACT_MAX_CHARS, 12000, 500, 24000),
+    BROWSER_EXTRACT_MAX_ELEMENTS: numOr(Bun.env.BROWSER_EXTRACT_MAX_ELEMENTS, 20, 1, 200),
     BROWSER_MAX_ACTIONS: numOr(Bun.env.BROWSER_MAX_ACTIONS, 10, 1, 30),
     BROWSER_DOMAIN_ALLOWLIST: (Bun.env.BROWSER_DOMAIN_ALLOWLIST || "").trim(),
     BROWSER_DOMAIN_BLOCKLIST: (Bun.env.BROWSER_DOMAIN_BLOCKLIST || "").trim(),
@@ -522,7 +544,9 @@ function detectEnvAnomalies(): void {
     //   否则 `KEY="a # b"`（密码/URL 带 #）会被误报「含行内注释」。
     if (stripInlineComment(last) === last) continue;
     // 只提示布尔/数值这类「不该带注释」的键，避免对路径、密钥类误报
-    if (!/(_ENABLED|_HEADLESS|_PRIVATE_NET|_ALLOW_[A-Z]+|_THINKING)$/.test(key)) continue;
+    // [REQ-browser BR-10] 补 _ON_OPEN：新键以 _ON_OPEN 结尾，不命中原有分组，
+    //   否则 `BROWSER_FOREGROUND_ON_OPEN=true   # 开` 这类写法不会被告警（解析仍正确，只是少了提示）
+    if (!/(_ENABLED|_HEADLESS|_PRIVATE_NET|_ALLOW_[A-Z]+|_THINKING|_ON_OPEN)$/.test(key)) continue;
     console.warn(
       `⚠️  [.env] ${key} 的值里含行内注释，实际解析按注释前的部分处理（原始值 "${last}"）。` +
         `建议把注释单独写一行，避免歧义。`
@@ -609,7 +633,9 @@ console.log(
   `  BROWSER 窗口:          ${env.BROWSER_HEADLESS ? "无头" : "有头（显示窗口）"}` +
     `（原始值=${
       Bun.env.BROWSER_HEADLESS === undefined ? "未设置" : JSON.stringify(Bun.env.BROWSER_HEADLESS)
-    }）`
+    }）` +
+    // [REQ-browser BR-10] 置前开关：用户反馈「窗口还是在后面」时，第一眼看的就是这一行
+    `｜置前=${env.BROWSER_FOREGROUND_ON_OPEN ? "开启" : "关闭"}`
 );
 console.log(
   `  BROWSER profile:       ${
@@ -625,6 +651,11 @@ console.log(
 console.log(
   `  BROWSER 快照:          元素=${env.BROWSER_SNAPSHOT_MAX_ELEMENTS} 个｜正文=${env.BROWSER_SNAPSHOT_MAX_CHARS} 字符｜单次动作=${env.BROWSER_MAX_ACTIONS} 个`
 );
+// [REQ-browser BR-33] extract 的两个上限与快照分列：调大取文不该顺带撑爆快照，一眼能看出各自的值
+console.log(
+  `  BROWSER 取文(extract): 单次=${env.BROWSER_EXTRACT_MAX_CHARS} 字符｜清单=${env.BROWSER_EXTRACT_MAX_ELEMENTS} 个`
+);
+// [REQ-browser BR-27] 工具面 4 → 5：关闸提示里补上 extract，避免用户以为只有四个工具
 console.log(
   `  BROWSER 域名策略:      白名单=${
     env.BROWSER_DOMAIN_ALLOWLIST || "空（不额外限制）"
@@ -638,12 +669,12 @@ console.log(
   }`
 );
 console.log(
-  `  BROWSER 会话:          空闲 TTL=${env.BROWSER_SESSION_TTL_S}s｜并发上限=${env.BROWSER_MAX_SESSIONS}｜拖拽步数=${env.BROWSER_DRAG_STEPS}`
+  `  BROWSER 会话:          空闲 TTL=${env.BROWSER_SESSION_TTL_S}s｜并发上限=${env.BROWSER_MAX_SESSIONS}｜标签上限=${env.BROWSER_MAX_TABS}${env.BROWSER_MAX_TABS <= 1 ? "（单标签模式）" : ""}｜拖拽步数=${env.BROWSER_DRAG_STEPS}`
 );
 // [FIX-SILENT-02] 关闸时把「为什么会什么也没发生」写在启动日志里：
 //   开关关闭 → 四个工具不在模型可见列表，模型连拒绝的理由都拿不到。
 if (!env.BROWSER_ENABLED) {
-  console.log("  ⚠️  浏览器工具未启用：open/observe/act/close 四个工具不在模型可见列表内，");
+  console.log("  ⚠️  浏览器工具未启用：open/observe/act/extract/close 五个工具不在模型可见列表内，");
   console.log("      模型收到「打开浏览器」只会说做不到，不会产生任何浏览器动作。启用方式二选一：");
   console.log("      ① 配置页 › 浏览器工具配置 › 浏览器工具总开关 → 打开（保存即生效，无需重启）");
   console.log("      ② .env 写入 BROWSER_ENABLED=true 后重启");

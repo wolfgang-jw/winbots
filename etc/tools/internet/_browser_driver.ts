@@ -14,6 +14,13 @@ import type { ChildProcess } from "node:child_process";
 import { env } from "@/infra/env";
 import { CdpConnection, CdpClosedError } from "./_browser_cdp";
 import { buildArgs, proc } from "./_browser_proc";
+// [REQ-browser BR-01/BR-03] 目标发现与计数落在 _browser_targets.ts（NB-01：驱动不再承载标签逻辑）
+import { ensureStartupPageTarget, tabFacts } from "./_browser_targets";
+// [REQ-browser BR-10] 置前：类型 + 三步协议序列（序列在 _browser_foreground.ts，NB-01：驱动不再增长）
+import { bringWindowToFront, type ForegroundResult } from "./_browser_foreground";
+// [REQ-browser BR-16～BR-26] 标签中心：注册 / 附着 / 切换 / 关闭 / 编号 / 目标事件
+//   NB-01：这些逻辑写在 _browser_targets.ts，驱动只留转发方法与「按活跃标签解析会话 id」
+import { TargetHub, type TabBrief, type TabOp, type TabsSnapshot } from "./_browser_targets";
 
 // ============================================================
 // 类型：事实与失败类别
@@ -27,7 +34,9 @@ export type DriverFailureKind =
   | "timeout"
   | "cancelled"
   | "closed"
-  | "launch_failed";
+  | "launch_failed"
+  /** [REQ-browser BR-27] 驱动/内核不支持该命令，或页面内库缺少该原语（非超时、非网络） */
+  | "unsupported";
 
 export type DriverResult<T> =
   | { ok: true; value: T }
@@ -102,7 +111,8 @@ export interface NavigateOptions {
 
 /** 驱动契约：域内模块只依赖这个接口 */
 export interface BrowserDriver {
-  launch(o: LaunchOptions): Promise<DriverResult<{ port: number }>>;
+  // [REQ-browser BR-02] 返回值追加可选 tabs（启动完成时的 page 目标数）；既有 port 字段不变
+  launch(o: LaunchOptions): Promise<DriverResult<{ port: number; tabs?: number }>>;
   shutdown(): Promise<void>;
   navigate(url: string, o: NavigateOptions): Promise<DriverResult<{ url: string; title: string; timedOut: boolean }>>;
   collectFacts(): Promise<DriverResult<CollectedFacts>>;
@@ -135,6 +145,98 @@ export interface BrowserDriver {
   isClosed(): boolean;
   /** 子进程号（进程级兜底清理用；假驱动可不实现） */
   processId?(): number | null;
+  /**
+   * [REQ-browser BR-27/BR-28] 按 CSS 选择器或 ref / 锚点取局部内容（**只读**）。
+   * 追加方法、可选实现：假驱动未实现时 `extract` 返回 internal_error，
+   * 其余 4 个工具完全不受影响（NB-03：接口只允许追加，不改既有签名）。
+   */
+  extractContent?(q: ExtractRequest): Promise<DriverResult<ExtractPayload>>;
+  /**
+   * [REQ-browser BR-02] 会话内 page 目标数与当前激活标签序号（1 起）。
+   * 追加方法、可选实现：假驱动未实现时调用方按 1/1 缺省（NB-03）。
+   */
+  tabs?(): Promise<DriverResult<TabsFact>>;
+  /**
+   * [REQ-browser BR-10/BR-11] 把窗口带到最前：取窗口 → 恢复窗口状态（仅最小化时）→ 激活页面。
+   * 追加方法、可选实现：假驱动未实现时调用方按「不适用」处理，**不因缺方法而让 open 失败**（NB-03）。
+   * 语义是「尽力而为」：不抛错，失败只在返回值里体现（BR-13）。
+   */
+  bringToFront?(): Promise<ForegroundResult>;
+  /**
+   * [REQ-browser BR-17/BR-26] 与真实目标集合对账，返回当前标签摘要。
+   * 追加方法、可选实现：假驱动未实现时调用方按「单标签隐式态」处理（NB-03）。
+   */
+  getTargets?(): Promise<TabOp<TabsSnapshot>>;
+  /** [REQ-browser BR-16] 新建标签（`url` 传 about:blank，随后的导航仍走 navigate：见 P3 文档 §5 的 P-1） */
+  createTarget?(url: string, maxTabs: number): Promise<TabOp<TabBrief>>;
+  /** [REQ-browser BR-18] 切换活动标签（1 起序号 / prev / next） */
+  switchTarget?(sel: number | "prev" | "next"): Promise<TabOp<{ index: number; count: number; targetId: string }>>;
+  /** [REQ-browser BR-23] 关闭当前标签并回退（`targetId` = 回退后的活动标签） */
+  closeTarget?(): Promise<TabOp<{ closedIndex: number; index: number; count: number; targetId: string }>>;
+}
+
+/**
+ * [REQ-browser BR-02/BR-21] 标签事实。
+ * P1 只定义 { count, activeIndex }；P3 只**追加可选** list，P1 的调用方与用例不受影响。
+ */
+export interface TabsFact {
+  count: number;
+  activeIndex: number;
+  /** 存活标签清单（序号 / 地址 / 标题），供快照头部与结果文案使用 */
+  list?: TabBrief[];
+}
+
+/**
+ * [REQ-browser BR-27] 取文请求（页面侧 content(q) 的入参）。
+ * 字段全部必填并由域内 `_browser_extract.ts::planOf` 统一归一：
+ * 驱动层不做任何默认值填充，否则「谁负责缺省」会在两层之间漂移。
+ */
+export interface ExtractRequest {
+  /** CSS 选择器（与 ref 二选一；ref 非空时本字段为空串） */
+  selector: string;
+  /** 目标元素的 data-wb-ref 值（空串 = 未指定） */
+  ref: string;
+  /** ref 在页面上找不到时的锚点兜底（与 act 的 locateByAnchor 同一套字段） */
+  anchor: ElementAnchor | null;
+  /** 1 起的命中序号；0 = 未指定（只有一个可选命中时自动取它） */
+  index: number;
+  /** 正文起始偏移（仅对已选定的那一个元素生效） */
+  offset: number;
+  includeHidden: boolean;
+  includeHtml: boolean;
+  /** 清单条数上限 = BROWSER_EXTRACT_MAX_ELEMENTS */
+  maxItems: number;
+  /** 单元素正文上限（固定 2000，BR-33） */
+  itemChars: number;
+}
+
+/**
+ * [REQ-browser BR-27/BR-29/BR-30] 取文结果（页面侧 `content()` 的返回）。
+ * 「选择器语法非法」用 `badSelector` 标记表达，而**不是** DriverFailureKind ——
+ * 后者是「驱动/传输层」的失败类别，把域内语法判定塞进去会让 mapKind 多出无意义的映射。
+ */
+export interface ExtractPayload {
+  badSelector?: boolean;
+  hits?: number;
+  visibleHits?: number;
+  skipped?: number;
+  avail?: number;
+  /** ref 与锚点都没在页面上命中（元素已被移除） */
+  missRef?: boolean;
+  truncated?: number;
+  items?: Array<{
+    tag: string;
+    role: string;
+    chars: number;
+    visible: boolean;
+    ref: string;
+    preview: string;
+  }>;
+  /** 仅当已选定某个元素时存在 */
+  body?: string;
+  bodyStart?: number;
+  bodyTotal?: number;
+  html?: string;
 }
 
 // ============================================================
@@ -143,8 +245,21 @@ export interface BrowserDriver {
 
 const PAGE_LIB = `(function () {
   var V = 3;
-  if (window.__wb && window.__wb.v === V) return;
+  // [REQ-browser BR-27] ID / REF 两个常量必须**提到守卫之前**赋值：
+  //   补装路径下守卫会直接 return，而 content()/byRef() 都要读 REF ——
+  //   var 声明提升但**赋值不提升**，放在守卫之后会让 REF === undefined，
+  //   byRef 拼出 '[undefined="e12"]' → ref 分支恒未命中、正文恒为空（且本地假驱动测不出来）。
+  //   （ids / seq 仍必须留在守卫之后：它们是「重建即出错」的状态，见下）
   var ID = 'data-wb-k', REF = 'data-wb-ref';
+  if (window.__wb && window.__wb.v === V) {
+    // [REQ-browser BR-27] 不 bump V：改版本会重置 ids/seq，而 DOM 上残留的 data-wb-k 不会消失，
+    //   于是 byId('k1') 可能命中旧元素（act 点到另一个元素）。
+    //   但旧库可能缺「后加的原语」，所以在守卫里**就地补装**，绝不重建 __wb 对象。
+    //   注：content / rawOf / elByAnchor 都是函数声明，在本 IIFE 作用域内已提升，此处可直接引用；
+    //       它们只调用 norm / cut / visible / roleOf / anchorOf / byRef 等纯函数，不碰 ids/seq/__wbCount。
+    if (typeof window.__wb.content !== 'function') window.__wb.content = content;
+    return;
+  }
   var ids = new WeakMap();
   var seq = 0;
   if (typeof window.__wbCount !== 'number') window.__wbCount = 0;
@@ -307,6 +422,90 @@ const PAGE_LIB = `(function () {
     var b = document.body;
     var t = b ? (b.innerText || b.textContent || '') : '';
     return String(t).replace(/[\\t\\r]+/g, ' ').replace(/ {2,}/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
+  }
+
+  // [REQ-browser BR-27/BR-28/BR-32] 按定位取局部内容的**只读**原语：
+  //   不写 DOM（不 setAttribute）、不碰 ids/seq（不调 idOf）、不碰 __wbCount（不建观察器）。
+  //   BR-32 的三道门也在页面侧完成：tag 黑名单、可见性、表单值不回（只取 innerText/textContent，
+  //   天然不含 input.value，因此密码框不会经由这里泄出）。
+  //   ⚠️ 本函数被守卫处的「补装」路径引用，必须是**函数声明**（提升），不能改成 var 赋值。
+  function content(q) {
+    q = q || {};
+    var BLOCK = { script: 1, style: 1, noscript: 1, template: 1, head: 1, meta: 1, link: 1 };
+    var ref = String(q.ref || '');
+    var list = [];
+    var one = null;
+    if (ref) {
+      one = byRef(ref);
+      if (!one && q.anchor && q.anchor.tag) one = elByAnchor(q.anchor);
+      if (!one) return { ok: true, hits: 0, visibleHits: 0, skipped: 0, avail: 0, missRef: true, items: [], truncated: 0 };
+      list = [one];
+    } else {
+      try { list = Array.prototype.slice.call(document.querySelectorAll(String(q.selector || ''))); }
+      catch (e) { return { ok: false, why: 'bad_selector' }; }
+    }
+    var hits = list.length, vis = 0, skip = 0;
+    var keep = [];
+    var max = Math.max(1, Number(q.maxItems) || 20);
+    var cap = Math.max(100, Number(q.itemChars) || 2000);
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i], tag = String(el.tagName || '').toLowerCase();
+      if (BLOCK[tag] === 1) { skip++; continue; }
+      var shown = visible(el);
+      if (shown) vis++;
+      // ref 分支：目标元素即使当前不可见也要能取到正文，否则「按 ref 取文」恒为空
+      if (q.includeHidden || shown || ref) keep.push(el);
+    }
+    var want = Number(q.index) > 0 ? Math.trunc(Number(q.index)) : (keep.length === 1 ? 1 : 0);
+    var off = Math.max(0, Math.trunc(Number(q.offset) || 0));
+    var out = { ok: true, hits: hits, visibleHits: vis, skipped: skip, avail: keep.length, items: [], truncated: Math.max(0, keep.length - max) };
+    for (var k = 0; k < keep.length && k < max; k++) {
+      var e = keep[k];
+      var pre = rawOf(e);
+      out.items.push({
+        tag: String(e.tagName || '').toLowerCase(),
+        role: roleOf(e),
+        chars: pre.length,
+        visible: visible(e),
+        ref: (e.getAttribute && e.getAttribute(REF)) || '',
+        preview: cut(norm(pre), 60)
+      });
+    }
+    var target = want > 0 && want <= keep.length ? keep[want - 1] : null;
+    if (target) {
+      var full = rawOf(target);
+      // [REQ-browser BR-33] offset 语义与 observe **完全一致**：越界回绕到 0（既有行为，AC-20 要求一致）
+      var st = off >= full.length ? 0 : off;
+      out.body = full.slice(st, st + cap);
+      out.bodyStart = st;
+      out.bodyTotal = full.length;
+      if (q.includeHtml) out.html = cut(String(target.outerHTML || ''), cap);
+    }
+    return out;
+  }
+
+  /** [REQ-browser BR-32] 元素原文：innerText 优先（不可见元素返回空串），空了回退 textContent（与 nameOf 同口径） */
+  function rawOf(el) {
+    var v = String(el.innerText || '');
+    if (!norm(v)) v = String(el.textContent || '');
+    return v;
+  }
+
+  /** [REQ-browser BR-27] ref 失效时的锚点兜底：**返回元素**而不是 id（idOf 会写 DOM，BR-28 不允许） */
+  function elByAnchor(a) {
+    var all = [];
+    try { all = document.getElementsByTagName(String(a.tag)); } catch (e) { return null; }
+    var hit = null;
+    for (var i = 0; i < all.length; i++) {
+      var c = anchorOf(all[i]);
+      if (a.inputType && c.inputType !== a.inputType) continue;
+      if (a.name && c.name !== a.name) continue;
+      if (a.placeholder && c.placeholder !== a.placeholder) continue;
+      if (!a.name && !a.placeholder && (!a.text || c.text !== a.text)) continue;
+      if (hit) return null;      // 多于一个：不做猜测（与 idByAnchor 同口径）
+      hit = all[i];
+    }
+    return hit;
   }
 
   function assignRefs(pairs) {
@@ -488,6 +687,8 @@ const PAGE_LIB = `(function () {
     collect: collect,
     sig: sig,
     text: text,
+    // [REQ-browser BR-27] 按定位取局部内容（只读）；守卫里的「缺则补装」补的就是这个成员
+    content: content,
     assignRefs: assignRefs,
     idByRef: idByRef,
     idByAnchor: idByAnchor,
@@ -558,6 +759,13 @@ class ChromiumDriver implements BrowserDriver {
   private closeReason = "";
   private launchOpts: LaunchOptions | null = null;
   private blockedCount = 0;
+  /** [REQ-browser BR-02] 启动期选中的 page 目标；P3 起语义升级为**当前活动标签**的 targetId */
+  private targetId = "";
+  private startupTabs = 1;
+  /** [REQ-browser BR-16] targetId → 扁平会话 id（cmd 按活跃标签解析，见下） */
+  private readonly sidOf = new Map<string, string>();
+  /** [REQ-browser BR-17] 标签中心：注册/附着/切换/关闭/编号/目标事件（逻辑在 _browser_targets.ts） */
+  private hub: TargetHub | null = null;
 
   // ---------- 基础收发 ----------
 
@@ -568,7 +776,10 @@ class ChromiumDriver implements BrowserDriver {
   ): Promise<Record<string, unknown>> {
     const cdp = this.cdp;
     if (!cdp) throw new CdpClosedError(this.closeReason || "会话已关闭");
-    return cdp.send(method, params, this.sid, timeoutMs);
+    // [REQ-browser BR-16] 按**活跃标签**解析会话 id：否则切标签后命令仍发往旧标签（静默错页）。
+    //   回落到 this.sid 是给「标签表尚未建立」的窗口期用的（attach 之后、hub.start 之前）。
+    const sid = this.targetId ? (this.sidOf.get(this.targetId) ?? this.sid) : this.sid;
+    return cdp.send(method, params, sid, timeoutMs);
   }
 
   private async rawEval(expression: string, timeoutMs = 15_000): Promise<unknown> {
@@ -613,7 +824,7 @@ class ChromiumDriver implements BrowserDriver {
 
   // ---------- 生命周期 ----------
 
-  async launch(o: LaunchOptions): Promise<DriverResult<{ port: number }>> {
+  async launch(o: LaunchOptions): Promise<DriverResult<{ port: number; tabs?: number }>> {
     this.launchOpts = o;
     const exe = proc().resolveExecutable();
     if (!exe.path) {
@@ -668,32 +879,51 @@ class ChromiumDriver implements BrowserDriver {
     }
     this.cdp = cdp;
 
+    // [自评审 P-32] 事件监听必须**先于**页面级策略注册：initTab 里的 Fetch.enable 一落地，
+    //   请求就会开始被暂停；若此刻 Fetch.requestPaused 的监听还没挂上，这批请求会被暂停后无人放行
+    //   （表现为页面一直白屏直到超时）。installPolicies 只注册监听，不发页面级命令。
+    this.installPolicies(o);
+
     try {
-      const t = (await cdp.send("Target.createTarget", { url: "about:blank" }, undefined, 10_000)) as {
-        targetId?: string;
-      };
-      const targetId = String(t.targetId ?? "");
-      if (!targetId) throw new Error("未能创建页面目标");
+      // [REQ-browser BR-01/BR-03] 复用内核已建出的启动目标；只有当会话内一个 page 目标都没有时才新建。
+      //   原先无条件 Target.createTarget，与 buildArgs 末尾的 about:blank 叠加 →
+      //   窗口里出现两个标签（INC-04）。目标发现/计数逻辑在 _browser_targets.ts（NB-01）。
+      const picked = await ensureStartupPageTarget(cdp);
+      this.targetId = picked.targetId;
+      this.startupTabs = picked.count;
+
       const a = (await cdp.send(
         "Target.attachToTarget",
-        { targetId, flatten: true },
+        { targetId: picked.targetId, flatten: true },
         undefined,
         10_000,
       )) as { sessionId?: string };
       this.sid = String(a.sessionId ?? "");
       if (!this.sid) throw new Error("未能附着到页面目标");
 
-      await this.cmd("Page.enable", {});
-      await this.cmd("Runtime.enable", {});
-      await this.cmd("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_LIB });
-      await this.rawEval(PAGE_LIB);
+      // [REQ-browser BR-24] 启动目标与后续新标签走**同一段**每标签初始化（initTab：
+      //   Page.enable / Runtime.enable / 注入脚本 / 立即求值 + 按标签重开请求策略），
+      //   避免「launch 里做四步、新标签只做一半」的路径漂移。
+      this.sidOf.set(this.targetId, this.sid);
+      await this.initTab(this.targetId, this.sid, false);
     } catch (err) {
       await this.hardKill();
       return dFail("launch_failed", `初始化调试会话失败：${msgOf(err)}`);
     }
 
-    this.installPolicies(o);
-    return { ok: true, value: { port } };
+    // [自评审 P-32] installPolicies 已在 try 之前调用（监听必须先于 Fetch.enable）
+
+    // [REQ-browser BR-17] 登记启动目标 + 订阅目标事件（浏览器级命令，sessionId 必须为 undefined）
+    try {
+      this.hub = new TargetHub(cdp, { initTab: (t, s, p) => this.initTab(t, s, p) });
+      await this.hub.start(this.targetId, this.sid, { url: "about:blank", title: "" });
+    } catch {
+      // 事件订阅失败不影响会话可用：sync() 仍按需对账（BR-17 的报数不会因此消失）
+      this.hub = null;
+    }
+
+    // [REQ-browser NB-05] tabs 只进启动日志（_browser_session.ts）；open 的 meta 用实时计数
+    return { ok: true, value: { port, tabs: this.startupTabs } };
   }
 
   private installPolicies(o: LaunchOptions): void {
@@ -720,7 +950,8 @@ class ChromiumDriver implements BrowserDriver {
     });
 
     // ② 上传/文件选择：拦截并记录（BR-54）
-    void this.cmd("Page.setInterceptFileChooserDialog", { enabled: true }, 5_000).catch(() => undefined);
+    //   ⚠️ 拦截开关本身（Page.setInterceptFileChooserDialog）是**页面级**命令，已移入 initTab()：
+    //      每个新标签都要单独开，否则弹窗里的文件选择不会被拦下（安全回退）。
     cdp.on("Page.fileChooserOpened", () => {
       this.blockedCount++;
       o.onUploadBlocked?.();
@@ -764,31 +995,9 @@ class ChromiumDriver implements BrowserDriver {
           }
         })();
       });
-      void cdp
-        .send(
-          "Fetch.enable",
-          { patterns: [{ urlPattern: "*", requestStage: "Request" }] },
-          this.sid,
-          10_000,
-        )
-        .catch(() => undefined);
-
-      // 粗粒度兜底：覆盖请求暂停事件覆盖不到的资源类型（WebSocket 等，已知缺口）
-      if (env.BROWSER_BLOCK_PRIVATE_NET) {
-        void this.cmd(
-          "Network.setBlockedURLs",
-          {
-            urls: [
-              "http://127.0.0.1:*",
-              "http://localhost:*",
-              "http://10.*",
-              "http://192.168.*",
-              "http://169.254.*",
-            ],
-          },
-          5_000,
-        ).catch(() => undefined);
-      }
+      // [REQ-browser BR-52 / BR-24] Fetch.enable 与 Network.setBlockedURLs 都是**页面级**命令，
+      //   已移入 initTab()：只对 this.sid 那一个标签执行会让弹窗/新标签里的请求完全不过策略
+      //   （私有网段阻断、域名黑白名单、下载上传拒绝在弹窗内全部失效）—— 这是安全回退，不是功能瑕疵。
     }
 
     // ④ 断开检测（BR-41 / 会话失效）
@@ -804,7 +1013,173 @@ class ChromiumDriver implements BrowserDriver {
     if (this.closed) return;
     this.closed = true;
     this.closeReason = reason;
+    // [REQ-browser BR-26] 连接断开即释放事件订阅：否则目标事件回调会挂在已失效的连接上
+    this.hub?.dispose();
+    this.hub = null;
     this.launchOpts?.onDisconnected?.(reason);
+  }
+
+  // ---------- 标签（P3：转发到 _browser_targets.ts 的 TargetHub，NB-01） ----------
+
+  /**
+   * [自评审 P-31] 把 this.sid 同步为**活跃标签**的会话 id。
+   * 三处依赖它：cmd 的回落、rawEval / callPage（经 cmd）、P2 的 bringToFront（直接用 this.sid 发 Page 域命令）。
+   */
+  private syncActiveSid(): void {
+    if (!this.targetId) return;
+    const sid = this.sidOf.get(this.targetId);
+    if (sid) this.sid = sid;
+  }
+
+  /**
+   * [REQ-browser BR-24] 每个标签的独立初始化。`isPopup` 只影响日志口径（弹窗与用户新开标签步骤相同）。
+   * 刻意**不用** this.cmd / rawEval：那两条按活跃标签解析 sessionId，而初始化期间活跃标签
+   * 可能已切到目标标签、也可能还没有，只有显式传 sid 才能保证命令落在正确的页面上。
+   */
+  async initTab(targetId: string, sessionId: string, isPopup: boolean): Promise<void> {
+    const cdp = this.cdp;
+    if (!cdp) throw new CdpClosedError(this.closeReason || "会话已关闭");
+    if (!sessionId) throw new Error("缺少页面会话标识（未附着到页面）");
+    this.sidOf.set(targetId, sessionId);
+    // [自评审 P-31] this.sid 必须始终是**活跃标签**的会话 id：P2 的 bringToFront() 直接用它发
+    //   Page.bringToFront。若它停在启动标签上，新建/切换标签后置前会把**旧标签**激活到前台
+    //   （窗口显示与实际操作的标签错位，且快照仍取自新标签 → 用户看到的和模型操作的不是同一页）。
+    if (targetId === this.targetId) this.sid = sessionId;
+    await cdp.send("Page.enable", {}, sessionId, 15_000);
+    await cdp.send("Runtime.enable", {}, sessionId, 15_000);
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_LIB }, sessionId, 15_000);
+    await this.evalOn(sessionId, PAGE_LIB);
+    await this.enableTabPolicies(sessionId);
+    console.log(
+      `[browser] 标签初始化｜target=${targetId.slice(0, 8)}｜popup=${isPopup ? "yes" : "no"}｜ok=yes`,
+    );
+  }
+
+  /** 在**指定**页面会话上求值（显式 sid；失败语义与 rawEval 一致：抛错） */
+  private async evalOn(sessionId: string, expression: string, timeoutMs = 15_000): Promise<void> {
+    const cdp = this.cdp;
+    if (!cdp) throw new CdpClosedError(this.closeReason || "会话已关闭");
+    const res = await cdp.send(
+      "Runtime.evaluate",
+      { expression, returnByValue: true, awaitPromise: true },
+      sessionId,
+      timeoutMs,
+    );
+    const ex = res.exceptionDetails as
+      | { text?: string; exception?: { description?: string } }
+      | undefined;
+    if (ex) throw new Error(`页面脚本执行失败：${ex.exception?.description ?? ex.text ?? "未知异常"}`);
+  }
+
+  /**
+   * [REQ-browser BR-52] 按标签重开请求策略。
+   * `Page.setInterceptFileChooserDialog` / `Fetch.enable` / `Network.setBlockedURLs`
+   * 全部是**页面级**命令：逐个标签开一次，否则新标签（含站点弹窗）里的请求完全不过策略。
+   */
+  private async enableTabPolicies(sessionId: string): Promise<void> {
+    const cdp = this.cdp;
+    if (!cdp || !sessionId) return;
+    await cdp
+      .send("Page.setInterceptFileChooserDialog", { enabled: true }, sessionId, 5_000)
+      .catch(() => undefined);
+    if (!this.launchOpts?.judgeRequest) return;
+    await cdp
+      .send(
+        "Fetch.enable",
+        { patterns: [{ urlPattern: "*", requestStage: "Request" }] },
+        sessionId,
+        10_000,
+      )
+      .catch(() => undefined);
+    // 粗粒度兜底：覆盖请求暂停事件覆盖不到的资源类型（WebSocket 等，已知缺口）
+    if (env.BROWSER_BLOCK_PRIVATE_NET) {
+      await cdp
+        .send(
+          "Network.setBlockedURLs",
+          {
+            urls: [
+              "http://127.0.0.1:*",
+              "http://localhost:*",
+              "http://10.*",
+              "http://192.168.*",
+              "http://169.254.*",
+            ],
+          },
+          sessionId,
+          5_000,
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  /** [REQ-browser BR-17] 与真实目标集合对账并返回标签摘要（浏览器级命令，sessionId = undefined） */
+  async getTargets(): Promise<TabOp<TabsSnapshot>> {
+    const hub = this.hub;
+    if (!hub) {
+      // 没建成标签中心（启动异常 / 旧路径）：如实降级为「只有一个标签」
+      const list: TabBrief[] = this.targetId
+        ? [{ targetId: this.targetId, index: 1, url: "", title: "" }]
+        : [];
+      return {
+        ok: true,
+        value: { count: list.length, activeIndex: list.length > 0 ? 1 : 0, list },
+      };
+    }
+    // [REQ-browser BR-25] BROWSER_MAX_TABS=1：站点自开的目标一律不登记、不报数（单标签退化）
+    const maxTabs = Math.min(20, Math.max(1, Number(env.BROWSER_MAX_TABS) || 10));
+    const r = await hub.sync({ ignoreNew: maxTabs <= 1 });
+    const snap = hub.briefs();
+    // 驱动侧「活跃标签」与标签中心对齐：cmd 依赖 this.targetId 解析 sessionId
+    this.targetId = hub.activeTargetId() || this.targetId;
+    // [自评审 P-31] 目标可能已被页面自关（hub 会自动回退），this.sid 必须跟着回退后的标签走
+    this.syncActiveSid();
+    if (r.created.length > 0 || r.destroyed.length > 0) {
+      // [REQ-browser NB-05] 标签变化只记数量，不记地址与标题
+      console.log(
+        `[browser] 标签变化｜created=${r.created.length}｜destroyed=${r.destroyed.length}｜total=${snap.count}｜active=${snap.activeIndex}`,
+      );
+    }
+    return { ok: true, value: snap };
+  }
+
+  /** [REQ-browser BR-16] 新建标签（url 固定 about:blank，随后由 navigate 走策略与超时） */
+  async createTarget(url: string, maxTabs: number): Promise<TabOp<TabBrief>> {
+    const hub = this.hub;
+    if (!hub) return { ok: false, code: "closed", reason: "标签中心不可用（会话可能已关闭）" };
+    const r = await hub.create(url, maxTabs);
+    if (r.ok) {
+      this.targetId = r.value.targetId;
+      this.syncActiveSid();
+    }
+    return r;
+  }
+
+  /** [REQ-browser BR-18] 切换活动标签（1 起序号 / prev / next） */
+  async switchTarget(
+    sel: number | "prev" | "next",
+  ): Promise<TabOp<{ index: number; count: number; targetId: string }>> {
+    const hub = this.hub;
+    if (!hub) return { ok: false, code: "tab_not_found", reason: "标签中心不可用（会话可能已关闭）" };
+    const r = await hub.switchTo(sel);
+    if (r.ok) {
+      this.targetId = r.value.targetId;
+      this.syncActiveSid();
+    }
+    return r;
+  }
+
+  /** [REQ-browser BR-23] 关闭当前标签并回退 */
+  async closeTarget(): Promise<
+    TabOp<{ closedIndex: number; index: number; count: number; targetId: string }>
+  > {
+    const hub = this.hub;
+    if (!hub) return { ok: false, code: "tab_not_found", reason: "标签中心不可用（会话可能已关闭）" };
+    const r = await hub.closeCurrent();
+    if (r.ok && r.value.targetId) {
+      this.targetId = r.value.targetId;
+      this.syncActiveSid();
+    }
+    return r;
   }
 
   /** 从进程输出解析调试地址；失败则轮询版本端点 */
@@ -871,6 +1246,9 @@ class ChromiumDriver implements BrowserDriver {
     const cdp = this.cdp;
     this.cdp = null;
     this.sid = "";
+    // [REQ-browser BR-02] 目标标识随会话失效，避免 tabs() 拿旧 id 去数
+    this.targetId = "";
+    this.startupTabs = 1;
     if (cdp) {
       try {
         await cdp.send("Browser.close", {}, undefined, 3000);
@@ -894,8 +1272,82 @@ class ChromiumDriver implements BrowserDriver {
     return this.child?.pid ?? null;
   }
 
+  /**
+   * [REQ-browser BR-10/BR-11] 窗口置前（尽力而为）。三步协议序列在 _browser_foreground.ts，
+   * 这里只做状态检查 + 转发，避免驱动继续膨胀（NB-01）。
+   * 注意：**永不抛错** —— 连接断了也只返回 ok:false，好让 open 不受影响（BR-13）。
+   */
+  async bringToFront(): Promise<ForegroundResult> {
+    const cdp = this.cdp;
+    if (!cdp || this.closed) {
+      return {
+        ok: false,
+        reached: "window",
+        before: "",
+        restored: false,
+        windowId: 0,
+        reason: this.closeReason || "会话已关闭",
+      };
+    }
+    return bringWindowToFront(cdp, this.sid, this.targetId);
+  }
+
+  /**
+   * [REQ-browser BR-02] 当前 page 目标数与当前激活标签序号（1 起）。
+   * P1 恒为 1/1；P3 起返回真实标签数，供快照头部「标签 i/N」使用。
+   * 注意：这是**辅助信息**，失败只返回 DriverResult 失败，不得改变 open 的成败判定。
+   */
+  async tabs(): Promise<DriverResult<TabsFact>> {
+    const cdp = this.cdp;
+    if (!cdp || this.closed) return dFail("closed", this.closeReason || "会话已关闭");
+    try {
+      const v = await tabFacts(cdp, this.targetId);
+      return { ok: true, value: v };
+    } catch (err) {
+      return this.fail<TabsFact>(err);
+    }
+  }
+
   blockedRequestCount(): number {
     return this.blockedCount;
+  }
+
+  // ---------- 取文（extract 专用，只读） ----------
+
+  /**
+   * [REQ-browser BR-27] 按定位取局部内容。
+   *
+   * 刻意**不复用** callPage：它的 `__MISSING__` 哨兵只判 `window.__wb` 是否存在，
+   * 函数缺失时不会命中哨兵，而是抛 TypeError → fail() 兜底成 timeout
+   * （模型会按 action_timeout 的建议重试，BR-29 明令禁止这种误归类）。
+   * 这里用**独立表达式 + 独立哨兵**，并补注入一次 PAGE_LIB
+   * （其守卫只补装缺的函数，不重建 __wb，因此不会重置 ids/seq）。
+   */
+  async extractContent(q: ExtractRequest): Promise<DriverResult<ExtractPayload>> {
+    if (this.closed) return dFail("closed", this.closeReason || "会话已关闭");
+    const arg = JSON.stringify(q);
+    const expr = `(window.__wb && typeof window.__wb.content === "function" ? window.__wb.content(${arg}) : "__WB_NO_EXTRACT__")`;
+    try {
+      let v = await this.rawEval(expr, 15_000);
+      if (v === "__WB_NO_EXTRACT__") {
+        await this.rawEval(PAGE_LIB, 15_000);
+        v = await this.rawEval(expr, 15_000);
+        if (v === "__WB_NO_EXTRACT__") {
+          // 独立失败类别：绝不能让上层读成「页面超时」（BR-27 / BR-29）
+          return dFail(
+            "unsupported",
+            "页面内库缺少取文原语 content（可能被页面脚本改写），本次未读取任何内容",
+          );
+        }
+      }
+      const raw = (v ?? {}) as ExtractPayload & { ok?: boolean; why?: string };
+      // 页面侧裁定「选择器语法非法」：以 payload 标记回传，由域内映射为 invalid_request（BR-29）。
+      // 不塞进 DriverFailureKind —— 那是传输层类别，语法判定不该混进去。
+      if (raw.ok === false) return { ok: true, value: { badSelector: true } };
+      return { ok: true, value: raw };
+    } catch (err) {
+      return this.fail<ExtractPayload>(err);
+    }
   }
 
   // ---------- 导航 ----------

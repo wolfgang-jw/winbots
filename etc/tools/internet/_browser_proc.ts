@@ -264,6 +264,12 @@ export function buildArgs(o: { headless: boolean; userDataDir: string; port: num
     "--window-size=1280,900",
     "about:blank",
   ];
+  // [REQ-browser BR-15] 有头时以最大化启动（可选增强）：让首个窗口带上前台概率。
+  //   ⚠️ 两个条件缺一不可：
+  //     ① 无头不加（headless 没有窗口，加了只是噪声）；
+  //     ② 置前开关关闭时不加 —— NB-04 规定 BROWSER_FOREGROUND_ON_OPEN=false 是 INC-02 的
+  //        唯一回滚旋钮；关掉它却仍然最大化启动，等于「只回滚一半」。
+  if (!o.headless && env.BROWSER_FOREGROUND_ON_OPEN) args.unshift("--start-maximized");
   if (o.headless) args.unshift("--headless=new");
   return args;
 }

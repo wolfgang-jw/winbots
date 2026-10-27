@@ -12,6 +12,8 @@ import type { ToolContext } from "@/tools";
 import { env } from "@/infra/env";
 import type { BrowserDriver, ElementAnchor, PageSignature } from "./_browser_driver";
 import { newDriver } from "./_browser_driver";
+// [REQ-browser BR-20/BR-21] 标签清单类型：只取**类型**（_browser_targets 不反向依赖本文件，不会形成循环）
+import type { TabBrief, TabsSnapshot } from "./_browser_targets";
 import {
   killTreeSync,
   removeDirSyncBestEffort,
@@ -34,6 +36,21 @@ import {
 export interface RefEntry {
   gen: number;
   anchor: ElementAnchor;
+}
+
+/**
+ * [REQ-browser BR-20] 单个标签的文档状态。
+ * `refTable` / `baseline` 存的是**引用**，切换标签时与 Session 上的镜像字段互换引用即可，
+ * 不需要深拷贝；`gen` 是数值，切换时必须显式搬运（见 saveActiveTab / activateTab）。
+ */
+export interface SessionTabState {
+  targetId: string;
+  gen: number;
+  refTable: Map<string, RefEntry>;
+  baseline: PageSignature | null;
+  /** 最近一次已知的地址与标题（只用于清单展示，BR-21） */
+  url: string;
+  title: string;
 }
 
 export interface Session {
@@ -78,6 +95,14 @@ export interface Session {
   /** 驱动已断开（浏览器崩溃 / 窗口被用户关闭） */
   dead: boolean;
   deadReason: string;
+  /**
+   * [REQ-browser BR-16/BR-20] 会话内每个标签的文档状态。
+   * Session 上的 gen / refTable / baseline 只是**活跃标签**那一份的镜像：
+   * 页面级代码（快照、动作、驱动命令）一律照旧读写镜像字段，只有切换标签时才搬运。
+   */
+  tabs: SessionTabState[];
+  /** [REQ-browser BR-16] 当前活动标签的 targetId（驱动侧用同名的私有字段镜像） */
+  activeTargetId: string;
 }
 
 export interface CloseReport {
@@ -164,6 +189,23 @@ export function sessionCount(): number {
   return [...registry.values()].filter((s) => s.state !== "closing" && !s.dead).length;
 }
 
+/**
+ * [REQ-browser 第 4 章] 并发会话上限：配置为 0 或非法时回退 2。
+ * `browser.ts` 的 session_limit 失败文案也用它 —— 否则「文案里的数」与「实际拦截用的数」会分叉。
+ */
+export function sessionLimit(): number {
+  return Math.max(1, Number(env.BROWSER_MAX_SESSIONS) || 2);
+}
+
+/**
+ * [REQ-browser BR-07/BR-08] 空闲回收秒数：与 sweepOnce 同一口径。
+ * 失败保活文案里的「约 N 秒无操作后自动关闭」必须来自这里，
+ * 否则文案说 180s、实际 10s 就把人骗了。
+ */
+export function sessionTtlSeconds(): number {
+  return Math.max(10, Number(env.BROWSER_SESSION_TTL_S) || 180);
+}
+
 export function getSession(sessionId?: string): Session | null {
   const s = registry.get(keyOf(sessionId));
   if (!s) return null;
@@ -180,6 +222,35 @@ export function bumpGeneration(s: Session): void {
   s.gen += 1;
   s.refTable.clear();
   s.baseline = null;
+  // [REQ-browser BR-20] 代次与基线是「值」而不是引用：必须同步写回该标签的条目，
+  //   否则切走再切回会拿到旧代次（旧 ref 会被误判为仍然有效 → 点错元素）。
+  if (s.activeTargetId) {
+    const t = tabEntryOf(s, s.activeTargetId);
+    t.gen = s.gen;
+    t.baseline = null;
+    t.refTable = s.refTable;
+  }
+}
+
+/**
+ * [REQ-browser BR-31] ref → 表项（含代次校验）的**唯一**取表入口。
+ *
+ * 为什么要单独抽一个函数：`act` 的 locate 与 `extract` 的取文必须走同一张表、同一套
+ * 代次判据，否则会出现「act 说 ref 有效、extract 说 ref 已失效」这类自相矛盾的结果。
+ * 这里只读 `s.refTable` / `s.gen` —— P3 起它们是**活跃标签**的镜像字段
+ * （切换标签时与 SessionTabState 互换引用），因此天然按标签隔离，无需再取 activeTab()。
+ *
+ * 注意：本函数只查表，**不碰 DOM**（BR-28：extract 不得写 data-wb-k / data-wb-ref）。
+ */
+export function refEntryOf(s: Session, ref: string): RefEntry | null {
+  const entry = s.refTable.get(ref);
+  if (!entry || entry.gen !== s.gen) return null;
+  return entry;
+}
+
+/** 当前活跃标签的文档代次（只读；`extract` 首段回显用） */
+export function currentGen(s: Session): number {
+  return s.gen;
 }
 
 /** 分配新 ref（会话内单调） */
@@ -218,7 +289,7 @@ export async function ensureSession(sessionId?: string): Promise<CreateResult> {
 }
 
 async function createSession(key: string): Promise<CreateResult> {
-  const limit = Math.max(1, Number(env.BROWSER_MAX_SESSIONS) || 2);
+  const limit = sessionLimit();
   const active = [...registry.values()].filter((s) => s.state !== "closing" && !s.dead);
   if (active.length >= limit) {
     return {
@@ -255,6 +326,9 @@ async function createSession(key: string): Promise<CreateResult> {
     refTable: new Map<string, RefEntry>(),
     refSeq: 0,
     baseline: null,
+    // [REQ-browser BR-16] 标签状态：首个标签由第一次 syncTabs 认领（那时才知道 targetId）
+    tabs: [],
+    activeTargetId: "",
     secrets: new Set<string>(),
     chain: Promise.resolve(),
     blocked: [],
@@ -329,6 +403,8 @@ async function createSession(key: string): Promise<CreateResult> {
       `exe=${exeLabel(proc().resolveExecutable().path)}`,
       `headless=${session.headless ? "yes" : "no"}`,
       `profile=${tempProfile ? "temp" : "persist"}`,
+      // [REQ-browser NB-05] 启动时的 page 目标数：INC-04 复发时这里会直接显示 2
+      `tabs=${launch.value.tabs ?? 1}`,
       `port=${session.port}`,
       `elapsed=${Date.now() - startedAt}ms`,
     ].join("｜"),
@@ -518,7 +594,7 @@ export async function sweepOnce(): Promise<void> {
       }
       return;
     }
-    const ttlMs = Math.max(10, Number(env.BROWSER_SESSION_TTL_S) || 180) * 1000;
+    const ttlMs = sessionTtlSeconds() * 1000;
     const now = Date.now();
     for (const s of listSessions()) {
       if (s.state === "closing" || s.dead) continue;
@@ -585,4 +661,253 @@ function registerProcessHooks(): void {
   } catch {
     /* 清理失败不影响会话创建 */
   }
+}
+
+// ============================================================
+// 标签状态（P3 / BR-16～BR-26）
+// ============================================================
+
+/** [REQ-browser BR-22/NB-04] 单会话标签上限（1 = 退回单标签语义） */
+export function sessionMaxTabs(): number {
+  return Math.min(20, Math.max(1, Number(env.BROWSER_MAX_TABS) || 10));
+}
+
+/** 取（必要时创建）某标签的状态条目；新建的条目文档状态为「空」（ref 不跨标签复用） */
+function tabEntryOf(s: Session, targetId: string): SessionTabState {
+  const hit = s.tabs.find((x) => x.targetId === targetId);
+  if (hit) return hit;
+  const made: SessionTabState = {
+    targetId,
+    gen: s.gen,
+    refTable: new Map<string, RefEntry>(),
+    baseline: null,
+    url: "",
+    title: "",
+  };
+  s.tabs.push(made);
+  return made;
+}
+
+/**
+ * 把活跃标签的三个文档字段写回它的条目。
+ * 只需在「即将切走」或「即将上报」时调用一次：页面级操作期间它们一直由 Session 上的镜像承载。
+ */
+export function saveActiveTab(s: Session): void {
+  if (!s.activeTargetId) return;
+  const t = tabEntryOf(s, s.activeTargetId);
+  t.gen = s.gen;
+  t.refTable = s.refTable;
+  t.baseline = s.baseline;
+}
+
+/**
+ * [REQ-browser BR-20] 切到某标签：把它的文档状态装回镜像字段。
+ * 必须在任何页面级操作之前调用（驱动侧也按同一个 targetId 解析会话 id）。
+ * 刻意**不**递增代次：切回旧标签时它此前的 ref 仍然有效 —— 这是标签栈的核心收益。
+ */
+export function activateTab(s: Session, targetId: string): void {
+  const t = tabEntryOf(s, targetId);
+  s.activeTargetId = targetId;
+  s.gen = t.gen;
+  s.refTable = t.refTable;
+  s.baseline = t.baseline;
+}
+
+/** [REQ-browser BR-16] 新建标签后接管它的状态：旧标签先存回，再切到新标签 */
+export function adoptCreatedTab(s: Session, targetId: string): void {
+  saveActiveTab(s);
+  activateTab(s, targetId);
+}
+
+export interface TabsReport {
+  count: number;
+  activeIndex: number;
+  list: TabBrief[];
+  /** 计数是否来自真实驱动（假驱动未实现 getTargets 时为 false，NB-03） */
+  known: boolean;
+  /** 本次新登记 / 消失的标签数（站点弹窗、页面自关，BR-17/BR-26） */
+  created: number;
+  destroyed: number;
+}
+
+/**
+ * 取不到可靠标签事实时的统一缺省：按 1/1 报，并标明「不是实测值」。
+ * 报 0 是测量失真而不是事实（页面明明开着），比「未知」更容易误导模型。
+ */
+const SINGLE_TAB: TabsReport = {
+  count: 1,
+  activeIndex: 1,
+  list: [],
+  known: false,
+  created: 0,
+  destroyed: 0,
+};
+
+/**
+ * [REQ-browser BR-17/BR-21/BR-26] 与驱动对账，并把标签状态同步到 Session。
+ * 这是「标签事实」的**唯一**来源（P1 的 tabFactsOf 已删除），
+ * 避免 meta.tabCount 与 meta.tabList 来自两个来源而互相矛盾。
+ */
+export async function syncTabs(s: Session): Promise<TabsReport> {
+  // 先存回活跃标签的状态：下面的对账可能改变「哪个标签是活跃的」
+  saveActiveTab(s);
+
+  const fn = s.driver.getTargets;
+  if (typeof fn !== "function") return SINGLE_TAB;
+
+  let snap: TabsSnapshot | null = null;
+  try {
+    const r = await fn.call(s.driver);
+    if (r.ok) snap = r.value;
+  } catch {
+    // 标签计数只是辅助信息：取数抛错绝不能把「页面已打开」改判成失败
+    snap = null;
+  }
+  if (!snap || snap.count <= 0 || snap.list.length === 0) return SINGLE_TAB;
+
+  const before = new Set(s.tabs.map((t) => t.targetId));
+  const alive = new Set(snap.list.map((b) => b.targetId));
+
+  // ① 摘除已消失标签的状态（BR-26：页面自己关了自己的标签）
+  let destroyed = 0;
+  s.tabs = s.tabs.filter((t) => {
+    if (alive.has(t.targetId)) return true;
+    destroyed += 1;
+    return false;
+  });
+  // ② 新标签：建空状态（不继承旧 refTable —— ref 不得跨标签复用，BR-20）
+  let created = 0;
+  for (const b of snap.list) {
+    if (!before.has(b.targetId)) created += 1;
+    const t = tabEntryOf(s, b.targetId);
+    if (b.url) t.url = b.url;
+    if (b.title) t.title = b.title;
+  }
+  // ③ 活动标签以**驱动**为准（目标消失时驱动会自动回退，BR-23/BR-26）
+  const activeBrief = snap.list.find((b) => b.index === snap.activeIndex);
+  const want = activeBrief?.targetId ?? "";
+  if (want && !s.activeTargetId) {
+    // 首个对账：当前镜像字段本来就是「这个标签」的状态，直接认领 —— 不能换成空表，
+    //   否则刚 buildSnapshot 分配的 ref 会全部丢失。
+    const t = tabEntryOf(s, want);
+    t.gen = s.gen;
+    t.refTable = s.refTable;
+    t.baseline = s.baseline;
+    s.activeTargetId = want;
+  } else if (want && want !== s.activeTargetId) {
+    activateTab(s, want);
+  }
+
+  return {
+    count: snap.count,
+    activeIndex: snap.activeIndex,
+    list: snap.list,
+    known: true,
+    created,
+    destroyed,
+  };
+}
+
+function cutText(v: string, n: number): string {
+  const t = String(v ?? "");
+  return t.length <= n ? t : `${t.slice(0, Math.max(0, n - 1))}…`;
+}
+
+/** [REQ-browser BR-57] 清单里只展示 host（不展示 query / 凭据） */
+export function hostOf(url: string): string {
+  const v = String(url ?? "");
+  if (!v || v === "about:blank") return "";
+  try {
+    return new URL(v).host;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * [REQ-browser BR-21] 标签提示行：数量 + 清单 + 当前序号 + 可用动作。
+ * 只在 count > 1 时产生 —— 单标签是常态，不该每次结果都多三行噪声。
+ * 放在会话层而不是动作层：动作层与门面互相 import 会形成循环（`act` 拿不到本函数）。
+ */
+export function tabNoticeLines(r: TabsReport, max = 10): string[] {
+  if (r.count <= 1 || r.list.length <= 1) return [];
+  const cur = r.list.find((b) => b.index === r.activeIndex);
+  const lines: string[] = [
+    `【标签】共 ${r.count} 个，当前第 ${r.activeIndex} 个${cur?.title ? `：${cutText(cur.title, 40)}` : ""}`,
+  ];
+  for (const b of r.list.slice(0, max)) {
+    const label = cutText(b.title || hostOf(b.url) || "（无标题）", 40);
+    lines.push(`  ${b.index}. ${label}${b.index === r.activeIndex ? "（当前）" : ""}`);
+  }
+  if (r.list.length > max) lines.push(`  …另有 ${r.list.length - max} 个未列出`);
+  // [REQ-browser BR-17/BR-26] 把「标签自己多出来 / 自己消失」显式说出来：
+  //   否则模型只看到序号变化，会以为是自己的操作导致的，进而重复点击。
+  if (r.created > 0) lines.push(`  （本次新登记 ${r.created} 个标签：由站点自行打开）`);
+  if (r.destroyed > 0) lines.push(`  （本次有 ${r.destroyed} 个标签已消失：由页面自行关闭）`);
+  lines.push(`切换标签：act 传 {"action":"switchTab","tab":"序号或 prev/next"}；关闭当前标签：close scope=tab。`);
+  return lines;
+}
+
+export type TabSwitchResult =
+  | { ok: true; count: number; activeIndex: number; title: string; url: string }
+  | { ok: false; code: "tab_limit" | "tab_not_found" | "closed"; reason: string };
+
+/** [REQ-browser BR-18] 切换活动标签（序号 1 起 / prev / next） */
+export async function switchTab(s: Session, sel: number | "prev" | "next"): Promise<TabSwitchResult> {
+  const fn = s.driver.switchTarget;
+  if (typeof fn !== "function") {
+    return { ok: false, code: "tab_not_found", reason: "当前驱动不支持多标签（会话内只有单标签）" };
+  }
+  saveActiveTab(s);
+  const r = await fn.call(s.driver, sel);
+  if (!r.ok) return { ok: false, code: r.code, reason: r.reason };
+
+  // [REQ-browser BR-20] 切标签**不**递增代次：切回旧标签时它的 ref 仍然有效
+  activateTab(s, r.value.targetId);
+  const rep = await syncTabs(s);
+  const t = tabEntryOf(s, r.value.targetId);
+  touch(s);
+  return {
+    ok: true,
+    count: rep.count,
+    activeIndex: rep.activeIndex || r.value.index,
+    title: t.title,
+    url: t.url,
+  };
+}
+
+export type TabCloseResult =
+  | { ok: true; count: number; activeIndex: number; closedIndex: number; degraded: boolean }
+  | { ok: false; code: "tab_limit" | "tab_not_found" | "closed"; reason: string };
+
+/**
+ * [REQ-browser BR-23] 关闭当前标签，并回退到上一个（BR-26 的自毁回退同口径）。
+ * ⚠️ 只剩一个标签时**不真关**：关掉最后一个标签会让浏览器进程自己退出
+ * （BR-03 ③ 明确不允许这种形态），因此退化为「回空白页」并如实标记 degraded。
+ */
+export async function closeCurrentTab(s: Session): Promise<TabCloseResult> {
+  const before = await syncTabs(s);
+  if (before.count <= 1) {
+    const r = await resetTab(s);
+    return r.ok
+      ? { ok: true, count: 1, activeIndex: 1, closedIndex: 1, degraded: true }
+      : { ok: false, code: "closed", reason: r.detail };
+  }
+  const fn = s.driver.closeTarget;
+  if (typeof fn !== "function") {
+    return { ok: false, code: "tab_not_found", reason: "当前驱动不支持关闭标签" };
+  }
+  saveActiveTab(s);
+  const r = await fn.call(s.driver);
+  if (!r.ok) return { ok: false, code: r.code, reason: r.reason };
+  if (r.value.targetId) activateTab(s, r.value.targetId);
+  const after = await syncTabs(s);
+  touch(s);
+  return {
+    ok: true,
+    count: after.count,
+    activeIndex: after.activeIndex,
+    closedIndex: r.value.closedIndex,
+    degraded: false,
+  };
 }

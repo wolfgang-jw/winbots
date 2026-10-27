@@ -14,8 +14,8 @@
 import { env } from "@/infra/env";
 import { withTail, TAIL_LINE } from "./_browser_errors";
 import type { BrowserDriver, DriverFailureKind, ElementFact } from "./_browser_driver";
-import type { RefEntry, Session } from "./_browser_session";
-import { allocRef } from "./_browser_session";
+import type { RefEntry, Session, TabsReport } from "./_browser_session";
+import { allocRef, syncTabs, tabNoticeLines } from "./_browser_session";
 import { createMasker, previewValue } from "./_browser_policy";
 
 /** [BR-32] 单次结果硬上限：平台兜底 32000 的 75%，留 ≥25% 余量 */
@@ -43,6 +43,8 @@ export type SnapshotOutcome =
       totalChars: number;
       bodyEnd: number;
       nextOffset: number | null;
+      /** [REQ-browser BR-21] 本次快照观测到的标签事实（结果文案与 meta 的唯一来源） */
+      tabs: TabsReport;
     }
   | { ok: false; kind: DriverFailureKind; reason: string };
 
@@ -122,7 +124,12 @@ const INSTRUCTION_PATTERNS: RegExp[] = [
   /disregard\s+(all\s+)?(previous|prior)/i,
 ];
 
-function markInstructions(body: string): { text: string; marked: number } {
+/**
+ * [REQ-browser BR-32 ④] 疑似指令文本只标记、不删（BR-55 同口径）。
+ * [REQ-browser BR-27] 由 extract 复用：导出以便 `_browser_extract.ts` 与快照共用同一套模式，
+ *   避免「两处各写一份正则」导致同一段文本在 observe 里被标记、在 extract 里不被标记。
+ */
+export function markInstructions(body: string): { text: string; marked: number } {
   let marked = 0;
   const lines = body.split("\n").map((line) => {
     if (!line.trim()) return line;
@@ -135,6 +142,32 @@ function markInstructions(body: string): { text: string; marked: number } {
     return line;
   });
   return { text: lines.join("\n"), marked };
+}
+
+/**
+ * [REQ-browser BR-32 ④] HTML 片段的疑似指令标记。
+ *
+ * 为什么不直接复用 markInstructions：它按 `\n` 切行，而 `outerHTML` 常常整段没有换行，
+ * 于是整段 HTML 会被当成「一行」——只要有一个关键词命中，整段（可能上千字符）都被打上
+ * 前缀，等于把标记变成噪声；反过来一行里有多个标签时也无法定位到具体片段。
+ * 这里改成按「每个 `<` 起始的片段」切开逐段判定，粒度与文本节点一致。
+ */
+export function markInstructionHtml(html: string): { text: string; marked: number } {
+  const src = String(html ?? "");
+  if (!src) return { text: "", marked: 0 };
+  let marked = 0;
+  const parts = src.split(/(?=<)/);
+  const out = parts.map((seg) => {
+    if (!seg.trim()) return seg;
+    for (const p of INSTRUCTION_PATTERNS) {
+      if (p.test(seg)) {
+        marked += 1;
+        return `[疑似指令文本] ${seg}`;
+      }
+    }
+    return seg;
+  });
+  return { text: out.join(""), marked };
 }
 
 // ============================================================
@@ -234,6 +267,10 @@ export async function buildSnapshot(
   const cfgBodyChars = Math.max(200, Number(env.BROWSER_SNAPSHOT_MAX_CHARS) || 6000);
   const offset = Math.max(0, Math.trunc(o.offset ?? 0));
 
+  // [REQ-browser BR-17/BR-21] 先与驱动对账标签：既刷新标签清单，也保证「活跃标签」的
+  //   gen / refTable / baseline 镜像与驱动指向同一个标签 —— 否则 ref 会被分配到别的标签上。
+  const tabs = await syncTabs(s);
+
   // ① 事实
   const factsRes = await driver.collectFacts();
   if (!factsRes.ok) return { ok: false, kind: factsRes.kind, reason: factsRes.reason };
@@ -269,7 +306,9 @@ export async function buildSnapshot(
     `【标题】${title || "（无标题）"}`,
     `【会话】${s.prefix}｜${s.headless ? "无头" : "有头"}｜${
       s.tempProfile ? "临时 profile" : "持久 profile"
-    }｜代次 ${s.gen}｜元素 ${elementTotal} 个`,
+    }｜标签 ${tabs.activeIndex}/${tabs.count}｜代次 ${s.gen}｜元素 ${elementTotal} 个`,
+    // [REQ-browser BR-21] 多标签时补清单与可执行动作（单标签不产生任何多余行）
+    ...tabNoticeLines(tabs),
   ];
 
   // 正文块：full 走分页三要素；compact 只给摘要
@@ -378,6 +417,8 @@ export async function buildSnapshot(
     totalChars: bodyTotal,
     bodyEnd,
     nextOffset,
+    // [REQ-browser BR-21] 标签事实随快照一起返回：门面不再单独取一次（避免两个来源打架）
+    tabs,
   };
 }
 

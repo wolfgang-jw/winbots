@@ -3,7 +3,7 @@
  * 浏览器工具门面（唯一被 loadTools 加载的文件，BR-02）
  *
  * 契约：导出 tools: Tool[]，调用名 internet.browser.<name>
- *       模型可见名固定 internet__browser__open / __observe / __act / __close（BR-03）
+ *       模型可见名固定 internet__browser__open / __observe / __act / __extract / __close（BR-03）
  * 分层：本文件只做「开关复检 → 入参预检 → 会话编排 → 结果整形」；
  *       动作在 _browser_actions，快照在 _browser_snapshot，会话在 _browser_session，
  *       页面原语在 _browser_driver，传输在 _browser_cdp（BR-06）。
@@ -14,27 +14,40 @@ import type { Tool, ToolContext } from "@/tools";
 import { env } from "@/infra/env";
 import { ok, type Envelope } from "./_common";
 import { failEnvelope, withTail, type BrowserErrorCode } from "./_browser_errors";
-import { precheckUrl, reasonLabel } from "./_browser_policy";
+import { precheckUrl, reasonLabel, urlForLog } from "./_browser_policy";
+// [REQ-browser BR-13] 置前结果类型（raiseWindow 的局部变量声明用；三步序列在 _browser_foreground.ts）
+import type { ForegroundResult } from "./_browser_foreground";
+// [实测修正 P2-P26/P2-P32] Windows 前台锁兜底 + **OS 级前台判定**（页面自报 hasFocus 不可信）
+import { ensureForeground } from "./_browser_winraise";
 import { buildSnapshot } from "./_browser_snapshot";
 import {
+  adoptCreatedTab,
   bumpGeneration,
+  closeCurrentTab,
   closeSession,
   ensureSession,
   getSession,
-  resetTab,
   runSerial,
+  sessionLimit,
+  sessionMaxTabs,
+  sessionTtlSeconds,
   SessionBusyError,
+  tabNoticeLines,
   touch,
   type Session,
 } from "./_browser_session";
 import { runAct, validateActArgs } from "./_browser_actions";
+// [REQ-browser BR-27] extract 的域内整形全部落在 _browser_extract.ts（NB-01：驱动不再承载域内逻辑）
+import { runExtract } from "./_browser_extract";
 import {
   DESC_ACT,
   DESC_CLOSE,
+  DESC_EXTRACT,
   DESC_OBSERVE,
   DESC_OPEN,
   SCHEMA_ACT,
   SCHEMA_CLOSE,
+  SCHEMA_EXTRACT,
   SCHEMA_OBSERVE,
   SCHEMA_OPEN,
 } from "./_browser_schemas";
@@ -84,6 +97,123 @@ function modeLine(s: Session): string {
   }${blocked}`;
 }
 
+/**
+ * [REQ-browser BR-13] 置前结果三态：
+ *   attempted=false → 本次「不适用」（无头 / 开关关闭 / 驱动未实现），**不写提示行、meta 记 null**；
+ *   attempted=true, ok=false → 真的试了但没成功，写提示行、meta 记 false。
+ * 为什么必须区分：假驱动都不实现 bringToFront()，若把「未实现」当失败，
+ * 既有用例的每个 open 结果都会多出一行「窗口未能置前」，文本断言与 meta 深比较会集体变红。
+ *
+ * [实测修正 P2-P26] `ok` 只是「CDP 命令成功」，不等于「窗口到了前台」。
+ * [实测修正 P2-P32] `verified`（页面自报 hasFocus）**也不可信**：`Page.bringToFront` 之后它恒为 true，
+ *   窗口仍在后面也报 true。真正的权威判定来自操作系统（_browser_winraise.ensureForeground）：
+ *   OS 说在不在前台，才算数；OS 取不到判定时才退回 `verified ?? ok`。
+ */
+type ForegroundAttempt =
+  | { attempted: false; why: string }
+  | { attempted: true; ok: boolean; verified?: boolean };
+
+/**
+ * [REQ-browser BR-10～BR-14] 把会话窗口带到最前（**仅 open 调用**）。
+ * 三类「不适用」一律不发起任何 CDP 调用：
+ *   ① 会话是无头（BR-14：判据取 Session.headless，不读 env —— 配置热更后旧会话仍按旧模式运行，
+ *      与 headlessHint / modeLine 的既有口径一致）；
+ *   ② BROWSER_FOREGROUND_ON_OPEN=false（NB-04 的回滚旋钮）；
+ *   ③ 驱动没实现 bringToFront()（假驱动，NB-03）。
+ * 任何异常都在这里吞掉：置前失败绝不影响 open 的成败（BR-13）。
+ */
+async function raiseWindow(s: Session): Promise<ForegroundAttempt> {
+  if (s.headless) return { attempted: false, why: "headless" };
+  if (!env.BROWSER_FOREGROUND_ON_OPEN) return { attempted: false, why: "switch_off" };
+  const fn = s.driver.bringToFront;
+  if (typeof fn !== "function") return { attempted: false, why: "driver_unsupported" };
+
+  const startedAt = Date.now();
+  let r: ForegroundResult;
+  try {
+    r = await fn.call(s.driver);
+  } catch (err) {
+    // 驱动实现里理论上不抛（_browser_foreground 各步各自 try/catch），
+    // 但假驱动 / 未来改动可能抛：这里再兜一层，守住 BR-13
+    r = { ok: false, reached: "window", before: "", restored: false, windowId: 0, reason: errText(err) };
+  }
+
+  // [实测修正 P2-P32] 权威判定必须来自**操作系统**。
+  //   上一版只在 `r.verified === false` 时兜底，而 verified 来自页面自报的 document.hasFocus()：
+  //   它只表示「渲染器认为标签页已激活」（Page.bringToFront 之后必然如此），
+  //   窗口仍在别的窗口后面也报 true → 兜底一次都没触发（日志里连 assist= 都没有）。
+  //   现在改为：拿浏览器 pid 做一次 OS 级「探测 →（不在前则）提升 → 复核」，
+  //   OS 判定优先于 CDP 自报；拿不到判定（非 Windows / 进程已退 / 脚本编译失败）才退回自报。
+  let front: boolean | undefined = r.verified;
+  let assist = "";
+  const pid = Number(s.driver.processId?.() ?? 0);
+  if (Number.isFinite(pid) && pid > 0) {
+    const a = await ensureForeground(pid);
+    // probed=false 表示「没拿到 OS 判定」（非 Windows / 进程已退 / PowerShell 不可用），
+    //   此时保留 CDP 自报结论，并把跳过原因记进日志 —— 否则「为什么又没置前」无从排查。
+    //   how: already / attach / alt / appactivate / topmost / none / no_window / circuit / skip
+    assist = a.probed ? `｜os=${a.how}` : `｜os=${a.how}:${a.why}`;
+    if (a.probed) front = a.ok;
+  }
+
+  // [REQ-browser NB-05] 每次置前记一行（成功/失败都记）：窗口在不在前台，是用户投诉的第一顺位。
+  //   cdp= CDP 命令是否成功；front= **最终结论**（OS 判定优先，? = 两边都判定不了）；
+  //   os= 走了哪条提升路径（already 表示本来就在前台，没做任何操作）。
+  console.log(
+    `[browser] 置前｜session=${s.prefix}｜cdp=${r.ok ? "yes" : "no"}` +
+      `｜front=${front === undefined ? "?" : front ? "yes" : "no"}｜reached=${r.reached}` +
+      `｜state=${r.before || "?"}${r.restored ? "→normal" : ""}｜window=${r.windowId}` +
+      `｜ms=${Date.now() - startedAt}${assist}${r.reason ? `｜reason=${r.reason}` : ""}`,
+  );
+  // front===false 才算真失败（含 TOP：窗口在最前但没拿到键盘焦点，仍属「已置前」）
+  return { attempted: true, ok: front ?? r.ok, verified: front };
+}
+
+/**
+ * [REQ-browser BR-13] 置前失败的单行提示（成功 / 不适用时返回空串，不留空行）。
+ * 措辞按需求文档给定：「窗口未能置前（可能受系统前台锁限制）」，并补一句「页面本身没问题」——
+ * 否则模型容易把它当成打开失败转告用户。
+ */
+function fgHintLine(f: ForegroundAttempt): string {
+  if (!f.attempted) return "";
+  // [实测修正 P2-P26] 判据与 meta.foreground 同口径：命令成功但窗口没到前台，也必须如实提示
+  if ((f.verified ?? f.ok) === true) return "";
+  return "【提示】窗口未能置前（可能受系统前台锁限制）；页面本身已正常打开，可直接在窗口里操作。";
+}
+
+/**
+ * [REQ-browser BR-06] 会话是否已经不可用：驱动已断开 / 被标记 dead / 正在关闭。
+ * 用于区分「有窗口可留的失败」与「只剩空壳的失败」。
+ */
+function sessionGone(s: Session): boolean {
+  if (s.dead || s.state === "closing") return true;
+  try {
+    return s.driver.isClosed();
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * [REQ-browser BR-07] 失败保留文案：错误码由信封携带，这里补齐其余四要素
+ * —— 目标地址（只到 host+path，BR-57）、会话前缀、进程号、保留声明 + TTL。
+ * 措辞必须同时表达「失败」与「窗口还在」，模型才能一边报错、一边告诉用户去哪儿看。
+ * 结尾不留句号：describeFailure 会先剥掉尾部标点，再拼「。」+ 建议句。
+ */
+function keptAliveDetail(s: Session, targetUrl: string, reason: string, ttl: number): string {
+  const pid = s.driver.processId?.() ?? null;
+  return (
+    `导航失败：${reason}（目标 ${urlForLog(targetUrl)}；会话 ${s.prefix}；进程 ${pid ?? "未知"}）` +
+    `。窗口已保留，约 ${ttl} 秒无操作后自动关闭；如需立刻关闭请调用 close`
+  );
+}
+
+/*
+ * [REQ-browser BR-02/BR-21] 标签事实统一由会话层的 syncTabs() 提供（见 _browser_session.ts），
+ * 并在构建快照时随结果返回（SnapshotOutcome.tabs）—— 门面不再单独取一次，
+ * 避免 meta.tabCount 与 meta.tabList 来自两个来源而互相矛盾。
+ */
+
 // ============================================================
 // open
 // ============================================================
@@ -116,7 +246,11 @@ async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promis
   const ensured = await ensureSession(ctx?.sessionId);
   if (!ensured.ok) {
     if (ensured.code === "session_limit") {
-      return failEnvelope("session_limit", undefined, { occupied: ensured.occupied });
+      // [REQ-browser 第 4 章] 带上真实上限，与会话层 sessionLimit() 同口径
+      return failEnvelope("session_limit", undefined, {
+        occupied: ensured.occupied,
+        limit: sessionLimit(),
+      });
     }
     return failEnvelope(
       "browser_unavailable",
@@ -139,7 +273,10 @@ async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promis
     const again = await ensureSession(ctx?.sessionId);
     if (!again.ok) {
       if (again.code === "session_limit") {
-        return failEnvelope("session_limit", undefined, { occupied: again.occupied });
+        return failEnvelope("session_limit", undefined, {
+          occupied: again.occupied,
+          limit: sessionLimit(),
+        });
       }
       return failEnvelope(
         "browser_unavailable",
@@ -154,43 +291,123 @@ async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promis
 
   try {
     return await runSerial(s, async () => {
+      // [REQ-browser BR-16/BR-21] 会话**已存在**时：在新标签里打开，原标签保留（多标签场景）。
+      //   判据用 hadSession（本次调用前是否已有就绪会话），不是「getSession() !== null」——
+      //   后者在「窗口模式变更后重建」时也成立，会在刚建好的实例上多开一个标签（INC-04 复发）。
+      //   BROWSER_MAX_TABS=1（单标签退化）、驱动不支持多标签：都退回「同标签导航」，不让 open 失败。
+      let tabNote = "";
+      if (hadSession && sessionMaxTabs() > 1) {
+        const make = s.driver.createTarget;
+        if (typeof make === "function") {
+          // url 传 about:blank：最终地址由随后的 navigate 进入，才能走同一条策略与超时链路
+          const made = await make.call(s.driver, "about:blank", sessionMaxTabs());
+          if (!made.ok) {
+            if (made.code === "tab_limit") {
+              // [REQ-browser BR-22] 超上限：不清理会话、不导航，明确让模型先关标签
+              //   detail 直接用驱动给的「已有 N 个、上限 M」：这里拿不到准确计数，自己拼会报错数
+              touch(s);
+              return failEnvelope("tab_limit", made.reason);
+            }
+            tabNote = `（新建标签失败：${made.reason}；已在当前标签打开）`;
+          } else {
+            // 新标签的文档状态从空开始（ref 不跨标签复用，BR-20）
+            adoptCreatedTab(s, made.value.targetId);
+            console.log(
+              `[browser] 新标签｜session=${s.prefix}｜index=${made.value.index}｜max=${sessionMaxTabs()}`,
+            );
+          }
+        } else {
+          // [自评审 P-33] 驱动没实现 createTarget（假驱动 / 纯单标签驱动）：静默退回同标签导航，
+          //   **不写提示行** —— 与 P2 置前的「未实现即不适用」同口径。真实驱动一定实现它，
+          //   写出来只会让每次 open 多一行噪声，并让既有文本断言集体变红。
+          console.log(`[browser] 驱动未实现 createTarget，已在当前标签打开｜session=${s.prefix}`);
+        }
+      }
+
       // ④ 导航（判据=加载完成 + 稳定窗口，不是「命令返回」）
       const nav = await s.driver.navigate(pre.url, {
         timeoutMs: navTimeout(),
         stableMs: stableWindow(),
       });
       if (!nav.ok) {
-        // 新建会话导航失败：清理半成品，绝不留半死进程
-        if (!hadSession) await closeSession(s, "打开失败清理");
         const code: BrowserErrorCode =
           nav.kind === "nav_timeout"
             ? "navigation_timeout"
             : nav.kind === "closed"
               ? "session_not_found"
               : "navigation_failed";
-        return failEnvelope(code, nav.reason);
+
+        // [REQ-browser BR-06 ②③] 驱动已断开 / 会话已被标记 dead：没有窗口可留，立即清理。
+        //   这是「打开失败清理」唯一允许出现的场景之一（BR-08）。
+        if (nav.kind === "closed" || s.dead) {
+          if (!hadSession) await closeSession(s, "打开失败清理");
+          return failEnvelope(code, nav.reason);
+        }
+
+        // [REQ-browser BR-04/BR-05] 导航失败：保留进程、窗口与标签，交由空闲回收。
+        //   用户能在窗口里看到浏览器错误页并自行重试；TTL 必须从**失败时刻**重新起算。
+        //   ⚠️ 此分支内绝不能调用 closeSession —— 它会 shutdown 进程并删临时 profile。
+        // [REQ-browser BR-10] 失败保留同样要置前：用户正是靠窗口里那张错误页发现问题的。
+        //   顺序：先置前（最坏约 6s：三步 CDP + 复核 + OS 探测/提升的一次 PowerShell，不写 lastUsedAt）
+        //   → 再 touch（BR-05 要求它是返回前最后一次写）→ 再拼文案返回。
+        //   反过来会在 TTL 极小时被扫掉，等于没保活。
+        const fg = await raiseWindow(s);
+        touch(s);
+        const ttl = sessionTtlSeconds();
+        console.log(
+          `[browser] 打开失败但已保留会话 ${s.prefix}｜code=${code}｜pid=${
+            s.driver.processId?.() ?? "-"
+          }｜ttl=${ttl}s`,
+        );
+        const fgLine = fgHintLine(fg);
+        return failEnvelope(code, keptAliveDetail(s, pre.url, nav.reason, ttl) + (fgLine ? `\n${fgLine}` : ""));
       }
 
       // ⑤ 导航后文档代次递增，旧 ref 全部失效
       bumpGeneration(s);
 
-      // ⑥ 首屏快照
+      // ⑥ [REQ-browser BR-10/BR-11] 置前：有头且开关开启时「取窗口 → 恢复窗口状态 → 激活页面
+      //   → 复核是否真的到了前台（未到时做一次系统级兜底，见 _browser_winraise.ts）」。
+      //   必须在首屏快照**之前**：激活窗口会让页面产生 focus / 懒加载 / 轮播一类 DOM 变更，
+      //   而 buildSnapshot 会把当时的 __wbCount 记进 s.baseline；若置前在快照之后，
+      //   这批变更就落在基线之外，下一次 act 的 detectChange 会误报「页面已变化」。
+      //   置前失败不影响成败（BR-13），raiseWindow 内部已吞掉所有异常。
+      const fg = await raiseWindow(s);
+
+      // ⑦ 首屏快照
       const snap = await buildSnapshot(s, s.driver, { mode: "full" });
       if (!snap.ok) {
         return failEnvelope("internal_error", `页面已打开，但读取页面快照失败：${snap.reason}`);
       }
 
+      // [REQ-browser BR-21] 标签事实随快照返回（唯一来源；P1 的 tabFactsOf 已删除）
+      const tabs = snap.tabs;
+      // [REQ-browser BR-09] URL/标题一律取页面真实 location（snap 内来自 driver.signature()），
+      //   入参与 navigate 的返回值只作兜底：用户可能在窗口里自行重试或跳到别的站点
+      const pageUrl = snap.url || nav.value.url;
+      const pageTitle = snap.title || nav.value.title;
+
       const head =
-        `【已打开】${nav.value.url}｜${modeLine(s)}` +
+        `【已打开】${pageUrl}｜${modeLine(s)}` +
         (switched ? `｜已按最新配置重建（${s.headless ? "无头" : "有头"}）` : "");
+      // [REQ-browser BR-21] P3 起多标签是**正常态**：只列清单与可用动作，不再当成异常报警
+      //   （P1 的 tabWarn 会每次都喊「启动基线应为 1」，与标签栈直接矛盾，已删除）
+      const tabLines = tabNoticeLines(tabs);
       // [FIX-SILENT-03] 无头时把「窗口不可见」显式写进结果，避免模型误报「已打开」
       const hint = headlessHint(s);
-      const body = hint ? [head, hint, "", snap.text] : [head, "", snap.text];
-      return ok(body.join("\n"), {
+      // [REQ-browser BR-13] 置前失败只加一行提示，不给错误码
+      const fgLine = fgHintLine(fg);
+      const lines = [head];
+      if (tabNote) lines.push(tabNote);
+      if (tabLines.length > 0) lines.push(...tabLines);
+      if (fgLine) lines.push(fgLine);
+      if (hint) lines.push(hint);
+      lines.push("", snap.text);
+      return ok(lines.join("\n"), {
         tool: "internet.browser.open",
         session: s.prefix,
-        url: nav.value.url,
-        title: nav.value.title,
+        url: pageUrl,
+        title: pageTitle,
         // [FIX-WIN-03] 报会话真实模式，不报 env
         headless: s.headless,
         tempProfile: s.tempProfile,
@@ -199,12 +416,41 @@ async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promis
         // [FIX-WIN-03] 便于用户/开发者在任务管理器里核对「是否真有浏览器进程」
         pid: s.driver.processId?.() ?? null,
         reusedSession: hadSession,
+        // [REQ-browser BR-21] 打开后的标签数与当前序号（多标签时附清单）
+        tabCount: tabs.count,
+        tabIndex: tabs.activeIndex,
+        // 计数是否来自真实驱动；假驱动未实现 getTargets 或读数失真时为 false（NB-03 的缺省路径）
+        tabCountKnown: tabs.known,
+        tabList: tabs.list.map((b) => ({
+          index: b.index,
+          title: b.title,
+          url: urlForLog(b.url),
+          active: b.index === tabs.activeIndex,
+        })),
+        // [REQ-browser BR-13] true=已置前；false=尝试过但失败；null=本次不适用（无头/开关关/假驱动）
+        // [实测修正 P2-P32] 口径 = **OS 前台判定**（取不到时退回 CDP 自报的 verified / ok）
+        foreground: fg.attempted ? (fg.verified ?? fg.ok) : null,
       });
     });
   } catch (err) {
+    // SessionBusyError 必须在最前面拦掉：它代表「上一次操作还没结束，本次压根没执行」，
+    // 与保活/清理无关，touch 也不该发生（那一侧正在用）。
     if (err instanceof SessionBusyError) return busyEnvelope();
-    if (!hadSession) await closeSession(s, "打开异常清理");
-    return failEnvelope("internal_error", `打开页面时发生未预期异常：${errText(err)}`);
+    // [REQ-browser BR-06/BR-08] 只有「会话真的没了」才即时清理；
+    //   异常发生在导航之后时窗口仍然可用，按 BR-04 的口径保活 ——
+    //   否则用户看到的是「页面已经打开，然后窗口自己消失」，日志里还会多一条「打开异常清理」。
+    if (sessionGone(s)) {
+      if (!hadSession) await closeSession(s, "打开异常清理");
+      return failEnvelope("internal_error", `打开页面时发生未预期异常：${errText(err)}`);
+    }
+    touch(s);
+    const ttl = sessionTtlSeconds();
+    return failEnvelope(
+      "internal_error",
+      `打开页面时发生未预期异常：${errText(err)}（会话 ${s.prefix}；进程 ${
+        s.driver.processId?.() ?? "未知"
+      }）。窗口已保留，约 ${ttl} 秒无操作后自动关闭；如需立刻关闭请调用 close`,
+    );
   }
 }
 
@@ -245,7 +491,10 @@ async function runObserve(args: Record<string, unknown>, ctx?: ToolContext): Pro
         const code: BrowserErrorCode = snap.kind === "closed" ? "session_not_found" : "internal_error";
         return failEnvelope(code, `读取页面快照失败：${snap.reason}`);
       }
-      return ok(snap.text, {
+      // [REQ-browser BR-21] 多标签时正文前先给标签清单，否则模型不知道当前看的是哪个标签
+      const tabLines = tabNoticeLines(snap.tabs);
+      const body = tabLines.length > 0 ? `${tabLines.join("\n")}\n\n${snap.text}` : snap.text;
+      return ok(body, {
         tool: "internet.browser.observe",
         session: s.prefix,
         offset,
@@ -254,6 +503,9 @@ async function runObserve(args: Record<string, unknown>, ctx?: ToolContext): Pro
         nextOffset: snap.nextOffset,
         refCount: snap.refCount,
         generation: s.gen,
+        tabCount: snap.tabs.count,
+        tabIndex: snap.tabs.activeIndex,
+        tabCountKnown: snap.tabs.known,
       });
     });
   } catch (err) {
@@ -295,6 +547,37 @@ async function runActTool(args: Record<string, unknown>, ctx?: ToolContext): Pro
 }
 
 // ============================================================
+// extract
+// ============================================================
+
+/**
+ * [REQ-browser BR-27] 读取页面局部内容（只读）。
+ * 与其余工具同口径：开关复检 → 会话解析 → 串行执行 → 结构化信封。
+ * 注意本工具**不**触发快照、不 bump 代次、不分配 ref —— 「只读」是 BR-28 的硬约束，
+ * 任何一条被破坏都会让模型手里的 ref 在毫无征兆的情况下失效。
+ */
+async function runExtractTool(args: Record<string, unknown>, ctx?: ToolContext): Promise<Envelope> {
+  if (!env.BROWSER_ENABLED) {
+    return failEnvelope("tool_disabled", "浏览器工具已禁用，本次未执行");
+  }
+
+  const s = getSession(ctx?.sessionId);
+  if (!s) {
+    return failEnvelope(
+      "session_not_found",
+      "当前会话不存在（可能已被 close，或因空闲超时被回收）",
+    );
+  }
+
+  try {
+    return await runSerial(s, () => runExtract(s, args));
+  } catch (err) {
+    if (err instanceof SessionBusyError) return busyEnvelope();
+    return failEnvelope("internal_error", `读取页面内容时发生未预期异常：${errText(err)}`);
+  }
+}
+
+// ============================================================
 // close
 // ============================================================
 
@@ -308,9 +591,32 @@ async function runClose(args: Record<string, unknown>, ctx?: ToolContext): Promi
 
   if (scope === "tab") {
     try {
-      const r = await runSerial(s, () => resetTab(s));
-      const text = `【已关闭标签页】${modeLine(s)}｜${r.detail}`;
-      return ok(withTail(text), { tool: "internet.browser.close", scope, session: s.prefix });
+      const r = await runSerial(s, () => closeCurrentTab(s));
+      if (!r.ok) {
+        const code: BrowserErrorCode =
+          r.code === "tab_limit"
+            ? "tab_limit"
+            : r.code === "closed"
+              ? "session_not_found"
+              : "invalid_request";
+        return failEnvelope(code, `关闭标签失败：${r.reason}`);
+      }
+      const lines = r.degraded
+        ? [
+            // [自评审 P-35] 保留既有前缀「【已关闭标签页】」：P1 起就有这条断言，不能因为改了措辞就变红；
+            //   但正文必须说清「没有真正关闭」，否则就是 P1 的 P-21 那类假话。
+            `【已关闭标签页】${modeLine(s)}`,
+            "会话内只剩这一个标签：关掉它会让浏览器进程自行退出，因此**未真正关闭**，改为把当前标签导航到空白页（实例保留）。",
+          ]
+        : [`【已关闭标签】原第 ${r.closedIndex} 个｜当前标签 ${r.activeIndex}/${r.count}｜${modeLine(s)}`];
+      return ok(withTail(lines.join("\n")), {
+        tool: "internet.browser.close",
+        scope,
+        session: s.prefix,
+        tabCount: r.count,
+        tabIndex: r.activeIndex,
+        tabClosed: !r.degraded,
+      });
     } catch (err) {
       if (err instanceof SessionBusyError) return busyEnvelope();
       return failEnvelope("internal_error", `关闭标签页时发生未预期异常：${errText(err)}`);
@@ -342,7 +648,7 @@ async function runClose(args: Record<string, unknown>, ctx?: ToolContext): Promi
 }
 
 // ============================================================
-// 工具导出（BR-01：恰为 4 个；BR-08：总开关共用 enabled）
+// 工具导出（BR-01：恰为 5 个；BR-08：总开关共用 enabled）
 // ============================================================
 
 export const tools: Tool[] = [
@@ -395,6 +701,20 @@ export const tools: Tool[] = [
         return await runClose(args, ctx);
       } catch (err) {
         return failEnvelope("internal_error", `关闭工具内部错误：${errText(err)}`);
+      }
+    },
+  },
+  {
+    // [REQ-browser BR-27/NB-03] 第 5 个工具：只读取局部内容（工具面 4 → 5，全仓 19 → 20）
+    name: "extract",
+    description: DESC_EXTRACT,
+    parameters: SCHEMA_EXTRACT,
+    enabled: () => env.BROWSER_ENABLED,
+    handler: async (args, ctx) => {
+      try {
+        return await runExtractTool(args, ctx);
+      } catch (err) {
+        return failEnvelope("internal_error", `读取内容工具内部错误：${errText(err)}`);
       }
     },
   },

@@ -20,7 +20,9 @@ import {
 import type { BrowserDriver, DriverFailureKind } from "./_browser_driver";
 import {
   bumpGeneration,
+  refEntryOf,
   rememberSecret,
+  switchTab,
   touch,
   type Session,
 } from "./_browser_session";
@@ -40,7 +42,9 @@ export type ActionName =
   | "drag"
   | "hover"
   | "select"
-  | "wait";
+  | "wait"
+  // [REQ-browser BR-18] 切换活动标签（标签栈）
+  | "switchTab";
 
 const ACTIONS: readonly ActionName[] = [
   "nav",
@@ -52,6 +56,7 @@ const ACTIONS: readonly ActionName[] = [
   "hover",
   "select",
   "wait",
+  "switchTab",
 ];
 
 export interface ActAction {
@@ -69,6 +74,8 @@ export interface ActAction {
   ms?: number;
   button?: "left" | "right" | "middle";
   clickCount?: number;
+  /** [REQ-browser BR-18] 仅 switchTab：1 起序号或 prev / next（默认 next） */
+  tab?: number | "prev" | "next";
 }
 
 /** 键名白名单（未知键在本地拒绝，BR-23） */
@@ -192,6 +199,46 @@ export function validateActArgs(raw: unknown): ValidationResult {
           code: "invalid_request",
           message: `第 ${at} 个动作（${action}）不接受 url 字段；只有 nav 使用 url。`,
         };
+      }
+    }
+
+    // [REQ-browser BR-18] switchTab 的 tab 字段：只允许它用；缺省按 next（顺序切换最常见）
+    if (action !== "switchTab" && o.tab !== undefined) {
+      return {
+        ok: false,
+        code: "invalid_request",
+        message: `第 ${at} 个动作（${action}）不接受 tab 字段；只有 switchTab 使用 tab。`,
+      };
+    }
+    if (action === "switchTab") {
+      const raw = o.tab;
+      if (raw === undefined || raw === null || raw === "") {
+        a.tab = "next";
+      } else if (typeof raw === "number") {
+        const n = Math.trunc(raw);
+        if (!Number.isFinite(n) || n < 1) {
+          return {
+            ok: false,
+            code: "invalid_request",
+            message: `第 ${at} 个动作（switchTab）的 tab 必须是 ≥1 的整数序号，或 prev / next。`,
+          };
+        }
+        a.tab = n;
+      } else {
+        const t = String(raw).trim().toLowerCase();
+        if (t === "prev" || t === "next") {
+          a.tab = t;
+        } else {
+          const n = Number(t);
+          if (!Number.isInteger(n) || n < 1) {
+            return {
+              ok: false,
+              code: "invalid_request",
+              message: `第 ${at} 个动作（switchTab）的 tab 非法：${previewText(String(raw), 12)}。合法取值：标签序号（≥1）或 prev / next。`,
+            };
+          }
+          a.tab = n;
+        }
       }
     }
 
@@ -356,6 +403,19 @@ export function validateActArgs(raw: unknown): ValidationResult {
     };
   }
 
+  // [REQ-browser BR-18] switchTab 也不得与其他动作同批：切换后看到的是另一个页面，
+  //   「按旧标签的 ref 继续点」会点到完全不同的元素（比报错更危险）。
+  const hasSwitch = actions.some((a) => a.action === "switchTab");
+  if (hasSwitch && actions.length > 1) {
+    return {
+      ok: false,
+      code: "invalid_request",
+      message:
+        "switchTab 不能与其他动作放在同一次调用里：切换后页面会换成另一个标签页，" +
+        "后续动作的 ref 属于原标签。请单独发一次 switchTab，等返回新标签的快照后继续。",
+    };
+  }
+
   return { ok: true, actions };
 }
 
@@ -428,6 +488,9 @@ function mapKind(kind: DriverFailureKind, phase: "nav" | "step"): BrowserErrorCo
       return "session_not_found";
     case "launch_failed":
       return "browser_unavailable";
+    // [REQ-browser BR-27] 不支持 ≠ 超时：绝不能让模型按 action_timeout 的建议重试
+    case "unsupported":
+      return "internal_error";
   }
 }
 
@@ -476,10 +539,14 @@ async function detectChange(s: Session, d: BrowserDriver): Promise<ChangeInfo> {
   return { changed, navigated };
 }
 
-/** 定位：一级属性 → 二级锚点（跨代次不兜底，§7.2） */
+/**
+ * 定位：一级属性 → 二级锚点（跨代次不兜底，§7.2）。
+ * [REQ-browser BR-31] 取表统一走会话层的 refEntryOf —— 与 extract 同一张表、同一套代次判据，
+ * 否则会出现「act 说 ref 有效、extract 说 ref 已失效」这种自相矛盾的结果。
+ */
 async function locate(s: Session, d: BrowserDriver, ref: string): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
-  const entry = s.refTable.get(ref);
-  if (!entry || entry.gen !== s.gen) {
+  const entry = refEntryOf(s, ref);
+  if (!entry) {
     return {
       ok: false,
       reason: `未找到 ref ${ref}（页面已跳转或元素已移除）；请重新 observe 取新的 ref`,
@@ -493,7 +560,7 @@ async function locate(s: Session, d: BrowserDriver, ref: string): Promise<{ ok: 
 }
 
 function roleTagOf(s: Session, ref: string): { tag: string; inputType: string } {
-  const a = s.refTable.get(ref)?.anchor;
+  const a = refEntryOf(s, ref)?.anchor;
   return { tag: a?.tag ?? "", inputType: a?.inputType ?? "" };
 }
 
@@ -606,6 +673,38 @@ async function execOne(
       degraded: false,
       wantFullSnapshot: ch.navigated,
       logFields: `${tag}｜key=${previewText(a.key ?? "", 12)}`,
+    };
+  }
+
+  // [REQ-browser BR-18] 切标签：不依赖 ref，且必须走会话层的状态搬运
+  //   （refTable / baseline / gen 按标签隔离；切换不递增代次，切回来 ref 仍可用）
+  if (a.action === "switchTab") {
+    const r = await switchTab(s, a.tab ?? "next");
+    if (!r.ok) {
+      const code: BrowserErrorCode =
+        r.code === "tab_limit"
+          ? "tab_limit"
+          : r.code === "closed"
+            ? "session_not_found"
+            : "invalid_request";
+      return {
+        ok: false,
+        code,
+        reason: r.reason,
+        logFields: `${tag}｜tab=${String(a.tab ?? "next")}`,
+      };
+    }
+    return {
+      ok: true,
+      line:
+        `switchTab → 已切到标签 ${r.activeIndex}/${r.count}` +
+        `${r.title ? `：${previewText(r.title, 30)}` : r.url ? `：${previewText(r.url, 40)}` : ""}` +
+        "（原标签的 ref 仍然有效，切回即可继续使用）",
+      changed: true,
+      navigated: false,
+      degraded: false,
+      wantFullSnapshot: true,
+      logFields: `${tag}｜tab=${String(a.tab ?? "next")}｜index=${r.activeIndex}/${r.count}`,
     };
   }
 
