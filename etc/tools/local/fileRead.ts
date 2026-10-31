@@ -23,6 +23,22 @@ import {
 } from "./_shared";
 import { readdir, stat, readFile } from "fs/promises";
 import { join, relative, sep } from "path";
+// [批次一 / FR-21、FR-38、FR-39] 预算上限与默认行数：每次调用实时读取，禁止模块级缓存
+import { env } from "@/infra/env";
+// [批次一] 分段读取纯函数（不导出 tools，loadTools 会跳过 _ 前缀文件）
+import {
+    MAX_LINES_PER_CALL,
+    buildEnvelope,
+    contentBudget,
+    countLines,
+    lineStartOffset,
+    nextStartAfter,
+    readLogLine,
+    splitLines,
+    takeLines,
+    type ReadEnvelope,
+    type ReadEnvelopeHead,
+} from "./_fileReadRange";
 
 /** 结果数量上限（F4-8） */
 const MAX_ENTRIES = 200;
@@ -49,6 +65,118 @@ function looksBinary(buf: Buffer): boolean {
     }
     return false;
 }
+
+/** 是否为正整数（FR-30：非整数一律 ERR_BAD_RANGE，不做隐式数值转换） */
+function isPositiveInt(v: unknown): v is number {
+    return typeof v === "number" && Number.isInteger(v) && v >= 1;
+}
+
+/** 回显用户传入的非法参数值（对象/字符串都能安全打印） */
+function describeArg(v: unknown): string {
+    const s = JSON.stringify(v);
+    return s === undefined ? String(v) : s;
+}
+
+/**
+ * [FR-36] 读操作日志：每次成功返回打印一行结构化文本。
+ * 只输出信封字段，**不含正文与任何文件内容片段**；不新增日志依赖。
+ * 整文件模式也打印（用 mode 区分），便于把「降级」这件事看到眼里。
+ */
+function logRead(envelope: ReadEnvelope): void {
+    console.log(readLogLine(envelope));
+}
+
+/**
+ * 区间模式（含整文件降级）的唯一实现。
+ *
+ * ① 用「最大可能的行号位数」实测信封占用 → 内容预算（FR-20 / FR-21）；
+ * ② 只解码从 startLine 起的一个窗口，不整文件解码（内存与 IO 不因分段而恶化，FR-48）；
+ * ③ 按预算取完整行；单行自身超预算时退化为「前缀 + 说明」（FR-27）。
+ */
+function takeRange(
+    buf: Buffer,
+    startLine: number,
+    maxLines: number,
+    limit: number,
+    fromFullFile: boolean,
+    relPath: string,
+    totalLines: number,
+    size: number,
+    mtime: string,
+): ReadEnvelope {
+    // ① 信封占用取上界：最后一次可能返回的行号不会超过 startLine + maxLines
+    const maxReach = Math.min(totalLines, startLine + maxLines);
+    const probe: ReadEnvelopeHead = {
+        path: relPath,
+        mode: "range",
+        startLine,
+        lastLineNum: maxReach,
+        totalLines,
+        partialLastLine: true,
+        nextStartLine: Math.min(totalLines, maxReach + 1),
+        truncated: true,
+        size,
+        mtime,
+    };
+    const budget = Math.max(1, contentBudget(limit, probe));
+
+    // ② 窗口字节数 = 3 × 预算 + 1024：
+    //    一个「转义后的字符」最多消耗 3 个源字节（3 字节 UTF-8 字符 → 1 字符），
+    //    所以预算一定在窗口内被用尽，取到的每一行都是完整的；
+    //    窗口末尾那段不完整的行必须剔除，否则会把半行当成完整行返回。
+    const offset = lineStartOffset(buf, startLine);
+    const windowEnd = Math.min(buf.length, offset + budget * 3 + 1024);
+    const windowLines = splitLines(buf.subarray(offset, windowEnd).toString("utf-8"));
+    // 窗口没到文件末尾时，最后一个元素必然是「被截断的半行」或「换行后的空串」，剔除
+    if (windowEnd < buf.length && windowLines.length > 1) windowLines.pop();
+
+    // ③ 取行
+    const taken = takeLines(windowLines, maxLines, budget);
+    const lastLineNum = taken.partialLine
+        ? startLine + taken.linesTaken          // 前缀落在这一行
+        : startLine + taken.linesTaken - 1;     // 完整返回的最后一行
+    const nextStartLine = nextStartAfter(lastLineNum, totalLines, false);
+
+    return buildEnvelope(
+        {
+            path: relPath,
+            mode: "range",
+            startLine,
+            lastLineNum,
+            totalLines,
+            partialLastLine: taken.partialLine,
+            nextStartLine,
+            // 整文件降级时「所请求范围」是全文：只要没给全文就算截断（FR-12 / FR-24）
+            truncated:
+                taken.partialLine ||
+                taken.stoppedByBudget ||
+                (fromFullFile && nextStartLine !== null),
+            size,
+            mtime,
+        },
+        taken.content,
+    );
+}
+
+/**
+ * read_file 描述：必须同时讲清两个新参数、两种模式差别、续读字段用法与「分段读更费轮次」
+ * （FR-04 / AC-FR-17）。
+ * ⚠️ 不要在这里拼 env 的值（工具 schema 在模块加载时固化，拼了就永远不变，热更失效）。
+ */
+const READ_FILE_DESCRIPTION =
+    "读取总操作目录下文本文件的内容，支持整文件与按行区间两种模式。" +
+    "①整文件模式：只传 path，返回整个文件（单次上限 256KB，超出会截断 truncated=true；" +
+    "若整文件序列化后超出结果长度预算，会自动降级为区间模式：mode=range、从第 1 行起返回完整行）。" +
+    "②区间模式：传 startLine（行号，从 1 起）与可选 lineCount（行数；省略时取配置 " +
+    "FILE_READ_DEFAULT_LINES，通常 2000；上限 50000），只返回该区间；" +
+    "只给 lineCount 而没给 startLine 会返回 ERR_BAD_RANGE；区间越过末行时截到末行并返回成功。" +
+    "续读字段用法：nextStartLine 就是下一次调用应传入的 startLine（已到文末为 null，调用方不要自己加一）；" +
+    "lastLineNum 是本次返回的最后一行行号；totalLines 是文件总行数；" +
+    "partialLastLine=true 表示 lastLineNum 这一行没有完整返回（该行剩余部分本工具无法返回，请改用其它方式获取）；" +
+    "truncated=true 表示本次正文不是所请求范围的全部内容。" +
+    "分段读会占用更多轮次（每一段都是一次工具调用），能用整文件读时不要分段；" +
+    "已知行号、已知报错位置、或命令输出重定向到文件后的回看，才适合用 startLine 定向读取。" +
+    "行号口径与 search_in_files 一致，可直接把搜索结果里的行号用作 startLine。";
 
 export const tools: Tool[] = [
     {
@@ -145,6 +273,7 @@ export const tools: Tool[] = [
                 const st = await stat(abs);
                 // 软链越界二次校验（可选加固）
                 assertRealPathInRoot(abs);
+
                 return ok({
                     path: toRel(abs),
                     type: st.isDirectory() ? "directory" : "file",
@@ -161,11 +290,27 @@ export const tools: Tool[] = [
     {
         name: "read_file",
         description:
-            "读取总操作目录下文本文件的完整内容。单次读取上限 256KB，超限会截断并标记 truncated。",
+            READ_FILE_DESCRIPTION,   // [FR-04] 描述抽常量：两参数 + 两模式 + 续读字段 + 轮次成本
         parameters: {
             type: "object",
             properties: {
                 path: { type: "string", description: "相对沙箱的文件路径，如 \"notes/a.md\"" },
+                // [批次一 / FR-02] 两个可选参数：给 startLine 才进入区间模式
+                startLine: {
+                    type: "integer",
+                    minimum: 1,
+                    description:
+                        "起始行号（从 1 起）。省略则整文件模式；给出则只返回从该行开始的区间。" +
+                        "可直接使用 search_in_files 返回的行号。",
+                },
+                lineCount: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: MAX_LINES_PER_CALL,
+                    description:
+                        "区间模式下最多返回的行数；省略则取配置 FILE_READ_DEFAULT_LINES（通常 2000），" +
+                        "上限 50000。实际行数以返回的 lastLineNum 为准。",
+                },
             },
             required: ["path"],
         },
@@ -183,7 +328,38 @@ export const tools: Tool[] = [
             }
 
             try {
-                // ③ 目标必须存在且为文件（F4-3 边界）
+                // ③ 模式判定与数值校验（FR-03 / FR-30）：不碰文件系统就能判定的先判掉
+                const hasStart = args.startLine !== undefined && args.startLine !== null;
+                const hasCount = args.lineCount !== undefined && args.lineCount !== null;
+                if (!hasStart && hasCount) {
+                    // FR-03 ④：只给 lineCount → ERR_BAD_RANGE
+                    return fail(
+                        "ERR_BAD_RANGE",
+                        "只给了 lineCount 而没给 startLine：请补上起始行号 startLine（从 1 起），" +
+                            "或只传 path 改用整文件模式。",
+                    );
+                }
+                if (hasStart && !isPositiveInt(args.startLine)) {
+                    return fail(
+                        "ERR_BAD_RANGE",
+                        `startLine 必须是 ≥1 的整数（收到 ${describeArg(args.startLine)}）：` +
+                            "请把 startLine 改成 1 起的整数行号；也可只传 path 改用整文件模式。",
+                    );
+                }
+                if (hasCount && !isPositiveInt(args.lineCount)) {
+                    return fail(
+                        "ERR_BAD_RANGE",
+                        `lineCount 必须是 ≥1 的整数（收到 ${describeArg(args.lineCount)}）：` +
+                            "请把 lineCount 改成正整数，或省略该参数使用默认行数。",
+                    );
+                }
+                const rangeRequested = hasStart;
+                // FR-22：lineCount 与配置默认值都受 50000 钳制；默认值每次调用实时读取（FR-39）
+                const maxLines = hasCount
+                    ? Math.min(args.lineCount as number, MAX_LINES_PER_CALL)
+                    : Math.min(env.FILE_READ_DEFAULT_LINES, MAX_LINES_PER_CALL);
+
+                // ④ 目标必须存在且为文件（F4-3 边界）
                 const st = await stat(abs);
                 if (st.isDirectory()) {
                     return fail("ERR_IS_DIRECTORY", `目标是目录而非文件: ${toRel(abs)}`);
@@ -191,22 +367,84 @@ export const tools: Tool[] = [
                 // 软链越界二次校验（可选加固）
                 assertRealPathInRoot(abs);
 
-                // ④ 读取（F4-4：超限截断，不抛异常）
+                // ⑤ 整文件读入（FR-48：不做流式与内存优化，区间模式只减少回灌字符数）
                 const buf = await readFile(abs);
+                // 信封基础字段：行数在完整字节上数（FR-19），大小/时间取 stat（FR-13 / FR-14）
+                const totalLines = countLines(buf);
+                const limit = env.TOOL_RESULT_MAX_CHARS;    // 每次调用实时读取（热更）
+                const relPath = toRel(abs);
+                const size = st.size;
+                const mtime = st.mtime.toISOString();
                 const truncated = buf.length > MAX_READ_BYTES;
                 const slice = truncated ? buf.subarray(0, MAX_READ_BYTES) : buf;
 
-                // ⑤ 二进制检测（F4-3 边界：二进制返回可读错误）
-                if (looksBinary(slice)) {
+                // ⑥ 二进制判定：对**完整文件**开头 8000 字节判定一次（FR-34）；错误码与文案保持原样（FR-29）
+                if (looksBinary(buf)) {
                     return fail("ERR_SIZE_EXCEEDED", `疑似二进制文件，拒绝读取: ${toRel(abs)}`);
                 }
 
-                return ok({
-                    path: toRel(abs),
+                // ⑦ 整文件模式：先按旧规则构造（256KB 字节上限），超字符预算再降级（FR-24）
+                if (!rangeRequested) {
+                    // 与旧版逐字符一致：仍是「先按字节切，再按 UTF-8 解码」（AC-FR-01）
+                    const content = slice.toString("utf-8");
+                    const lines = splitLines(content);
+                    const endsWithNewline = content.endsWith("\n");
+
+                    // 未截断时整文件都在，末行就是 totalLines（含结尾空行，FR-18）；
+                    // 被 256KB 截断时只能按已返回的正文推算（FR-26 / FR-27）
+                    const lastLineNum = truncated
+                        ? (endsWithNewline ? Math.max(1, lines.length - 1) : lines.length)
+                        : totalLines;
+                    const partialLastLine = truncated && !endsWithNewline;
+
+                    const full = buildEnvelope(
+                        {
+                            path: relPath,
+                            mode: "full",
+                            startLine: 1,                                   // FR-07
+                            lastLineNum,
+                            totalLines,
+                            partialLastLine,
+                            nextStartLine: truncated
+                                ? nextStartAfter(lastLineNum, totalLines, partialLastLine)
+                                : null,
+                            truncated,
+                            size,
+                            mtime,
+                        },
+                        content,
+                    );
+
+                    // FR-20 / FR-24：长度自己算准，外层 capToolResult 永不触发
+                    if (JSON.stringify(ok(full)).length <= limit) {
+                        logRead(full);
+                        return ok(full);
+                    }
+                    // 超预算 → 自动降级为区间模式：从第 1 行起返回完整行（FR-24 ②）
+                    const degraded = takeRange(buf, 1, maxLines, limit, true, relPath, totalLines, size, mtime);
+                    logRead(degraded);
+                    return ok(degraded);
+                }
+
+                // ⑧ 区间模式
+                const startLine = args.startLine as number;
+                if (startLine > totalLines) {
+                    // FR-30：超界必须报错，不能返回空区间（空串与空文件不可区分）
+                    return fail(
+                        "ERR_BAD_RANGE",
+                        `startLine=${startLine} 超出文件末行（totalLines=${totalLines}）：` +
+                            `请把 startLine 改到 1–${totalLines} 之间；如需读全文请只传 path 改用整文件模式。`,
+                    );
+                }
+                const ranged = takeRange(buf, startLine, maxLines, limit, false, relPath, totalLines, size, mtime);
+                logRead(ranged);
+                return ok(ranged);
+                /* [批次一] 下面这段旧实现（整文件直接返回）已由上面的 ⑦ / ⑧ 统一出口取代，保留注释仅为对照：
                     content: slice.toString("utf-8"),
                     truncated,
                     size: st.size,
                 });
+                */
             } catch (e) {
                 const err = e as NodeJS.ErrnoException;
                 if (err.code === "ENOENT") return fail("ERR_NOT_FOUND", `文件不存在: ${toRel(abs)}`);

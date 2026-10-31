@@ -109,6 +109,42 @@ export function parseDebugPort(raw: string | undefined): number {
   return n;
 }
 
+/** [批次一 / FR-38] read_file 区间模式的默认行数：默认 2000，范围 1–50000 */
+export const FILE_READ_DEFAULT_LINES_DEFAULT = 2000;
+export const FILE_READ_DEFAULT_LINES_MIN = 1;
+export const FILE_READ_DEFAULT_LINES_MAX = 50000;
+
+/**
+ * [批次一 / FR-38、AC-FR-19] 解析 FILE_READ_DEFAULT_LINES。
+ *
+ * 与 parseIntClamped 的差别（有意为之）：
+ *   · 缺失 / 非数字 / 非整数 / 0 / 负数 → **告警并回退默认值 2000**（而不是钳到下限 1）；
+ *   · 超过 50000 → 钳到 50000；
+ *   · 原文先经 normalizeScalarText 归一（容忍 `  # 注释`、成对引号，与布尔/数值项同一口径）。
+ *
+ * 不得改写为 `parseInt(raw) || 2000`：那样 0 会被静默吞成默认值且无任何告警。
+ */
+export function parseFileReadDefaultLines(raw: string | undefined): number {
+  const text = normalizeScalarText(raw);
+  if (text === "") return FILE_READ_DEFAULT_LINES_DEFAULT;
+  const n = Number(text);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < FILE_READ_DEFAULT_LINES_MIN) {
+    console.warn(
+      `⚠️  FILE_READ_DEFAULT_LINES 取值非法（${JSON.stringify(String(raw))}），` +
+        `已按默认值 ${FILE_READ_DEFAULT_LINES_DEFAULT} 处理；有效范围 ` +
+        `${FILE_READ_DEFAULT_LINES_MIN}–${FILE_READ_DEFAULT_LINES_MAX}。`,
+    );
+    return FILE_READ_DEFAULT_LINES_DEFAULT;
+  }
+  if (n > FILE_READ_DEFAULT_LINES_MAX) {
+    console.warn(
+      `⚠️  FILE_READ_DEFAULT_LINES 取值 ${n} 超过上限，已钳制为 ${FILE_READ_DEFAULT_LINES_MAX}。`,
+    );
+    return FILE_READ_DEFAULT_LINES_MAX;
+  }
+  return n;
+}
+
 /**
  * [FIX-SILENT-01] 浏览器开关的布尔容错解析。
  *
@@ -223,6 +259,9 @@ export interface EnvConfig {
   FILE_READ_ENABLED: boolean;     // 读开关（默认 true）
   FILE_CREATE_ENABLED: boolean;   // 新建开关（默认 false）
   FILE_MODIFY_ENABLED: boolean;   // 修改开关（含删除，默认 false）
+  // [批次一 / FR-38、FR-39] read_file 区间模式的默认行数（默认 2000，范围 1–50000）。
+  //   不进配置页（手工维护），也不进 REQUIRED_VARS；改 .env 后热更即生效。
+  FILE_READ_DEFAULT_LINES: number;
 
   // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（全部可选，带默认值；不加入 REQUIRED_VARS）
   LLM_LOG_ENABLED: boolean;       // 日志总开关（默认 false，关闭）
@@ -386,6 +425,9 @@ function validateEnv(): EnvConfig {
     FILE_CREATE_ENABLED: Bun.env.FILE_CREATE_ENABLED === "true",
     //   修改开关：默认关闭（含删除，破坏性最强）
     FILE_MODIFY_ENABLED: Bun.env.FILE_MODIFY_ENABLED === "true",
+    //   [批次一 / FR-38] read_file 区间默认行数：默认 2000，范围 1–50000
+    //     0 / 负数 / 非整数 → 告警并回退 2000；> 50000 → 钳到 50000（AC-FR-19）
+    FILE_READ_DEFAULT_LINES: parseFileReadDefaultLines(Bun.env.FILE_READ_DEFAULT_LINES),
 
     // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（可选，带默认值）
     //   开关：默认关闭（仅显式 "true" 才开启，与 LLM_THINKING 语义一致）
@@ -584,6 +626,14 @@ console.log(`  FILE_ROOT_DIR:         ${env.FILE_ROOT_DIR}`);
 console.log(`  FILE_READ_ENABLED:     ${env.FILE_READ_ENABLED ? "开启" : "关闭"}`);
 console.log(`  FILE_CREATE_ENABLED:   ${env.FILE_CREATE_ENABLED ? "开启" : "关闭"}`);
 console.log(`  FILE_MODIFY_ENABLED:   ${env.FILE_MODIFY_ENABLED ? "开启" : "关闭"}`);
+// [批次一 / FR-38] 区间读取默认行数（不进配置页，手工维护）。原始值一并打印，便于排查「写了 0」的情况
+console.log(
+  `  FILE_READ_DEFAULT_LINES: ${env.FILE_READ_DEFAULT_LINES}（区间模式默认行数；原始值=${
+    Bun.env.FILE_READ_DEFAULT_LINES === undefined
+      ? "未设置"
+      : JSON.stringify(Bun.env.FILE_READ_DEFAULT_LINES)
+  }）`,
+);
 // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（无敏感信息，直接打印）
 console.log("-".repeat(60));
 console.log(`  LLM_LOG_ENABLED:       ${env.LLM_LOG_ENABLED ? "开启" : "关闭"}`);
