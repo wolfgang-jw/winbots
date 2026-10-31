@@ -39,8 +39,10 @@
  *     避免多轮循环下上游意外多发 finish 导致后续轮次内容被丢弃。
  * 33. [Sprint 5.2 / US-STAB-2] 内容保护：错误分支仅当气泡为空时才移除，非空则保留已生成内容
  * 34. [Sprint 5.2 / US-STAB-3] notice 处理：新增 case "notice"，以非错误样式展示截断提示
- * 35. [配置页 / US-CFG-PAGE-1~8] 配置视图：新增第 4 视图（config），按分组渲染 34 项配置（7 组，含浏览器工具配置），
+ * 35. [配置页 / US-CFG-PAGE-1~8] 配置视图：新增第 4 视图（config），按分组渲染 43 项配置（8 组，含浏览器工具配置与本机命令执行配置），
  *     支持保存（二次确认 + confirm:true）、密钥不回显、逐项错误提示、脏值提醒
+ * 36. [批次三 / AP-11、SH-47、SH-48] 会话切换广播 winbots:session-changed（供审批通道跟随当前会话）；
+ *     配置视图新增 shell 分组与 enumLabels（枚举项中文显示名）
  */
 
 (function () {
@@ -1032,6 +1034,14 @@
     function persistSessionId(id) {
         try {
             sessionStorage.setItem(CONFIG.SESSION_STORAGE_KEY, id);
+            // [批次三 / AP-11] 通知审批通道跟随当前会话：
+            //   审批请求只路由到「命令来源会话」的界面（A 会话的批准只在 A 会话生效）。
+            //   这里只广播事实（id 变了），不参与任何审批判定，也不触碰对话主链路。
+            try {
+                window.dispatchEvent(new CustomEvent("winbots:session-changed", { detail: { sessionId: id } }));
+            } catch (err) {
+                // 极老浏览器不支持 CustomEvent：审批通道退化为「首屏读 sessionStorage」
+            }
         } catch (e) {
             console.warn("保存本标签页会话 ID 失败:", e);
         }
@@ -1796,14 +1806,16 @@
         }
     }
 
-    /** 按分组渲染 16 个控件（AC-CFG-1 / 需求 §4.8.2） */
+    /** 按分组渲染 43 个控件 / 8 组（AC-CFG-1 / 需求 §4.8.2；[批次三 / SH-48] 计数与 CONFIG_KEYS 同步） */
     function renderConfigForm(box) {
         const titles = {
             app: "应用配置", llm: "LLM 配置", file: "文件工具配置",
             log: "LLM 对话日志配置", stab: "复杂问题稳定性配置",
             internet: "互联网工具配置", browser: "浏览器工具配置",
+            // [批次三 / SH-47] 新分组：本机命令执行配置（9 项）
+            shell: "本机命令执行配置",
         };
-        const groups = ["app", "llm", "file", "log", "stab", "internet", "browser"];
+        const groups = ["app", "llm", "file", "log", "stab", "internet", "browser", "shell"];
 
         box.innerHTML = groups.map((g) => {
             const items = (configState.items || []).filter((it) => it.group === g);
@@ -1832,9 +1844,12 @@
                 <option value="false"${it.value === "false" ? " selected" : ""}>false</option>
               </select>`;
         } else if (it.type === "enum") {
+            // [批次三 / SH-47 ①] 有 enumLabels 时显示中文（值仍是原始 token，写回 .env 不变），
+            //   否则回退显示原始值（既有枚举项行为完全不变）
+            const labels = it.enumLabels || {};
             control = `<select class="config-input" id="${id}" data-config-key="${it.key}">
                 ${(it.enumValues || []).map((v) =>
-                    `<option value="${escapeHtml(v)}"${it.value === v ? " selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+                    `<option value="${escapeHtml(v)}"${it.value === v ? " selected" : ""}>${escapeHtml(labels[v] || v)}</option>`).join("")}
               </select>`;
         } else if (it.secret) {
             // AC-CFG-4：不回显明文，占位符显示掩码，留空=不修改

@@ -13,7 +13,9 @@
  *  3) 150ms 延时用「音频时钟偏移」实现，不用 setTimeout / requestAnimationFrame：
  *     后台标签页的 timer 会被节流到 ≥1s、rAF 会被暂停，二者都会把播放推出 200ms 之外（NB-05）。
  *  4) 静默降级（NB-11）：任何异常只吞掉，不抛错、不提示、不重试、不申请权限。
- *  5) approval_pending 只定义规格、不接线（REQUIREMENTS 3.1）：本文件没有任何审批音触发入口。
+ *  5) 批次三起 approval_pending 已接线：唯一触发源是界面收到的 approval_request 事件（AP-24）。
+ *     本文件**不**从工具名 / 权限档位 / 命令文本 / 按钮状态推断「此刻需要授权」——
+ *     推断等于在客户端复制一遍服务端授权策略，两份策略必然漂移（AC-SH-37）。
  */
 (function (global) {
     "use strict";
@@ -25,10 +27,12 @@
      *           节奏型         音高音区              时长
      *  完成音   down-2 两音下行 440 ~ 660Hz（中音区） 240ms（≤300ms）
      *  审批音   pulse-3 三连脉冲 1046.5Hz（高音区）   360ms（≤500ms）
-     *  音量：完成音峰值 0.55 > 审批音 0.38（NB-10：审批音不得高于完成音）
+     *  音量：完成音峰值 1.0 > 审批音 0.8（NB-10：审批音不得高于完成音）
      *        包络 = 8ms 起音 + 保持段 + 指数释放（见二、ENVELOPE）：
      *        保持段把能量撑住，是「听起来更响」的主要来源；
-     *        峰值 × 音量上限 = 0.55，离 1.0 仍有余量，不会削波（NB-09 仍是界面提示音级别）。
+     *        完成音在音量 100% 时峰值恰为 1.0（0 dBFS）：单独一条提示音不会削波，
+     *        但与其它声音（在放的音乐 / 另一个标签页 / 同批次的审批音）叠加时，
+     *        系统混音仍可能削波 → 想留余量把 answer_done.peakGain 调回 0.8（-1.9 dBFS）。
      * ============================================================ */
     var CUE_SPECS = {
         answer_done: {
@@ -38,7 +42,7 @@
                 { freq: 659.25, startMs: 0, durMs: 90 },      // E5
                 { freq: 440.00, startMs: 110, durMs: 120 }    // A4（下行四度）
             ],
-            peakGain: 1,      // 原 0.18（偏小）；× 音量上限 = 0.55，-5.2dBFS，不削波
+            peakGain: 1,      // 原 0.18（偏小）× 音量 100% = 1.0（0dBFS）：单条不削波，与其它声音叠加可能削波
             sustain: 0.55,       // 保持段占单音时长的比例（"实心"程度，见 ENVELOPE）
             totalMs: 240,
             rhythm: "down-2",
@@ -53,7 +57,7 @@
                 { freq: 1046.50, startMs: 140, durMs: 80 },   // C6
                 { freq: 1046.50, startMs: 280, durMs: 80 }    // C6
             ],
-            peakGain: 0.8,      // 原 0.14；严格低于完成音 0.55（NB-10「审批音不得高于完成音」）
+            peakGain: 0.8,      // 原 0.14；严格低于完成音 1.0（NB-10「审批音不得高于完成音」）
             sustain: 0.45,       // 脉冲要短促：保持段比例比完成音更低
             totalMs: 360,
             rhythm: "pulse-3",
@@ -296,13 +300,22 @@
                 : Date.now();
         };
 
+        // [批次三 / NB-15] 定时器可注入：用例用虚拟时钟覆盖 30s 重复与 1000ms 间隔
+        var setTimer = d.setTimer || function (fn, ms) { return global.setTimeout(fn, ms); };
+        var clearTimer = d.clearTimer || function (h) { global.clearTimeout(h); };
+
         var st = {
             latchedRoundId: null,     // NB-04 一次性闩锁：已消费终态的轮次
             suppressedRoundId: null,  // NB-06：命中截断的轮次
             lastPlayAt: null,         // NB-04：上一次「排期播放」的时刻
             lastScheduled: null,      // { roundId, cueName }：最近一次成功排期
-            approvalPending: false,   // 批次三用；批次二恒为 false（没有任何入口能置真）
-            playedCount: 0            // 便于手工/用例观察
+            approvalPending: false,   // NB-21 / NB-22⑤：是否有仍挂起的审批请求（由 approvals 派生）
+            playedCount: 0,           // 便于手工/用例观察
+            // [批次三 / AP-25] 审批音状态：requestId → { requestId, played, timers, settled }
+            approvals: {},
+            approvalQueue: [],        // NB-22④：按请求到达顺序排队（相邻间隔 ≥ MIN_GAP_MS）
+            finishedApprovals: {},    // NB-22③：已结束的 requestId（防重渲染/重连重复计数）
+            approvalSeq: 0            // 请求到达序（仅用于日志与排查）
         };
 
         function isTruncatedFinish(reason) {
@@ -330,7 +343,7 @@
                 return "suppressed_truncated";
             }
 
-            return playCue("answer_done", roundId);
+            return playCue("answer_done", roundId, TIMING.PLAY_DELAY_MS, 1);
         }
 
         /**
@@ -361,8 +374,14 @@
             return "suppressed";
         }
 
-        /** 开关判定 + 间隔合并 + 实际排期 */
-        function playCue(cueName, roundId) {
+        /**
+         * 开关判定 + 间隔策略 + 实际排期。
+         * @param {string} cueName  answer_done / approval_pending
+         * @param {string} refId    完成音=轮次标识；审批音=requestId（AP-19 的一次性标识）
+         * @param {number} delayMs  起始偏移（毫秒）：完成音固定 150（NB-05）；审批音 0 或顺延值
+         * @param {number} seq      序号（NB-15：审批音重复组 1..3；完成音恒为 1）
+         */
+        function playCue(cueName, refId, delayMs, seq) {
             var prefs = getPrefs();
 
             // NB-12 / NB-14：主开关与子开关各自独立生效
@@ -370,48 +389,190 @@
             if (cueName === "answer_done" && !prefs.answer) return "skipped_answer_off";
             if (cueName === "approval_pending" && !prefs.approval) return "skipped_approval_off";
 
-            // NB-22⑤ 仲裁（批次三生效）：挂起审批期间禁播完成音。
-            // 批次二 st.approvalPending 恒为 false，此分支不生效，只是预留。
+            // NB-21 / NB-22⑤ 仲裁：挂起审批期间**禁播**完成音，且直接丢弃、不延迟补播
             if (cueName === "answer_done" && st.approvalPending) return "dropped_approval_pending";
 
-            // NB-04：两次终态不足 1000ms 时合并为一次（丢弃后一次，不延迟补播）
             var t = now();
-            if (st.lastPlayAt !== null && (t - st.lastPlayAt) < TIMING.MIN_GAP_MS) {
+            var offset = Math.max(0, Number(delayMs) || 0);
+
+            // NB-04：完成音两次终态不足 1000ms 时合并为一次（丢弃后一次）
+            // NB-22④：审批音**不丢弃**，改为顺延到 ≥1000ms（由调用方计算 delayMs）
+            if (cueName === "answer_done"
+                && st.lastPlayAt !== null
+                && (t - st.lastPlayAt) < TIMING.MIN_GAP_MS) {
                 return "dropped_min_gap";
             }
 
             var ok = false;
             try {
-                ok = player.play(cueName, 1, TIMING.PLAY_DELAY_MS) !== false;
+                ok = player.play(cueName, seq || 1, offset) !== false;
             } catch (e) {
                 ok = false;                     // NB-11：播放失败不影响任何流程
             }
 
             if (ok) {
-                // 只有「确实排期成功」才占用 1000ms 合并窗口：
-                // 播放失败不占用，否则会连累下一轮也听不到（漏响可接受，连续漏响没必要）
-                st.lastPlayAt = t;
-                st.lastScheduled = { roundId: roundId, cueName: cueName };
+                // 只有「确实排期成功」才占用 1000ms 窗口：
+                // 播放失败不占用，否则会连累下一次（漏响可接受，连续漏响没必要）
+                st.lastPlayAt = t + offset;     // 记录**实际发声时刻**，顺延过的也算
+                st.lastScheduled = { roundId: refId, cueName: cueName };
                 st.playedCount++;
             } else {
                 st.lastScheduled = null;
             }
 
             log("[cue] 排期", cueName, ok ? "成功" : "失败(静默)",
-                "轮次=" + roundId, "延时=" + TIMING.PLAY_DELAY_MS + "ms");
+                "ref=" + refId, "延时=" + offset + "ms", "序号=" + (seq || 1));
             return ok ? "played" : "play_failed_silent";
+        }
+
+        /* ============================================================
+         * 四之二、审批音：触发 / 排队 / 重复 / 仲裁（NB-21 / NB-22 / AP-24 / AP-25）
+         * ------------------------------------------------------------
+         * 关键点：
+         *  · 首组**立即**播（偏移 0），与完成音的 150ms 收尾延时不同；
+         *  · 仍挂起则每 30s 一组，最多 3 组（含首组）；
+         *  · 用户决定 / 取消 / 超时 / 断连 → 立即停止重复；
+         *  · 同一 requestId 只计一次（重渲染、轮询、重连都不重复）；
+         *  · 多会话同时挂起按到达顺序排队，相邻两组间隔 ≥1000ms（顺延，不丢弃）。
+         * ============================================================ */
+
+        function hasPendingApproval() {
+            for (var k in st.approvals) {
+                if (Object.prototype.hasOwnProperty.call(st.approvals, k)) return true;
+            }
+            return false;
+        }
+
+        function clearApprovalTimers(s) {
+            for (var i = 0; i < s.timers.length; i++) {
+                try { clearTimer(s.timers[i]); } catch (e) { /* 已清理 */ }
+            }
+            s.timers = [];
+        }
+
+        /**
+         * 审批请求挂起：**唯一入口**（AP-24）。
+         * 调用方只允许在收到 approval_request 事件时调用，不得据其它信号推断。
+         * @param {{requestId:string}} evt
+         */
+        function notifyApprovalRequest(evt) {
+            var e = evt || {};
+            var id = String(e.requestId || "");
+            if (!id) return "ignored_no_id";
+
+            // AP-25 / NB-22③：同一请求不因重渲染、轮询刷新、断线重连重复计数
+            if (st.approvals[id] || st.finishedApprovals[id]) return "ignored_duplicate";
+
+            st.approvalSeq++;
+            st.approvals[id] = {
+                requestId: id,
+                order: st.approvalSeq,
+                played: 0,
+                timers: [],
+                settled: false
+            };
+            st.approvalPending = true;          // NB-21 / NB-22⑤：挂起期间禁播完成音
+            st.approvalQueue.push(id);          // NB-22④：按到达顺序排队
+            log("[cue] 收到审批请求，加入审批音队列:", id);
+            return drainApprovalQueue();
+        }
+
+        /**
+         * 审批请求结束：决定 / 取消 / 超时 / 断连都必须调用（NB-22②「立即停止」）。
+         * @param {{requestId:string}} evt
+         */
+        function notifyApprovalSettled(evt) {
+            var e = evt || {};
+            var id = String(e.requestId || "");
+            var s = st.approvals[id];
+
+            if (!s) {
+                if (id) st.finishedApprovals[id] = true;   // 记下来，防止迟到的重复事件再响一次
+                return "ignored_unknown";
+            }
+            clearApprovalTimers(s);
+            s.settled = true;
+            delete st.approvals[id];
+            st.finishedApprovals[id] = true;
+
+            for (var i = st.approvalQueue.length - 1; i >= 0; i--) {
+                if (st.approvalQueue[i] === id) st.approvalQueue.splice(i, 1);
+            }
+            st.approvalPending = hasPendingApproval();
+            log("[cue] 审批已结束，停止重复:", id, "仍有挂起=" + st.approvalPending);
+            return "settled";
+        }
+
+        /**
+         * 队列出队播放。
+         * NB-22④：相邻两组间隔 ≥ MIN_GAP_MS —— 不满足时**顺延**（不是丢弃）。
+         */
+        function drainApprovalQueue() {
+            if (st.approvalQueue.length === 0) return "idle";
+
+            var id = st.approvalQueue[0];
+            var s = st.approvals[id];
+            if (!s || s.settled) {
+                st.approvalQueue.shift();
+                return drainApprovalQueue();
+            }
+
+            var prefs = getPrefs();
+            // NB-14 / NB-22⑥：关闭审批音 → 不播，但挂起状态与视觉标记完全不受影响
+            if (!prefs.enabled || !prefs.approval) {
+                st.approvalQueue.shift();
+                s.played = TIMING.APPROVAL_MAX_GROUPS;   // 视为已播完，避免开关打开后补播旧请求
+                return "skipped_approval_off";
+            }
+
+            var delay = 0;                       // AP-24：首组「立即播放」
+            if (st.lastPlayAt !== null) {
+                var gap = now() - st.lastPlayAt;
+                if (gap < TIMING.MIN_GAP_MS) delay = TIMING.MIN_GAP_MS - gap;
+            }
+
+            s.played += 1;
+            var result = playCue("approval_pending", id, delay, s.played);
+            st.approvalQueue.shift();
+
+            if (result === "played") scheduleApprovalRepeat(s);
+            return result;
+        }
+
+        /** NB-22②：仍挂起且用户无交互 → 间隔 repeatMs 再排一组，最多 APPROVAL_MAX_GROUPS 组 */
+        function scheduleApprovalRepeat(s) {
+            if (s.settled || s.played >= TIMING.APPROVAL_MAX_GROUPS) return;
+
+            var handle = setTimer(function () {
+                if (s.settled || s.played >= TIMING.APPROVAL_MAX_GROUPS) return;
+                // 通过队列重新排队：与其它请求的播放仍然保持 ≥1000ms 间隔（NB-22④）
+                st.approvalQueue.push(s.requestId);
+                drainApprovalQueue();
+            }, TIMING.APPROVAL_REPEAT_MS);
+
+            s.timers.push(handle);
         }
 
         return {
             notifyFinish: notifyFinish,
             notifyNotice: notifyNotice,
+            // [批次三 / AP-24] 审批音的两个入口（只由 approval.js 在收到事件时调用）
+            notifyApprovalRequest: notifyApprovalRequest,
+            notifyApprovalSettled: notifyApprovalSettled,
             inspect: function () {
+                var ids = [];
+                for (var k in st.approvals) {
+                    if (Object.prototype.hasOwnProperty.call(st.approvals, k)) ids.push(k);
+                }
                 return {
                     latchedRoundId: st.latchedRoundId,
                     suppressedRoundId: st.suppressedRoundId,
                     lastPlayAt: st.lastPlayAt,
                     playedCount: st.playedCount,
-                    approvalPending: st.approvalPending
+                    approvalPending: st.approvalPending,
+                    pendingApprovals: ids,              // 当前仍挂起的 requestId
+                    approvalQueue: st.approvalQueue.slice(),
+                    approvalGroups: ids.map(function (k) { return st.approvals[k].played; })
                 };
             }
         };
@@ -456,7 +617,21 @@
             prefs.answer = !!answerEl.checked; commit();
         });
         if (approvalEl) approvalEl.addEventListener("change", function () {
+            var wasOn = !!prefs.approval;
             prefs.approval = !!approvalEl.checked; commit();
+
+            // [批次三 / NB-22⑥] 关闭审批音：一次性告知「此后挂起期间只剩视觉提示」。
+            //   ① 不阻止关闭（不弹 confirm、不弹二次窗）；② 不重复告知（只在「开→关」这一刻显示一行文字）。
+            var note = document.getElementById("cue-approval-off-note");
+            if (note) {
+                if (wasOn && !prefs.approval) {
+                    note.hidden = false;
+                    note.textContent = "已关闭授权请求提示音：此后命令挂起期间只剩视觉提示（顶部待审批标记），可能错过需要确认的命令。";
+                } else if (prefs.approval) {
+                    note.hidden = true;
+                    note.textContent = "";
+                }
+            }
         });
         if (volumeEl) volumeEl.addEventListener("input", function () {
             prefs.volume = clamp01(Number(volumeEl.value) / 100); commit();
@@ -513,6 +688,9 @@
         // 页面运行时实例：只接收「终态语义事件」，不含任何 play / 审批音入口
         notifyFinish: controller.notifyFinish,
         notifyNotice: controller.notifyNotice,
+        // [批次三 / AP-24] 审批音入口：调用方只允许是 approval.js 的 approval_request 处理分支
+        notifyApprovalRequest: controller.notifyApprovalRequest,
+        notifyApprovalSettled: controller.notifyApprovalSettled,
         inspect: controller.inspect
     };
 

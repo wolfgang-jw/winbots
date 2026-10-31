@@ -18,6 +18,7 @@ import healthRoute from "@/routes/health";
 import chatRoute from "@/routes/chat";
 import logRoute from "@/routes/log";   // [Sprint 5.1 / US-LOG-4]
 import configRoute from "@/routes/config";   // [配置页 / US-CFG-PAGE-1]
+import approvalRoute from "@/routes/approval";   // [批次三 / NH-02 ②③] 审批通道
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
@@ -41,6 +42,8 @@ app.route("/api/health", healthRoute);
 app.route("/api/chat", chatRoute);
 app.route("/api/log", logRoute);         // [Sprint 5.1 / US-LOG-4]
 app.route("/api/config", configRoute);   // [配置页 / US-CFG-PAGE-1]
+// [批次三 / NH-02 ③] 审批通道：独立 SSE 端点，不改对话主链路（chat.ts 一行未动）
+app.route("/api/approvals", approvalRoute);
 
 // ============================================
 // 静态文件服务（前端页面）
@@ -79,6 +82,7 @@ console.log(`   监听:      127.0.0.1:${port}（仅本机可访问）`);
 console.log(`   地址:      http://localhost:${port}`);
 console.log(`   健康检查:  http://localhost:${port}/api/health`);
 console.log(`   对话接口:  http://localhost:${port}/api/chat/stream`);
+console.log(`   审批通道:  http://localhost:${port}/api/approvals/stream?sessionId=…`);   // [批次三]
 console.log(`   聊天页面:  http://localhost:${port}/`);
 console.log(`   状态监控:  http://localhost:${port}/?view=status`);   // [US-STATUS-VIEW-4] 内联视图入口
 console.log("=".repeat(60) + "\n");

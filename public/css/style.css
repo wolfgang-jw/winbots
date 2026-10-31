@@ -1640,3 +1640,240 @@ padding: 12px 16px;
         width: 236px;
     }
 }
+
+/* ============================================
+   [批次三 / AP-09、AP-10、AP-21、AP-22、NB-13] 审批弹窗与挂起标记
+   位置：body 直属（与 .top-menu / .chat-layout 同级），不参与任何视图的显隐
+   ============================================ */
+
+/* 挂起标记条：琥珀色系，与「✅ 完成」的绿色、错误的红色都能区分（NB-13） */
+.approval-pending-bar {
+    position: fixed;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 64px;
+    z-index: 70;
+    max-width: min(92vw, 720px);
+    padding: 8px 16px;
+    border-radius: 20px;
+    background: #fff4d6;
+    border: 1px solid #e6b422;
+    color: #7a5300;
+    font-size: 0.82rem;
+    font-weight: 600;
+    box-shadow: var(--shadow-hover);
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.approval-modal[hidden],
+.approval-pending-bar[hidden] {
+    display: none !important;
+}
+
+.approval-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 80;                 /* 高于提示音面板（60）与挂起条（70） */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+
+.approval-modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+}
+
+.approval-modal__panel {
+    position: relative;
+    width: min(760px, 94vw);
+    max-height: 88vh;
+    overflow-y: auto;
+    background: var(--white);
+    color: var(--gray-800);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-hover);
+    padding: 20px 22px;
+    text-align: left;
+}
+
+.approval-modal__title {
+    font-size: 1.02rem;
+    font-weight: 700;
+    margin-bottom: 10px;
+}
+
+.approval-modal__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    margin-bottom: 10px;
+    font-size: 0.76rem;
+    color: var(--gray-600);
+    word-break: break-all;
+}
+
+.approval-modal__label {
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--gray-700);
+    margin-bottom: 4px;
+}
+
+/* 命令原文：等宽、可滚动、不截断（AP-09 ①：不得默认折叠或省略中间部分） */
+.approval-modal__command {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    max-height: 180px;
+    overflow: auto;
+    background: var(--gray-100, #f4f5f7);
+    border: 1px solid var(--gray-200);
+    border-radius: 8px;
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    white-space: pre;
+    word-break: normal;
+    tab-size: 4;
+}
+
+.approval-modal__warn {
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    background: #fdecea;
+    border-left: 4px solid var(--tomato-red);
+    color: #8a1c12;
+    font-size: 0.8rem;
+    line-height: 1.55;
+    font-weight: 600;
+}
+
+.approval-modal__destructive {
+    padding: 6px 12px;
+    margin-bottom: 10px;
+    background: #fff4d6;
+    border-left: 4px solid #e6b422;
+    color: #7a5300;
+    font-size: 0.78rem;
+}
+
+/* 三段告知：视觉区隔的独立区块（AP-22 要求独立区块，不得合并成一句警示语） */
+.approval-block {
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--gray-200);
+}
+
+.approval-block--intent { background: #f7f9fc; }
+.approval-block--risk { background: #fdf7f6; border-color: #f0cfcb; }
+.approval-block--boundary { background: #f6faf7; border-color: #cfe6d6; }
+
+.approval-block__title {
+    margin: 0 0 6px;
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.approval-block__badge {
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    background: var(--gray-200);
+    color: var(--gray-700);
+    font-size: 0.68rem;
+    font-weight: 500;
+}
+
+.approval-block__text {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    color: var(--gray-700);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.approval-modal__options {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 12px 0;
+}
+
+.approval-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    color: var(--gray-700);
+    cursor: pointer;
+}
+
+.approval-option:hover { background: var(--gray-100, #f4f5f7); }
+.approval-option input[type="radio"] { accent-color: var(--tomato-red); }
+
+.approval-option--deny { font-weight: 600; color: #8a1c12; }
+.approval-option--danger {
+    background: #fff4d6;
+    color: #7a5300;
+    font-weight: 600;
+}
+
+.approval-modal__footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--gray-200);
+}
+
+.approval-modal__version {
+    font-size: 0.7rem;
+    color: var(--gray-600);
+    font-variant-numeric: tabular-nums;
+}
+
+.approval-modal__submit {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 20px;
+    background: var(--tomato-red);
+    color: var(--white);
+    font-size: 0.84rem;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.approval-modal__submit:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.approval-modal__error {
+    margin-top: 8px;
+    font-size: 0.78rem;
+    color: #8a1c12;
+}
+
+/* 弹窗打开时锁住页面滚动，避免「滚着滚着把警示区滚出视野」 */
+body.approval-open { overflow: hidden; }
+
+.cue-settings__note--warn {
+    color: #7a5300;
+}
+
+@media (max-width: 600px) {
+    .approval-modal { padding: 10px; }
+    .approval-modal__panel { padding: 14px 14px; max-height: 92vh; }
+    .approval-modal__command { max-height: 130px; }
+    .approval-pending-bar { top: 56px; font-size: 0.76rem; }
+}

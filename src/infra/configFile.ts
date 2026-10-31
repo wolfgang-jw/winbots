@@ -37,7 +37,7 @@ const KEEP_BACKUPS = 20;
 // ============================================
 
 export type ConfigType = "int" | "bool" | "enum" | "string" | "secret";
-export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab" | "internet" | "browser";
+export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab" | "internet" | "browser" | "shell";
 
 export interface ConfigKeyMeta {
   key: string;
@@ -59,6 +59,12 @@ export interface ConfigKeyMeta {
    */
   allowEmpty?: boolean;
   enumValues?: readonly string[];
+  /**
+   * [批次三 / SH-47 ①] 枚举项的**中文显示名**（值仍写 .env / 仍走 enumValues 校验）。
+   * 只为下拉更好读：`forbid / ask / allow` 在界面上显示成「禁止 / 需用户同意 / 允许」。
+   * 未声明时前端回退显示原始值。
+   */
+  enumLabels?: Record<string, string>;
   min?: number;
   max?: number;
   /** 分组标题（与 .env.example 注释块一致） */
@@ -67,9 +73,14 @@ export interface ConfigKeyMeta {
   desc: string;
 }
 
-/** 34 项全量白名单（16 项原有 + 6 项互联网工具 + 12 项浏览器工具；需求 §4.2 / §9.1 / BR-62）
+/** 43 项全量白名单（16 项原有 + 6 项互联网工具 + 12 项浏览器工具 + 9 项命令执行；需求 §4.2 / §9.1 / BR-62 / SH-46）
  *  [R-04] 浏览器组由 10 项扩到 12 项：补 BROWSER_PROFILE_DIR（选 persist 却无处填目录）
- *         与 BROWSER_SESSION_TTL_S（「浏览器自己就关掉」的直接旋钮，原先只能手工改 .env + 重启）。 */
+ *         与 BROWSER_SESSION_TTL_S（「浏览器自己就关掉」的直接旋钮，原先只能手工改 .env + 重启）。
+ *  [批次三 / SH-48] 组数 7 → 8，项数 34 → 43；页面上没有可见的「组数 / 项数」文案，
+ *         计数实际分布在**四处**源码注释里（本行、routes/config.ts 抬头、public/js/chat.js 抬头注释、
+ *         public/js/chat.js 的 renderConfigForm 上方注释——后者原是「按分组渲染 16 个控件」的遗留笔误），
+ *         四处已同步为 43 / 8，分别见批次三文档 §5.8.3 / §5.8.5 / §5.14.4 / §5.14.2。
+ */
 export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   {
     key: "APP_PORT", group: "app", groupTitle: "应用配置", type: "int",
@@ -259,13 +270,67 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
     label: "允许上传/文件选择", defaultValue: "false",
     desc: "默认拒绝：文件选择弹窗被拦截，涉及上传的动作会失败。开启后模型可让页面读取本机文件，请自行评估风险；该开关不对模型可见。",
   },
+
+  // ============================================
+  // [批次三 / SH-46 ~ SH-48] 本机命令执行配置（9 项进配置页；其余 6 项手工维护，见 .env.example）
+  //   ⚠️ 权限档位默认 forbid：任何执行能力都必须由用户显式开启（SH-31）。
+  // ============================================
+  {
+    key: "SHELL_PERMISSION", group: "shell", groupTitle: "本机命令执行配置", type: "enum",
+    label: "命令执行权限档位", defaultValue: "forbid",
+    enumValues: ["forbid", "ask", "allow"],
+    enumLabels: { forbid: "禁止", ask: "需用户同意", allow: "允许" },
+    desc: "禁止＝run 工具不在模型可见列表（默认）；需用户同意＝每次执行都弹窗等用户点确认，用户不在屏幕前就什么也执行不了；允许＝不弹窗直接执行，等于把本机命令行完全交给模型，不再有任何人工闸门。保存后热更立即生效，且不影响已存在的授权记忆。",
+  },
+  {
+    key: "SHELL_APPROVAL_WAIT_MS", group: "shell", groupTitle: "本机命令执行配置", type: "int",
+    label: "审批等待上限（毫秒）", defaultValue: "120000", min: 1000, max: 3600000,
+    desc: "弹窗超过该时长无人应答即返回 approval_timeout（命令不执行）。它只约束「等人」的时间，不延长单条命令的执行超时。",
+  },
+  {
+    key: "SHELL_SESSION_MEMORY_ENABLED", group: "shell", groupTitle: "本机命令执行配置", type: "bool",
+    label: "本会话授权记忆", defaultValue: "true",
+    desc: "开启后，用户选「本会话都允许」的命令在本会话内不再弹窗；关闭则退化为逐次询问。记忆只在服务端内存，不落盘、不进对话历史、不进模型上下文，会话结束或界面断连即清空。",
+  },
+  {
+    key: "SHELL_TYPE", group: "shell", groupTitle: "本机命令执行配置", type: "enum",
+    label: "shell 类型", defaultValue: "cmd",
+    enumValues: ["cmd", "powershell"],
+    enumLabels: { cmd: "cmd", powershell: "PowerShell" },
+    desc: "命令解释器。模型不能选择 shell，只能由这里决定；如需另一种解释器，请改这一项（引号、编码、权限语义随 shell 变化）。PowerShell 以 -NoProfile -NonInteractive 启动，不加载用户配置。",
+  },
+  {
+    key: "SHELL_TIMEOUT_DEFAULT_MS", group: "shell", groupTitle: "本机命令执行配置", type: "int",
+    label: "默认执行超时（毫秒）", defaultValue: "30000", min: 1000, max: 3600000,
+    desc: "模型未传 timeoutMs 时使用的超时。超时会终止整个进程树（含 cmd 派生的子孙进程），不是只杀直接子进程。",
+  },
+  {
+    key: "SHELL_OUTPUT_MAX_CHARS", group: "shell", groupTitle: "本机命令执行配置", type: "int",
+    label: "输出回灌上限（字符）", defaultValue: "8000", min: 500, max: 24000,
+    desc: "单次执行回灌给模型的**结果总长**上限（含命令原文、退出码、头尾标注与约束尾行），不是输出片段上限。超限按三要素标注：已显示区间、原始字节数、后续获取方式（重定向到文件后用读文件工具读取）。须显著小于平台兜底上限 TOOL_RESULT_MAX_CHARS（默认 32000）。",
+  },
+  {
+    key: "SHELL_UTF8_UNIFY", group: "shell", groupTitle: "本机命令执行配置", type: "bool",
+    label: "UTF-8 统一编码", defaultValue: "true",
+    desc: "开启后先按 UTF-8 严格解码；失败则按控制台代码页（如 GBK）解码，并在回灌正文里显式告知「输出编码可能不匹配」，不会静默回灌乱码。注意：为满足「弹窗展示与执行同源」，本实现不改写命令（不拼 chcp 前缀），编码统一发生在解码侧。",
+  },
+  {
+    key: "SHELL_DENY_LIST", group: "shell", groupTitle: "本机命令执行配置", type: "string",
+    label: "拒绝清单（逗号分隔）", defaultValue: "format,diskpart,bcdedit,vssadmin delete,vssadmin resize,cipher /w,wbadmin delete,reg delete,reg add,shutdown,restart-computer,stop-computer,net user,net localgroup,takeown /f,icacls . /reset,del /f /s /q c:,rd /s /q c:,rmdir /s /q c:",
+    desc: "命中即本地拒绝（denied_by_policy），不创建进程、不弹窗。大小写不敏感、去多余空白后按「包含」匹配整条命令文本。⚠️ 这是启发式：可通过变量展开、字符串拼接、别名、脚本文件、转义变体绕过，不能当作安全保证。",
+  },
+  {
+    key: "SHELL_ALLOW_LIST", group: "shell", groupTitle: "本机命令执行配置", type: "string",
+    label: "允许清单（逗号分隔，none=未启用）", defaultValue: "none",
+    desc: "非空时只放行「首 token 命中」的命令，且优先于拒绝清单判定；填 none 表示不启用。允许清单**不能替代审批**：命中清单仍会弹窗（除非权限档位为允许或授权记忆命中）。同样是启发式，可绕过。",
+  },
 ] as const;
 
 /** 键名白名单集合（PUT 校验用） */
 export const CONFIG_KEY_SET: ReadonlySet<string> = new Set(CONFIG_KEYS.map((m) => m.key));
 
 /** 分组顺序（前端渲染顺序） */
-export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab", "internet", "browser"];
+export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab", "internet", "browser", "shell"];
 
 // ============================================
 // 校验
@@ -496,6 +561,8 @@ export interface ConfigItem {
   /** secret 键：掩码，如 sk-****cdef */
   mask?: string;
   enumValues?: readonly string[];
+  /** [批次三 / SH-47 ①] 枚举项中文显示名（与 ConfigKeyMeta.enumLabels 同源） */
+  enumLabels?: Record<string, string>;
   min?: number;
   max?: number;
   /** 被系统环境变量遮蔽（AC-CFG-8） */
@@ -536,7 +603,7 @@ export function buildConfigItems(
       type: meta.type, label: meta.label, desc: meta.desc,
       value: raw, secret: !!meta.secret, required: meta.required === true,
       allowEmpty: meta.allowEmpty === true,
-      enumValues: meta.enumValues, min: meta.min, max: meta.max,
+      enumValues: meta.enumValues, enumLabels: meta.enumLabels, min: meta.min, max: meta.max,
       shadowed: shadowed.has(meta.key),
       restartRequired: restartOnly.has(meta.key),
     };

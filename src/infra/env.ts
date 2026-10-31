@@ -145,6 +145,65 @@ export function parseFileReadDefaultLines(raw: string | undefined): number {
   return n;
 }
 
+/* ============================================================
+ * [批次三 / 第 4.11 节] 本机命令执行配置（15 项；其中 9 项进配置页）
+ *   解析原则（SH-46 / SH-47）：
+ *     · 缺失 / 非法一律回退默认值，**不加入 REQUIRED_VARS**（不得导致进程退出）；
+ *     · 整数项只接受纯数字（不接受 1e3 / 0x10 / 负数）；越界钳制；
+ *     · 枚举项非法值回退最保守取值（权限档位 → forbid）；
+ *     · 不得用 `parseInt(raw) || 默认`：那样 0 会被静默吞成默认值且无告警。
+ * ============================================================ */
+
+/** [AP-01] 权限档位：三值枚举 */
+export type ShellPermission = "forbid" | "ask" | "allow";
+export const SHELL_PERMISSIONS: readonly ShellPermission[] = ["forbid", "ask", "allow"];
+export const DEFAULT_SHELL_PERMISSION: ShellPermission = "forbid";
+
+/** 三档的中文说明（启动摘要与配置页 desc 共用同一措辞，AP-04 / SH-31） */
+export const SHELL_PERMISSION_LABEL: Record<ShellPermission, string> = {
+  forbid: "禁止（工具不在模型可见列表）",
+  ask: "需用户同意（每次执行都要用户点一次确认）",
+  allow: "允许（等于把本机命令行完全交给模型，不再有任何人工闸门）",
+};
+
+/** [AP-01 / AP-05] 缺失 / 非法 → forbid（保守失败：宁可工具消失，也不误开） */
+export function parseShellPermission(raw: string | undefined): ShellPermission {
+  const v = normalizeScalarText(raw).toLowerCase();
+  if (v === "") return DEFAULT_SHELL_PERMISSION;
+  if ((SHELL_PERMISSIONS as readonly string[]).includes(v)) return v as ShellPermission;
+  console.warn(
+    `⚠️  SHELL_PERMISSION 取值非法（${JSON.stringify(String(raw))}），已按「禁止」处理；` +
+      `有效值 forbid / ask / allow。`,
+  );
+  return DEFAULT_SHELL_PERMISSION;
+}
+
+/** [SH-12 / XS-04] shell 类型：不可由模型选择，只由配置决定 */
+export type ShellType = "cmd" | "powershell";
+export const SHELL_TYPES: readonly ShellType[] = ["cmd", "powershell"];
+
+export function parseShellType(raw: string | undefined): ShellType {
+  const v = normalizeScalarText(raw).toLowerCase();
+  if (v === "") return "cmd";
+  if (v === "cmd" || v === "powershell") return v;
+  console.warn(`⚠️  SHELL_TYPE 取值非法（${JSON.stringify(String(raw))}），已按 cmd 处理；有效值 cmd / powershell。`);
+  return "cmd";
+}
+
+/**
+ * [SH-33] 内置拒绝清单默认集（逗号分隔，大小写不敏感、去多余空白后按「包含」匹配）。
+ * ⚠️ 这是**启发式**，不是安全保证（SH-36）；覆盖磁盘级与系统级破坏性操作。
+ */
+export const DEFAULT_SHELL_DENY_LIST = [
+  "format", "diskpart", "bcdedit", "vssadmin delete", "vssadmin resize", "cipher /w",
+  "wbadmin delete", "reg delete", "reg add", "shutdown", "restart-computer", "stop-computer",
+  "net user", "net localgroup", "takeown /f", "icacls . /reset",
+  "del /f /s /q c:", "rd /s /q c:", "rmdir /s /q c:",
+].join(",");
+
+/** [SH-34 / SH-47 ③] 允许清单未启用时的固定取值（非密文文本项不能留空） */
+export const DEFAULT_SHELL_ALLOW_LIST = "none";
+
 /**
  * [FIX-SILENT-01] 浏览器开关的布尔容错解析。
  *
@@ -262,6 +321,24 @@ export interface EnvConfig {
   // [批次一 / FR-38、FR-39] read_file 区间模式的默认行数（默认 2000，范围 1–50000）。
   //   不进配置页（手工维护），也不进 REQUIRED_VARS；改 .env 后热更即生效。
   FILE_READ_DEFAULT_LINES: number;
+
+  // [批次三 / 第 4.11 节] 本机命令执行配置（15 项，全部可选、带默认值；不加入 REQUIRED_VARS）
+  //   工具每次调用实时读取（SH-46），不得在模块顶层缓存。
+  SHELL_PERMISSION: ShellPermission;      // 权限档位（默认 forbid；AP-01 ~ AP-05）
+  SHELL_APPROVAL_WAIT_MS: number;         // 审批等待上限（默认 120000；AP-16）
+  SHELL_SESSION_MEMORY_ENABLED: boolean;  // 本会话授权记忆（默认开；关闭后退化为逐次询问，AP-13）
+  SHELL_ALLOW_ALL_OPTION: boolean;        // 是否提供「本会话都允许 · 所有命令」（默认提供；AP-15）
+  SHELL_DENY_COOLDOWN_MS: number;         // 拒绝冷却时长（默认 60000；AP-17）
+  SHELL_TYPE: ShellType;                  // shell 类型（默认 cmd；SH-12）
+  SHELL_TIMEOUT_DEFAULT_MS: number;       // 默认超时（默认 30000；SH-15）
+  SHELL_TIMEOUT_MAX_MS: number;           // 超时上限（默认 120000；SH-15）
+  SHELL_OUTPUT_MAX_CHARS: number;         // 输出上限（默认 8000；SH-26 / SH-30）
+  SHELL_MAX_COMMAND_CHARS: number;        // 命令长度上限（默认 4000；SH-11）
+  SHELL_MAX_CONCURRENCY: number;          // 全局并发上限（默认 1；SH-17）
+  SHELL_UTF8_UNIFY: boolean;              // UTF-8 统一编码（默认开；SH-28，语义见文档 §3.4）
+  SHELL_DENY_LIST: string;                // 拒绝清单（逗号分隔；SH-33）
+  SHELL_ALLOW_LIST: string;               // 允许清单（none = 未启用；SH-34）
+  SHELL_EXTRA_ENV_KEYS: string;           // 追加环境变量键（逗号分隔；SH-35）
 
   // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（全部可选，带默认值；不加入 REQUIRED_VARS）
   LLM_LOG_ENABLED: boolean;       // 日志总开关（默认 false，关闭）
@@ -428,6 +505,24 @@ function validateEnv(): EnvConfig {
     //   [批次一 / FR-38] read_file 区间默认行数：默认 2000，范围 1–50000
     //     0 / 负数 / 非整数 → 告警并回退 2000；> 50000 → 钳到 50000（AC-FR-19）
     FILE_READ_DEFAULT_LINES: parseFileReadDefaultLines(Bun.env.FILE_READ_DEFAULT_LINES),
+
+    // [批次三] 本机命令执行配置：缺失/非法一律回退默认值并告警，不退出进程（SH-46）
+    SHELL_PERMISSION: parseShellPermission(Bun.env.SHELL_PERMISSION),
+    SHELL_APPROVAL_WAIT_MS: parseIntClamped(Bun.env.SHELL_APPROVAL_WAIT_MS, 120000, 1000, 3600000, "SHELL_APPROVAL_WAIT_MS"),
+    SHELL_SESSION_MEMORY_ENABLED: parseBoolLoose(Bun.env.SHELL_SESSION_MEMORY_ENABLED, true, "SHELL_SESSION_MEMORY_ENABLED"),
+    SHELL_ALLOW_ALL_OPTION: parseBoolLoose(Bun.env.SHELL_ALLOW_ALL_OPTION, true, "SHELL_ALLOW_ALL_OPTION"),
+    SHELL_DENY_COOLDOWN_MS: parseIntClamped(Bun.env.SHELL_DENY_COOLDOWN_MS, 60000, 0, 3600000, "SHELL_DENY_COOLDOWN_MS"),
+    SHELL_TYPE: parseShellType(Bun.env.SHELL_TYPE),
+    SHELL_TIMEOUT_DEFAULT_MS: parseIntClamped(Bun.env.SHELL_TIMEOUT_DEFAULT_MS, 30000, 1000, 3600000, "SHELL_TIMEOUT_DEFAULT_MS"),
+    SHELL_TIMEOUT_MAX_MS: parseIntClamped(Bun.env.SHELL_TIMEOUT_MAX_MS, 120000, 1000, 3600000, "SHELL_TIMEOUT_MAX_MS"),
+    SHELL_OUTPUT_MAX_CHARS: parseIntClamped(Bun.env.SHELL_OUTPUT_MAX_CHARS, 8000, 500, 24000, "SHELL_OUTPUT_MAX_CHARS"),
+    SHELL_MAX_COMMAND_CHARS: parseIntClamped(Bun.env.SHELL_MAX_COMMAND_CHARS, 4000, 16, 32000, "SHELL_MAX_COMMAND_CHARS"),
+    SHELL_MAX_CONCURRENCY: parseIntClamped(Bun.env.SHELL_MAX_CONCURRENCY, 1, 1, 8, "SHELL_MAX_CONCURRENCY"),
+    SHELL_UTF8_UNIFY: parseBoolLoose(Bun.env.SHELL_UTF8_UNIFY, true, "SHELL_UTF8_UNIFY"),
+    // 拒绝清单 / 允许清单：空值在解析期回退为内置默认集 / none（配置页保存空串会被 validateValue 拒绝，SH-47 ③）
+    SHELL_DENY_LIST: (Bun.env.SHELL_DENY_LIST ?? "").trim() === "" ? DEFAULT_SHELL_DENY_LIST : Bun.env.SHELL_DENY_LIST!.trim(),
+    SHELL_ALLOW_LIST: (Bun.env.SHELL_ALLOW_LIST ?? "").trim() === "" ? DEFAULT_SHELL_ALLOW_LIST : Bun.env.SHELL_ALLOW_LIST!.trim(),
+    SHELL_EXTRA_ENV_KEYS: (Bun.env.SHELL_EXTRA_ENV_KEYS || "").trim(),
 
     // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（可选，带默认值）
     //   开关：默认关闭（仅显式 "true" 才开启，与 LLM_THINKING 语义一致）
@@ -634,6 +729,42 @@ console.log(
       : JSON.stringify(Bun.env.FILE_READ_DEFAULT_LINES)
   }）`,
 );
+
+// [批次三 / SH-49] 命令执行生效摘要：权限档位、shell、两个超时、审批等待、记忆开关、
+//   输出上限、命令长度上限、编码、拒绝清单条数、允许清单是否启用。不含任何敏感值与已授权命令。
+console.log("-".repeat(60));
+console.log(`  SHELL_PERMISSION:      ${env.SHELL_PERMISSION}（${SHELL_PERMISSION_LABEL[env.SHELL_PERMISSION]}）`);
+console.log(`  SHELL_TYPE:            ${env.SHELL_TYPE}`);
+console.log(
+  `  SHELL 超时:            默认=${env.SHELL_TIMEOUT_DEFAULT_MS}ms｜上限=${env.SHELL_TIMEOUT_MAX_MS}ms｜审批等待=${env.SHELL_APPROVAL_WAIT_MS}ms`,
+);
+console.log(
+  `  SHELL 会话记忆:        ${env.SHELL_SESSION_MEMORY_ENABLED ? "开启" : "关闭（逐次询问）"}` +
+    `｜「所有命令」选项=${env.SHELL_ALLOW_ALL_OPTION ? "提供" : "不提供"}` +
+    `｜拒绝冷却=${env.SHELL_DENY_COOLDOWN_MS}ms`,
+);
+console.log(
+  `  SHELL 上限:            输出=${env.SHELL_OUTPUT_MAX_CHARS} 字符｜命令长度=${env.SHELL_MAX_COMMAND_CHARS} 字符｜并发=${env.SHELL_MAX_CONCURRENCY}`,
+);
+console.log(
+  `  SHELL 编码:            ${env.SHELL_UTF8_UNIFY ? "UTF-8 优先（解码失败回退控制台码页并显式告知）" : "仅按控制台码页解码"}`,
+);
+console.log(
+  `  SHELL 清单:            拒绝清单=${env.SHELL_DENY_LIST.split(",").filter((s) => s.trim() !== "").length} 条` +
+    `｜允许清单=${env.SHELL_ALLOW_LIST.toLowerCase() === "none" ? "未启用" : "已启用（只放行首 token 命中的命令）"}`,
+);
+// [SH-31] 关闸/开闸提示：档位含义必须写在启动日志里，避免「为什么模型不执行命令」无从排查
+if (env.SHELL_PERMISSION === "forbid") {
+  console.log("  ⚠️  命令执行未启用：run 工具不在模型可见列表内，模型收到「执行命令」只会说做不到。");
+  console.log("      启用方式二选一：① 配置页 › 本机命令执行配置 › 权限档位 → 需用户同意（保存即生效）；");
+  console.log("      ② .env 写入 SHELL_PERMISSION=ask 后重启。注意 allow 档等于把本机命令行完全交给模型。");
+} else {
+  console.log("  ⚠️  命令执行已启用：命令以服务进程权限在本机真实执行，cwd 守卫不是沙箱，命令可访问任意路径与网络。");
+  if (env.SHELL_PERMISSION === "allow") {
+    console.log("      ⚠️  当前为 allow 档：不再有任何人工闸门，任何命令都会被直接执行。");
+  }
+}
+
 // [Sprint 5.1 / US-LOG-1] LLM 对话日志配置（无敏感信息，直接打印）
 console.log("-".repeat(60));
 console.log(`  LLM_LOG_ENABLED:       ${env.LLM_LOG_ENABLED ? "开启" : "关闭"}`);
