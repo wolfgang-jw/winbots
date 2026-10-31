@@ -34,6 +34,42 @@
                     <!-- [US-2.1] 新建会话动作项：位于菜单栏同一行右侧（F3-1），随菜单常驻，三视图均可见（F3-2） -->
                     <!-- [US-2.7] 链接化：href 携带 ?view=chat&new=1，支持右键「在新标签页中打开链接」并进入空白新会话（F3-8） -->
                     <a class="top-menu__action" id="top-menu-new" href="/?view=chat&new=1">＋ 新建会话</a>
+
+                    <!-- [批次二 / NB-12、NB-14] 提示音设置（界面本地偏好，不进服务端配置，NB-19）
+                         三个开关默认全开且各自独立；音量 0~100%。
+                         审批音子开关此刻「存了但不会响」：批次二没有 approval_request 触发源，
+                         批次三上线后自动生效，文案如实标注。 -->
+                    <div class="cue-settings" id="cue-settings">
+                        <button type="button" class="cue-settings__toggle" id="cue-settings-toggle"
+                                aria-expanded="false" aria-controls="cue-settings-panel"
+                                title="提示音设置">🔔 提示音</button>
+                        <div class="cue-settings__panel" id="cue-settings-panel" hidden>
+                            <div class="cue-settings__title">
+                                提示音设置<span class="cue-settings__hint">仅本浏览器生效</span>
+                            </div>
+                            <label class="cue-settings__row">
+                                <input type="checkbox" id="cue-enabled">
+                                <span>启用提示音（主开关）</span>
+                            </label>
+                            <label class="cue-settings__row cue-settings__row--sub">
+                                <input type="checkbox" id="cue-answer">
+                                <span>回答完成提示音</span>
+                            </label>
+                            <label class="cue-settings__row cue-settings__row--sub">
+                                <input type="checkbox" id="cue-approval">
+                                <span>授权请求提示音<span class="cue-settings__hint">待授权功能上线后生效</span></span>
+                            </label>
+                            <label class="cue-settings__row cue-settings__row--volume">
+                                <span>音量</span>
+                                <input type="range" id="cue-volume" min="0" max="100" step="5" value="60"
+                                       aria-label="提示音音量">
+                                <span id="cue-volume-text">60%</span>
+                            </label>
+                            <div class="cue-settings__note">
+                                提示音只是辅助提醒：回答完成与待审批都有可见文案，关掉声音不影响任何功能。
+                            </div>
+                        </div>
+                    </div>
                 </nav>
             </div>
         </div>
@@ -172,6 +208,9 @@
         </div>
     </footer>
 
+    <!-- [批次二 / NB-12] 提示音机制：必须在 chat.js 之前加载，
+         chat.js 会在 SSE finish 分支调用 window.WinbotsCue.notifyFinish(...) -->
+    <script src="js/cue.js"></script>
     <!-- 聊天页面 JS -->
     <script src="js/chat.js"></script>
     <!-- [US-STATUS-VIEW-3] 状态视图逻辑（jQuery，内容未改动，仅迁移加载位置到 </body> 之前、chat.js 之后） -->

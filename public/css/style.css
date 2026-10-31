@@ -1513,3 +1513,130 @@ padding: 12px 16px;
     color: var(--gray-600);
     cursor: not-allowed;
 }
+
+
+/* ============================================
+   [批次二 / NB-12、NB-14] 提示音设置面板
+   位置：顶部菜单右端（.top-menu 内，动作项之后）
+   说明：.top-menu 为 flex + nowrap，本块 flex-shrink:0 防止窄屏被压缩；
+        面板用绝对定位挂在按钮下方，避免撑开菜单行高
+   ============================================ */
+.cue-settings {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    margin-left: 8px;
+}
+
+.cue-settings__toggle {
+    background: rgba(255, 255, 255, 0.14);
+    color: var(--white);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.2s, color 0.2s;
+}
+
+.cue-settings__toggle:hover {
+    background: rgba(255, 255, 255, 0.24);
+}
+
+.cue-settings__toggle[aria-expanded="true"] {
+    background: var(--egg-yellow);
+    color: var(--gray-800);
+    border-color: var(--egg-yellow);
+}
+
+.cue-settings__panel {
+    position: absolute;
+    top: calc(100% + 10px);
+    right: 0;
+    z-index: 60;                        /* 高于消息区与状态栏 */
+    width: 272px;
+    background: var(--white);
+    color: var(--gray-800);
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-hover);
+    padding: 14px 16px;
+    text-align: left;
+}
+
+.cue-settings__title {
+    font-size: 0.9rem;
+    font-weight: 700;
+    margin-bottom: 10px;
+}
+
+.cue-settings__hint {
+    margin-left: 6px;
+    font-size: 0.72rem;
+    font-weight: 400;
+    color: var(--gray-600);
+}
+
+.cue-settings__row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 0;
+    font-size: 0.82rem;
+    color: var(--gray-700);
+    cursor: pointer;
+}
+
+.cue-settings__row--sub {
+    padding-left: 20px;                 /* 视觉上从属主开关 */
+}
+
+.cue-settings__row--volume {
+    gap: 10px;
+}
+
+.cue-settings__row input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    accent-color: var(--tomato-red);
+    cursor: pointer;
+}
+
+.cue-settings__row input[type="range"] {
+    flex: 1;
+    accent-color: var(--tomato-red);
+}
+
+#cue-volume-text {
+    width: 40px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--gray-600);
+}
+
+.cue-settings__note {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--gray-200);
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--gray-600);
+}
+
+@media (max-width: 600px) {
+    .cue-settings {
+        margin-left: 4px;
+    }
+
+    .cue-settings__toggle {
+        padding: 5px 9px;
+        font-size: 0.74rem;
+    }
+
+    .cue-settings__panel {
+        width: 236px;
+    }
+}

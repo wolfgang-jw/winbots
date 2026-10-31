@@ -145,6 +145,8 @@
         currentView: "chat",
         /** @type {boolean} [US-HF-5] 是否处于 DSML 块内（前端兜底过滤状态） */
         dsmlBlocked: false,
+        /** @type {string} [批次二 / NB-06、AC-CUE-02] 本轮已收到的 notice 文案（"" 表示本轮没有 notice） */
+        currentNoticeText: "",
     };
 
     // ============================================
@@ -1092,6 +1094,8 @@
         state.drainTimedOut = false;
         // [US-HF-5] 本轮回答开始：复位 DSML 过滤状态，避免上一条回答污染下一条
         state.dsmlBlocked = false;
+        // [批次二 / NB-06] 本轮回答开始：复位本轮 notice 文案（终态文案守卫 + 截断抑制判据）
+        state.currentNoticeText = "";
 
         // 创建 AbortController
         state.abortController = new AbortController();
@@ -1198,6 +1202,22 @@
                                 // [US-3.7] 正常收尾经统一入口（幂等）
                                 finalizeOnce(false);
 
+                                // [批次二 / NB-02、NB-05、NB-07] 终态语义事件：唯一依据是服务端 finish。
+                                //   ① 只放在本分支，且已在上面 `if (state.draining) { … break; }` 之后
+                                //      —— 用户点「停止」的排空态 / 断连 / 报错都不会走到这里（NB-03 ②③）；
+                                //   ② 绝不放进 finalizeOnce()：它同时被排空与 abort 路径调用，
+                                //      放进去会让「用户中止」也响一声（NB-03 ②、AC-CUE-03）；
+                                //   ③ 轮次标识必须在此刻取值 —— finally 会把 currentRequestId 置 null，
+                                //      在延时回调里读会全部变成 "unknown"，一次性闩锁失效（NB-04）；
+                                //   ④ 150ms 延时、去重、截断抑制、开关判定全部下沉到 cue.js，
+                                //      此处不做任何「光标是否消失 / 按钮是否可用」的渲染状态推断。
+                                if (window.WinbotsCue) {
+                                    window.WinbotsCue.notifyFinish({
+                                        roundId: state.currentRequestId || "unknown",
+                                        reason: data.reason || "",
+                                    });
+                                }
+
                                 // [US-3.6] 暂存模型名
                                 if (data.raw && data.raw.model) {
                                     state.currentModel = data.raw.model;
@@ -1240,13 +1260,34 @@
                                         state.currentStartTime = 0;
                                     }
                                 }
-                                setStatus(`✅ 完成 (${getTimeStr()})`);
+                                // [批次二 / NB-13、AC-CUE-02] 可见终态文案：提示音不是唯一信号（听障 / 静音 / 共享办公）。
+                                //   若本轮已收到 notice（轮次上限截断等），保留 notice 文案不被「✅ 完成」覆盖，
+                                //   否则「答案被截断」在界面上就看不到了（AC-CUE-02 后半句）。
+                                if (state.currentNoticeText) {
+                                    setStatus(`ℹ️ ${state.currentNoticeText}`, "chat-status--notice");
+                                } else {
+                                    setStatus(`✅ 完成 (${getTimeStr()})`);
+                                }
                                 break;
 
                             case "notice":
                                 // [Sprint 5.2 / US-STAB-3] 截断/提示类事件（非错误样式）：
                                 //   如「已达工具调用轮次上限」。不视为失败，仅提示用户。
+                                // [批次二 / NB-06] 记录本轮 notice 文案：终态文案守卫（finish 分支）用
+                                state.currentNoticeText = data.message || "";
                                 setStatus(`ℹ️ ${data.message}`, "chat-status--notice");
+
+                                // [批次二 / NB-06、AC-CUE-02] 截断类 notice 到达 → 抑制本轮完成音。
+                                //   服务端是「finish 先发、notice 后发」（src/routes/chat.ts 第 802 / 812 行），
+                                //   二者通常在同一分片内同步处理，因此这里能赶在 150ms 排期发声之前取消。
+                                //   非截断类 notice（如「模型未返回正文，本轮已执行工具…」）由 cue.js 内部
+                                //   按文案特征忽略，不会漏响正常完成。
+                                if (window.WinbotsCue) {
+                                    window.WinbotsCue.notifyNotice({
+                                        roundId: state.currentRequestId || "unknown",
+                                        message: data.message,
+                                    });
+                                }
                                 break;
 
                             case "error":
