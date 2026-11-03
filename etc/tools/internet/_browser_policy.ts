@@ -6,8 +6,11 @@
  * [设计] §10.1 判定顺序、§10.2 名单、§10.6 脱敏；D-08（新增黑名单项）
  */
 import { lookup as dnsLookupCb } from "node:dns";
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
 import { truncate } from "./_common";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 
 export type BlockReason =
   | "protocol"
@@ -49,12 +52,19 @@ export function parseHostList(raw: string): string[] {
   return out;
 }
 
-function cachedList(raw: string): string[] {
-  const key = String(raw ?? "");
-  let v = listCache.get(key);
+/**
+ * 名单取值。
+ * [规范 §7.2] 域名名单已下沉为本组设置项，声明类型是 `string_array`（落盘为 JSON 文本），
+ * 因此这里拿到的是数组；仍过一次「合法性过滤」，与改造前「逗号文本 → 过滤」的语义一致。
+ */
+function hostList(name: "domain_allowlist" | "domain_blocklist"): string[] {
+  const raw = B.get<string[]>(name);
+  if (raw.length === 0) return [];
+  const cacheKey = raw.join(",");
+  let v = listCache.get(cacheKey);
   if (!v) {
-    v = parseHostList(key);
-    listCache.set(key, v);
+    v = parseHostList(cacheKey);
+    listCache.set(cacheKey, v);
   }
   return v;
 }
@@ -186,7 +196,7 @@ export function precheckUrl(
   const host = u.hostname.toLowerCase();
 
   // ③ IP 字面量
-  if (isIpLiteral(host) && env.BROWSER_BLOCK_PRIVATE_NET && isPrivateAddress(host)) {
+  if (isIpLiteral(host) && B.get<boolean>("block_private_net") && isPrivateAddress(host)) {
     return {
       ok: false,
       verdict: deny("ip_private"),
@@ -196,12 +206,12 @@ export function precheckUrl(
   }
 
   // ④ 黑名单优先（BR-53）
-  if (matchHostList(host, cachedList(env.BROWSER_DOMAIN_BLOCKLIST))) {
+  if (matchHostList(host, hostList("domain_blocklist"))) {
     return { ok: false, verdict: deny("blocklist"), host, detail: `主机 ${host} 命中域名黑名单` };
   }
 
   // ⑤ 白名单非空且不匹配
-  const allow = cachedList(env.BROWSER_DOMAIN_ALLOWLIST);
+  const allow = hostList("domain_allowlist");
   if (allow.length > 0 && !matchHostList(host, allow)) {
     return { ok: false, verdict: deny("not_allowlisted"), host, detail: `主机 ${host} 不在域名白名单内` };
   }
@@ -274,17 +284,17 @@ export async function judgeRequestUrl(raw: string): Promise<Verdict> {
 
   // IP 字面量：无需 DNS
   if (isIpLiteral(host)) {
-    if (env.BROWSER_BLOCK_PRIVATE_NET && isPrivateAddress(host)) return deny("ip_private");
+    if (B.get<boolean>("block_private_net") && isPrivateAddress(host)) return deny("ip_private");
     return ALLOW;
   }
 
-  const block = cachedList(env.BROWSER_DOMAIN_BLOCKLIST);
+  const block = hostList("domain_blocklist");
   if (block.length > 0 && matchHostList(host, block)) return deny("blocklist");
-  const allow = cachedList(env.BROWSER_DOMAIN_ALLOWLIST);
+  const allow = hostList("domain_allowlist");
   if (allow.length > 0 && !matchHostList(host, allow)) return deny("not_allowlisted");
 
   // 私有网段阻断：解析主机名后判定（DNS 重绑定只能尽力，登记为已知缺口）
-  if (env.BROWSER_BLOCK_PRIVATE_NET) {
+  if (B.get<boolean>("block_private_net")) {
     const ips = await resolveCached(host);
     if (ips && ips.some((ip) => isPrivateAddress(ip))) return deny("dns_private");
   }
@@ -355,9 +365,9 @@ export function previewValue(value: string, keep = 40): string {
 // ============================================================
 
 export function downloadAllowed(): boolean {
-  return env.BROWSER_ALLOW_DOWNLOAD === true;
+  return B.get<boolean>("allow_download") === true;
 }
 
 export function uploadAllowed(): boolean {
-  return env.BROWSER_ALLOW_UPLOAD === true;
+  return B.get<boolean>("allow_upload") === true;
 }

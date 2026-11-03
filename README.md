@@ -36,7 +36,7 @@ BotsAI/
 └── README.md          # 本说明文档
 ```
 
-> 📁 首次启动后会自动创建两个**运行期**目录：`data/`（SQLite 数据库、`.env` 备份、LLM 对话日志）与 `working/`（AI 文件工具的沙箱根，见 `FILE_ROOT_DIR`）。两者都不需要你手工创建。
+> 📁 首次启动后会自动创建两个**运行期**目录：`data/`（SQLite 数据库、`.env` 备份、LLM 对话日志）与 `working/`（AI 文件工具的沙箱根，可用工具配置 `etc__tools__local__file_root_dir` 改名）。两者都不需要你手工创建。
 
 ---
 
@@ -73,20 +73,13 @@ LLM_THINKING=true
 LLM_REASONING_EFFORT=high
 
 # ============================================
-# 文件工具配置（US-CFG-1）
+# 文件工具配置 → 已下沉为「工具配置」（见下方 2.4 节）
 # ============================================
-# 总操作目录：AI 文件操作的唯一沙箱根，与 data 目录平级。
-#   默认 working，即 <项目根>/working；所有文件操作限定在此目录内，越界拒绝。
-FILE_ROOT_DIR=working
-# 读开关：控制「列出目录/读取文件/查看信息/搜索文件路径/搜索文件内容」。
-#   默认开启（读操作无副作用）。
-FILE_READ_ENABLED=true
-# 新建开关：控制「创建文件夹/创建新文件/追加内容」。
-#   默认关闭（写操作需显式开启）。
-FILE_CREATE_ENABLED=false
-# 修改开关：控制「整篇覆盖/定点替换/移动重命名/删除」。
-#   默认关闭（含删除，破坏性最强，请谨慎开启）。
-FILE_MODIFY_ENABLED=false
+# 总操作目录、读/新建/修改开关等都不再写在 .env 的固定键里，而是：
+#   · 在配置页 › 工具配置（目录 → 工具组）里逐级开启；
+#   · 或直接手写托管键：etc__tools__local__file_root_dir / TOOLON__local__fileRead。
+# 旧的 FILE_ROOT_DIR / FILE_READ_ENABLED / FILE_CREATE_ENABLED / FILE_MODIFY_ENABLED
+#   已在本次升级中删除（前者迁为目录设置项，后三者按规范「删除、不迁移」）。
 
 # ============================================
 # LLM 对话日志配置（Sprint 5.1）
@@ -118,32 +111,13 @@ SSE_HEARTBEAT_MS=10000
 TOOL_RESULT_MAX_CHARS=32000
 
 # ============================================
-# 互联网工具配置（需求域 R）
+# 互联网工具配置 → 已下沉为「工具配置」（见下方 2.4 节）
 # ============================================
-# 总开关：联网工具（网页检索/抓取）是否出现在模型可见工具列表；保存后热更立即生效。
-INTERNET_ENABLED=true
-# 供应商：检索与抓取各自独立选择（本期内置 deepseek），缺密钥只影响各自的 kind。
-INTERNET_SEARCH_PROVIDER=deepseek
-INTERNET_FETCH_PROVIDER=deepseek
-# 供应商密钥：留空 = 免鉴权（请求完全省略鉴权头）；不设全局回退。
-#   删除已保存的密钥请用配置页的「清空」按钮，不要用留空表达清空。
-INTERNET_DEEPSEEK_API_KEY=
-# 基址与端点路径（手工维护，不进配置页）：仅当供应商实际地址与默认值不同时才需要改。
-#   ✅ 已按 DeepSeek 官方文档核实：Search = /v1/tools/search，Fetch = /v1/tools/fetch。
-INTERNET_DEEPSEEK_BASE_URL=https://api.deepseek.com
-INTERNET_DEEPSEEK_SEARCH_PATH=/v1/tools/search
-INTERNET_DEEPSEEK_FETCH_PATH=/v1/tools/fetch
-# 检索默认条数（工具侧最终仍钳制到 1–10）。
-INTERNET_DEFAULT_COUNT=5
-# 单次上游请求超时（毫秒）；点「停止」同样会中止在途请求。
-INTERNET_TIMEOUT_MS=20000
-# 抓取回灌上限（字符）：单次抓取正文回灌上限，超限按三要素标注截断。
-INTERNET_FETCH_MAX_CHARS=8000
-# 续读暂存四要素：TTL（秒）/ 单会话条数 / 单条字符上限 / 全局字符上限。
-INTERNET_STORE_TTL_S=300
-INTERNET_STORE_MAX_ITEMS_PER_SESSION=8
-INTERNET_STORE_MAX_CHARS_PER_ITEM=200000
-INTERNET_STORE_MAX_CHARS_TOTAL=4194304
+# 联网开关与全部供应商参数都改为 internet/web.ts 的组设置项，例如：
+#   TOOLON__internet__web=true                      # 组开关（默认关）
+#   TOOLSET__internet__web__deepseek_api_key=       # 供应商密钥（留空=免鉴权）
+#   TOOLSET__internet__web__timeout_ms=20000
+# 旧的 INTERNET_ENABLED 及各 INTERNET_* 键已删除或迁移，请勿再手写。
 ```
 
 | 配置项 | 说明 | 示例 | 是否必填 |
@@ -155,29 +129,14 @@ INTERNET_STORE_MAX_CHARS_TOTAL=4194304
 | `LLM_THINKING_MODE` | 思考字段下发方式（`none` 均不下发 / `effort` 仅推理强度 / `thinking` 仅思考开关 / `both` 两者都下发） | `none` | 可选（默认 `none`） |
 | `LLM_THINKING` | 思考开关字段的**取值来源**（是否下发见上行） | `true` / `false` | 可选 |
 | `LLM_REASONING_EFFORT` | 推理强度字段的**取值来源**（是否下发见上行） | `low` / `high` / `max` | 可选 |
-| `FILE_ROOT_DIR` | AI 文件操作的沙箱总目录（与 `data` 平级） | `working` | 可选（默认 `working`） |
-| `FILE_READ_ENABLED` | 读操作开关（列目录/读文件/查信息/搜索） | `true` / `false` | 可选（默认 `true`） |
-| `FILE_CREATE_ENABLED` | 新建操作开关（建目录/建文件/追加） | `true` / `false` | 可选（默认 `false`） |
-| `FILE_MODIFY_ENABLED` | 修改操作开关（覆盖/替换/移动/**删除**） | `true` / `false` | 可选（默认 `false`） |
+| 工具配置（原 `FILE_*` / `INTERNET_*` / `BROWSER_*` / `SHELL_*`） | 已全部下沉为「目录设置项 / 组设置项 / 开关」，在配置页 › 工具配置里维护，见 **2.8 节** | `TOOLON__local__fileRead=true` | 可选（默认**全部关闭**） |
 | `LLM_LOG_ENABLED` | LLM 对话日志开关（供问题分析） | `true` / `false` | 可选（默认 `false`） |
 | `LLM_LOG_FILE` | 日志文件路径（JSONL） | `data/llm_logs.jsonl` | 可选（默认 `data/llm_logs.jsonl`） |
 | `LLM_LOG_MAX_ROWS` | 日志条数上限（超出清理最旧） | `2000` | 可选（默认 `2000`） |
 | `MAX_TOOL_ROUNDS` | 工具调用轮次上限（超出则截断并提示） | `8` | 可选（默认 `8`） |
 | `SSE_HEARTBEAT_MS` | SSE 心跳间隔（毫秒，保活连接） | `10000` | 可选（默认 `10000`） |
 | `TOOL_RESULT_MAX_CHARS` | 工具结果总长度上限（字符，超限截断并标注）；与具体工具无关的平台兜底 | `32000` | 可选（默认 `32000`） |
-| `INTERNET_ENABLED` | 联网工具总开关（是否出现在模型可见工具列表，热更生效） | `true` / `false` | 可选（默认 `true`） |
-| `INTERNET_SEARCH_PROVIDER` | 网页检索供应商 | `deepseek` | 可选（默认 `deepseek`） |
-| `INTERNET_FETCH_PROVIDER` | 网页抓取供应商 | `deepseek` | 可选（默认 `deepseek`） |
-| `INTERNET_DEEPSEEK_API_KEY` | 供应商密钥；**留空＝免鉴权**，需删除请用配置页「清空」 | `sk-xxxxxxxx` | 可选（默认空） |
-| `INTERNET_DEEPSEEK_BASE_URL` | 供应商基址（可覆盖，手工维护） | `https://api.deepseek.com` | 可选 |
-| `INTERNET_DEEPSEEK_SEARCH_PATH` / `_FETCH_PATH` | 检索/抓取端点路径（已按官方文档核实，见 §十） | `/v1/tools/search` | 可选 |
-| `INTERNET_DEFAULT_COUNT` | 检索默认条数（最终钳制 1–10） | `5` | 可选（默认 `5`） |
-| `INTERNET_TIMEOUT_MS` | 单次上游请求超时（毫秒） | `20000` | 可选（默认 `20000`） |
-| `INTERNET_FETCH_MAX_CHARS` | 抓取回灌上限（字符） | `8000` | 可选（默认 `8000`） |
-| `INTERNET_STORE_TTL_S` | 续读暂存 TTL（秒） | `300` | 可选（默认 `300`） |
-| `INTERNET_STORE_MAX_ITEMS_PER_SESSION` | 暂存单会话条数上限 | `8` | 可选（默认 `8`） |
-| `INTERNET_STORE_MAX_CHARS_PER_ITEM` | 暂存单条字符上限 | `200000` | 可选（默认 `200000`） |
-| `INTERNET_STORE_MAX_CHARS_TOTAL` | 暂存全局字符上限（默认 4 MB） | `4194304` | 可选（默认 `4194304`） |
+| 工具配置（原 `INTERNET_*`） | 见 **2.8 节**；联网开关与供应商参数均为 `internet/web.ts` 的组设置项 | `TOOLSET__internet__web__deepseek_api_key=` | 可选 |
 
 ### 2.2 修改 API Key（必做）
 
@@ -222,15 +181,16 @@ LLM_MODEL=deepseek-chat
 
 开启文件工具后，AI 可读写指定目录。请务必了解以下安全边界：
 
-1. **沙箱边界**：所有文件操作限定在 `FILE_ROOT_DIR`（默认 `working`）目录内，
-   使用 `../` 等越界路径会被**直接拒绝**，AI 无法访问项目源码、配置文件或系统目录。
-2. **分级开关**：读 / 新建 / 修改三类操作由**独立开关**控制，默认「读开、新建关、修改关」。
-   建议按需逐步开启，不要一次性全部打开。
+1. **沙箱边界**：所有文件操作限定在「总操作目录」（目录设置项 `etc__tools__local__file_root_dir`，
+   默认 `working`）内，使用 `../` 等越界路径会被**直接拒绝**，AI 无法访问项目源码、配置文件或系统目录。
+2. **目录 / 组两级开关**：先开目录（如 `local`），再开具体工具组（`local/fileRead`、`local/fileNew`、
+   `local/fileModify`、`local/shell`）。**升级后初始态全部为关闭**，需要到配置页重新开启一次。
+   父目录关闭时，其下所有工具组一律不可用（页面上灰显且无法勾选）。
 3. **删除进回收站**：删除操作**不会物理销毁**文件，而是移入 `working/.trash`（带时间戳），
-   可手动恢复。删除能力随「修改开关」统一控制，无独立删除开关。
+   可手动恢复。删除能力随 `local/fileModify` 工具组统一控制，无独立删除开关。
 4. **破坏性确认**：覆盖、删除等操作需 AI 显式声明确认意图，降低误操作概率。
 
-> ⚠️ 请勿将 `FILE_ROOT_DIR` 指向项目根目录或系统重要目录，以免暴露源码或误改数据。
+> ⚠️ 请勿把总操作目录（`etc__tools__local__file_root_dir`）指向项目根目录或系统重要目录，以免暴露源码或误改数据。
 
 ### 2.7 日志隐私说明（重要）
 
@@ -248,12 +208,29 @@ LLM_MODEL=deepseek-chat
 
 除用记事本修改 `.env` 外，也可在浏览器中打开 **配置页**（`http://localhost:3001/?view=config`，或点击顶部菜单「配置」）：
 
-1. **可视化编辑**：页面按分组列出全部 22 项配置（应用 / LLM / 文件 / 日志 / 稳定性 / 互联网工具 6 组），含当前值与说明；
+1. **可视化编辑**：页面分两块 —— ①**系统配置项**（应用 / LLM / 日志 / 稳定性 4 组，共 12 项）；
+   ②**工具配置树**（按 `etc/tools` 的目录 → 工具组逐级展开，组内可展开设置项）。全部含当前值与说明；
 2. **密钥不回显**：`LLM_API_KEY` 与各供应商密钥仅显示掩码（如 `sk-****cdef`），**留空表示不修改**；
 3. **保存需确认**：点击「保存」会弹二次确认，确认后写回 `.env`；
 4. **自动备份**：每次保存前会把旧 `.env` 备份到 `data/envbk/`（只保留最近 20 份），改错可回退；
 5. **生效说明**：保存后会明确提示「哪些已立即生效、哪些需重启服务」（仅 `APP_PORT` 需重启）；
-6. **遮蔽提示**：若某键已被系统环境变量占用，页面会给出橙色只读提示（改 `.env` 需先清除系统环境变量）。
+6. **遮蔽提示**：若某键已被系统环境变量占用，页面会给出橙色只读提示（改 `.env` 需先清除系统环境变量）；
+7. **工具树门禁**：工具节点显示「已开启 / 已关闭 / 上级目录已关闭 / 加载失败（原因）」；父目录关闭或工具组挂起时节点**灰显不可操作**；
+   **勾上父目录后，其下工具组立即变为可勾选**（无需刷新页面），取消父目录则其下立即灰显且已勾的「开启」草稿被撤回；
+   后端在保存时会独立复查（前端灰显只是提示，不是安全边界）；
+8. **刷新按钮**：「🔄 刷新」会重新扫描 `etc/tools`，新增/删除入口文件后点一下即可生效，无需重启；
+9. **命名规则**：入口文件必须形如 `name.ts`（小写字母数字，可含 `_`，不以 `_` 开头、不含连续 `__`）；
+   不合规文件会被忽略并在节点下列出「已忽略：bad-name.ts（…）」；`_` 前缀是私有模块，不注册为工具；
+10. **两类设置项**：目录设置项 `etc__tools__local__<键>`（本目录及子级可读）、
+    组设置项 `TOOLSET__<目录>__<文件>__<键>`（仅本组可读）；跨组读取会直接报错；
+11. **开关键**：组开关 `TOOLON__<目录>__<文件>`、目录开关 `TOOLON__<目录>`；**值等于默认即删键**，
+    所以「恢复默认」等于「关掉」——默认态是**全部关闭**；
+12. **遗留键区块**：以受管前缀开头但没有对应声明的键会集中列在页面底部，可勾选后整体删除（删除不备份）；
+13. **热更新边界**：入口文件（`name.ts`）改动**免重启**；私有模块（`_` 前缀）改动**需重启进程**——
+    这是设计的已知限制，页面上也有同样提示。
+14. **保存失败看得见**：后端逐项返回的拒绝原因会落到**具体那一行**（系统项 / 目录节点 / 工具组 / 组设置项），
+    若落在折叠的设置项里会自动展开并滚到可见处，同时汇总到工具区顶部——不会再只剩一句「存在不合法变更」；
+    灰显（上级关闭 / 挂起）节点下的输入框**不参与提交**，避免「没动过却报不合法」。
 
 > ⚠️ 配置页**无身份认证**，仅限本机可信环境使用（详见「八、关于本项目」的免责声明）。
 > 首次保存时若 `.env` 不存在，会自动创建（此时不备份）。

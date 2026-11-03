@@ -9,7 +9,15 @@
  * ⚠️ 进程清理钩子在本文件自行注册，`src/index.ts` 保持零改动（NB-02）。
  */
 import type { ToolContext } from "@/tools";
-import { env } from "@/infra/env";
+import { groupScope, groupState } from "@/infra/settings";
+
+/**
+ * [规范 §7.3] 本文件服务 internet/browser 组。
+ * ⚠️ 本文件含**定时器路径**（sweepOnce / TTL）：组一旦被挂起，严格读会抛
+ *   ERR_UNDECLARED_SETTING，定时器里就变成 unhandled rejection、会话再也收不掉。
+ *   故这些取值用 getSoft(key, 旧默认值)：键不可读时才回落，正常路径仍以声明为准。
+ */
+const B = groupScope("internet", "browser");
 import type { BrowserDriver, ElementAnchor, PageSignature } from "./_browser_driver";
 import { newDriver } from "./_browser_driver";
 // [REQ-browser BR-20/BR-21] 标签清单类型：只取**类型**（_browser_targets 不反向依赖本文件，不会形成循环）
@@ -194,7 +202,7 @@ export function sessionCount(): number {
  * `browser.ts` 的 session_limit 失败文案也用它 —— 否则「文案里的数」与「实际拦截用的数」会分叉。
  */
 export function sessionLimit(): number {
-  return Math.max(1, Number(env.BROWSER_MAX_SESSIONS) || 2);
+  return Math.max(1, Number(B.getSoft<number>("max_sessions", 2)) || 2);
 }
 
 /**
@@ -203,7 +211,7 @@ export function sessionLimit(): number {
  * 否则文案说 180s、实际 10s 就把人骗了。
  */
 export function sessionTtlSeconds(): number {
-  return Math.max(10, Number(env.BROWSER_SESSION_TTL_S) || 180);
+  return Math.max(10, Number(B.getSoft<number>("session_ttl_s", 180)) || 180);
 }
 
 export function getSession(sessionId?: string): Session | null {
@@ -318,7 +326,7 @@ async function createSession(key: string): Promise<CreateResult> {
     profileDir,
     tempProfile,
     // [FIX-WIN-03] 窗口模式在此定格；open 会据此判断「配置是否已变更，需要按新配置重建」
-    headless: env.BROWSER_HEADLESS,
+    headless: B.get<boolean>("headless"),
     createdAt: startedAt,
     lastUsedAt: startedAt,
     inFlight: 0,
@@ -344,7 +352,7 @@ async function createSession(key: string): Promise<CreateResult> {
   startSweeper();
 
   const launch = await driver.launch({
-    headless: env.BROWSER_HEADLESS,
+    headless: B.get<boolean>("headless"),
     profileDir,
     allowDownload: downloadAllowed(),
     allowUpload: uploadAllowed(),
@@ -430,8 +438,8 @@ export class SessionBusyError extends Error {
  */
 export async function runSerial<T>(s: Session, fn: () => Promise<T>): Promise<T> {
   const waitLimit =
-    Math.max(1000, Number(env.BROWSER_ACTION_TIMEOUT_MS) || 8000) +
-    Math.max(1000, Number(env.BROWSER_NAV_TIMEOUT_MS) || 20000);
+    Math.max(1000, Number(B.getSoft<number>("action_timeout_ms", 8000)) || 8000) +
+    Math.max(1000, Number(B.getSoft<number>("nav_timeout_ms", 20000)) || 20000);
 
   const prev = s.chain;
   let release!: () => void;
@@ -547,8 +555,8 @@ export async function closeAll(reason: string): Promise<CloseReport[]> {
 /** `close(scope=tab)`：回空白页并清空 ref，实例保留（XB-01 单标签） */
 export async function resetTab(s: Session): Promise<{ ok: boolean; detail: string }> {
   const r = await s.driver.navigate("about:blank", {
-    timeoutMs: Math.max(1000, Number(env.BROWSER_NAV_TIMEOUT_MS) || 20000),
-    stableMs: Math.max(0, Number(env.BROWSER_STABLE_WINDOW_MS) || 400),
+    timeoutMs: Math.max(1000, Number(B.getSoft<number>("nav_timeout_ms", 20000)) || 20000),
+    stableMs: Math.max(0, Number(B.getSoft<number>("stable_window_ms", 400)) || 400),
   });
   bumpGeneration(s);
   s.baseline = null;
@@ -586,11 +594,14 @@ export async function sweepOnce(): Promise<void> {
   if (sweeping) return;
   sweeping = true;
   try {
-    if (!env.BROWSER_ENABLED) {
+    // [规范 §8.3 / §8.4] 旧总开关 BROWSER_ENABLED 已废弃：改为「组状态」判定，
+    //   组被关闭 / 挂起时主动回收全部会话（否则关掉开关后浏览器进程会一直留着）。
+    //   这里读 groupState（不抛错），不会因组挂起把定时器打崩。
+    if (!groupState("internet/browser").available) {
       const all = listSessions();
       if (all.length > 0) {
-        console.log(`[browser] 总开关已关闭，主动回收全部会话（${all.length} 个）`);
-        await closeAll("总开关关闭");
+        console.log(`[browser] 工具组已关闭或不可用，主动回收全部会话（${all.length} 个）`);
+        await closeAll("工具组关闭");
       }
       return;
     }
@@ -669,7 +680,7 @@ function registerProcessHooks(): void {
 
 /** [REQ-browser BR-22/NB-04] 单会话标签上限（1 = 退回单标签语义） */
 export function sessionMaxTabs(): number {
-  return Math.min(20, Math.max(1, Number(env.BROWSER_MAX_TABS) || 10));
+  return Math.min(20, Math.max(1, Number(B.getSoft<number>("max_tabs", 10)) || 10));
 }
 
 /** 取（必要时创建）某标签的状态条目；新建的条目文档状态为「空」（ref 不跨标签复用） */

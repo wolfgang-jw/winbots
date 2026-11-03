@@ -7,7 +7,10 @@
  * ⚠️ 本文件不导出 tools（BR-04），只被 _browser_* 引用。
  */
 import { fail, type EnvelopeFail } from "./_common";
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 
 export type BrowserErrorCode =
   | "invalid_request"
@@ -66,7 +69,7 @@ export function suggestionOf(code: BrowserErrorCode, c: FailCtx = {}): string {
       return "请按提示修正参数后重试（本次为本地校验失败，尚未对页面做任何操作）。";
     case "browser_unavailable":
       return (
-        `请检查配置项 BROWSER_EXECUTABLE_PATH（当前值 ${env.BROWSER_EXECUTABLE_PATH}），` +
+        `请让用户检查「浏览器可执行文件路径」配置（当前值 ${B.get<string>("executable_path")}），` +
         "或确认本机已安装 Edge/Chrome。这属于配置问题，原样重试不会成功。" +
         (c.attemptedPaths && c.attemptedPaths.length > 0
           ? `已尝试路径：${c.attemptedPaths.join(" / ")}。`
@@ -76,7 +79,7 @@ export function suggestionOf(code: BrowserErrorCode, c: FailCtx = {}): string {
       return "请重新调用 open 打开该地址；旧会话的 ref 已全部失效。";
     case "session_limit":
       return (
-        `已达并发会话上限 ${c.limit ?? env.BROWSER_MAX_SESSIONS}` +
+        `已达并发会话上限 ${c.limit ?? B.get<number>("max_sessions")}` +
         (c.occupied && c.occupied.length > 0 ? `（当前占用：${c.occupied.join(" / ")}）` : "") +
         // [REQ-browser 第 4 章] 失败保活（BR-04）会让名额更容易被占满，必须说清「失败的会话也算占用」
         "。注意：打开失败后被保留的会话同样占用名额，直到空闲回收或主动 close。" +
@@ -85,8 +88,8 @@ export function suggestionOf(code: BrowserErrorCode, c: FailCtx = {}): string {
     case "tab_limit":
       // [REQ-browser BR-22] 与 session_limit 分开：那个要「关会话再重试」，这个要「关标签」
       return (
-        `已达单会话标签上限 ${env.BROWSER_MAX_TABS}（配置项 BROWSER_MAX_TABS）。` +
-        "请先关闭当前标签（close 的 scope=tab）再打开新页面，或由用户调高 BROWSER_MAX_TABS 后重试；" +
+        `已达单会话标签上限 ${B.get<number>("max_tabs")}（配置项「单会话标签数上限」）。` +
+        "请先关闭当前标签（close 的 scope=tab）再打开新页面，或由用户调高该上限后重试；" +
         "原样重试不会成功。"
       );
     case "session_busy":
@@ -105,23 +108,24 @@ export function suggestionOf(code: BrowserErrorCode, c: FailCtx = {}): string {
       return "请核对地址是否正确；若为证书问题，请改用可信任的 https 站点。可重试一次。";
     case "navigation_timeout":
       return (
-        `导航超时（超过 ${c.timeoutMs ?? env.BROWSER_NAV_TIMEOUT_MS}ms 未完成）。可重试一次，` +
+        `导航超时（超过 ${c.timeoutMs ?? B.get<number>("nav_timeout_ms")}ms 未完成）。可重试一次，` +
         "或改访问更轻量的页面。"
       );
     case "blocked_url":
       return (
-        `目标地址被域名/网段策略阻断（${c.host ?? "未知主机"}）。如确需访问，请由用户调整 ` +
-        "BROWSER_DOMAIN_ALLOWLIST / BROWSER_DOMAIN_BLOCKLIST / BROWSER_BLOCK_PRIVATE_NET；重试不会成功。"
+        `目标地址被域名/网段策略阻断（${c.host ?? "未知主机"}）。如确需访问，请让用户调整配置页中的 ` +
+        "「域名白名单 / 域名黑名单 / 阻断内网地址」；重试不会成功。"
       );
     case "blocked_action":
-      return "该操作被策略阻止（下载/上传/文件选择）。如确需执行，请由用户修改 BROWSER_ALLOW_DOWNLOAD / BROWSER_ALLOW_UPLOAD 后重试。";
+      return "该操作被策略阻止（下载/上传/文件选择）。如确需执行，请让用户调整配置页中的「允许下载 / 允许上传」后重试。";
     case "action_timeout":
       return (
-        `单步动作超时（超过 ${c.timeoutMs ?? env.BROWSER_ACTION_TIMEOUT_MS}ms）。可重试一次；` +
+        `单步动作超时（超过 ${c.timeoutMs ?? B.get<number>("action_timeout_ms")}ms）。可重试一次；` +
         "若频繁出现，说明该页面脚本繁忙，建议减少单次动作数量。"
       );
     case "tool_disabled":
-      return "浏览器工具当前已禁用；如需使用请由用户开启总开关（BROWSER_ENABLED）后重试。";
+      // [规范 §8.6] 文案面向「模型能做什么」：模型改不了配置，禁止写「请修改配置后重试」
+      return "该能力当前不可用；请改用其他可用工具完成任务，或直接说明该能力暂不可用，不要原地重试。";
     case "cancelled":
       return "用户已停止本次回答，未完成的步骤不会继续执行。";
     case "internal_error":

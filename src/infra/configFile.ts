@@ -4,9 +4,13 @@
  *
  * 设计要点：
  * 1. 路径基准与 src/infra/env.ts 完全一致（import.meta.dir 而非 process.cwd()）；
- * 2. 逐键替换、保留注释与行序，不重生成文件；
+ * 2. 逐键替换 / 逐键删除、保留注释与行序，不重生成文件；
  * 3. 原子写（tmp + rename），失败回退 copy；
- * 4. 独立于 etc/tools/local 文件沙箱，不受 FILE_MODIFY_ENABLED 影响（需求 §4.7 S5）。
+ * 4. 独立于 etc/tools/local 文件沙箱，不受工具开关影响（需求 §4.7 S5）。
+ *
+ * ⚠️ 工具配置**不再**在这里声明：类型、默认值、范围、说明的唯一来源是 etc/tools/** 的
+ *    `settings` 声明（规范 §3.2 默认值单一来源 / §9.2 存量分流）。本文件只保留系统项，
+ *    工具键通过参数注入的白名单与声明校验（§9.1 写入白名单 = 系统项 ∪ 本次扫描注册键）。
  */
 import {
   existsSync,
@@ -37,7 +41,8 @@ const KEEP_BACKUPS = 20;
 // ============================================
 
 export type ConfigType = "int" | "bool" | "enum" | "string" | "secret";
-export type ConfigGroup = "app" | "llm" | "file" | "log" | "stab" | "internet" | "browser" | "shell";
+/** 系统配置分组（工具配置不再走这里，见规范 §11 的工具区） */
+export type ConfigGroup = "app" | "llm" | "log" | "stab";
 
 export interface ConfigKeyMeta {
   key: string;
@@ -45,25 +50,17 @@ export interface ConfigKeyMeta {
   type: ConfigType;
   /** 中文标签（前端表单显示） */
   label: string;
-  /** 文件缺失该键时的回填值（取自 src/infra/env.ts 的 validateEnv 默认值） */
+  /** 文件缺失该键时的回填值（默认值单一来源 = 这里的 defaultValue） */
   defaultValue: string;
   secret?: boolean;
   /**
    * [需求域 R / R-17、§9.2] 必需项：不允许清空（界面不显示按钮，接口收到清空须拒绝且不改写文件）。
-   * 仅为 true 时才受限制；未声明视为「非必需」——但非密文项本身也不支持清空（§9.2 适用范围）。
    */
   required?: boolean;
-  /**
-   * [R-04] 允许写空值：仅用于「留空 = 未配置」这类语义（如 BROWSER_PROFILE_DIR）。
-   * 未声明时按原规则——string/secret 一律不允许留空（§9.2）。
-   */
+  /** [R-04] 允许写空值：仅用于「留空 = 未配置」这类语义。 */
   allowEmpty?: boolean;
   enumValues?: readonly string[];
-  /**
-   * [批次三 / SH-47 ①] 枚举项的**中文显示名**（值仍写 .env / 仍走 enumValues 校验）。
-   * 只为下拉更好读：`forbid / ask / allow` 在界面上显示成「禁止 / 需用户同意 / 允许」。
-   * 未声明时前端回退显示原始值。
-   */
+  /** 枚举项的**中文显示名**（值仍写 .env / 仍走 enumValues 校验） */
   enumLabels?: Record<string, string>;
   min?: number;
   max?: number;
@@ -73,13 +70,15 @@ export interface ConfigKeyMeta {
   desc: string;
 }
 
-/** 43 项全量白名单（16 项原有 + 6 项互联网工具 + 12 项浏览器工具 + 9 项命令执行；需求 §4.2 / §9.1 / BR-62 / SH-46）
- *  [R-04] 浏览器组由 10 项扩到 12 项：补 BROWSER_PROFILE_DIR（选 persist 却无处填目录）
- *         与 BROWSER_SESSION_TTL_S（「浏览器自己就关掉」的直接旋钮，原先只能手工改 .env + 重启）。
- *  [批次三 / SH-48] 组数 7 → 8，项数 34 → 43；页面上没有可见的「组数 / 项数」文案，
- *         计数实际分布在**四处**源码注释里（本行、routes/config.ts 抬头、public/js/chat.js 抬头注释、
- *         public/js/chat.js 的 renderConfigForm 上方注释——后者原是「按分组渲染 16 个控件」的遗留笔误），
- *         四处已同步为 43 / 8，分别见批次三文档 §5.8.3 / §5.8.5 / §5.14.4 / §5.14.2。
+/**
+ * 系统项白名单（12 项）。
+ * 已下沉到工具域声明的项（文件工具 / 命令执行 / 互联网 / 浏览器）**全部移出本表**：
+ * 它们的类型、默认值、范围、说明的唯一来源是 etc/tools/** 的声明（规范 §3.2 / §9.2）。
+ *
+ * ⚠️ `TOOL_RESULT_MAX_CHARS` 仍是系统项，但沿用「不进配置页、手工维护」，
+ *    故不在本表内 → 经配置接口**不可写**（只能手工改 .env 后重启）。
+ *    若日后要让它可写，必须**同时**做三件事（进 CONFIG_KEYS / 进页面 / 确认热更路径），
+ *    否则会出现「接口能写、页面看不到、热更不生效」的三方不一致。
  */
 export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   {
@@ -121,27 +120,6 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
   },
 
   {
-    key: "FILE_ROOT_DIR", group: "file", groupTitle: "文件工具配置", type: "string",
-    label: "沙箱总目录", defaultValue: "working",
-    desc: "AI 文件操作的沙箱根（相对项目根）。路径不做限制，请自行确认安全。",
-  },
-  {
-    key: "FILE_READ_ENABLED", group: "file", groupTitle: "文件工具配置", type: "bool",
-    label: "读开关", defaultValue: "true",
-    desc: "控制列目录/读文件/查信息/搜索。默认开启。",
-  },
-  {
-    key: "FILE_CREATE_ENABLED", group: "file", groupTitle: "文件工具配置", type: "bool",
-    label: "新建开关", defaultValue: "false",
-    desc: "控制建目录/建文件/追加。默认关闭。",
-  },
-  {
-    key: "FILE_MODIFY_ENABLED", group: "file", groupTitle: "文件工具配置", type: "bool",
-    label: "修改开关（含删除）", defaultValue: "false",
-    desc: "控制覆盖/替换/移动/删除。破坏性最强，默认关闭。",
-  },
-
-  {
     key: "LLM_LOG_ENABLED", group: "log", groupTitle: "LLM 对话日志配置", type: "bool",
     label: "日志开关", defaultValue: "false",
     desc: "记录与 LLM 的对话日志。默认关闭。",
@@ -167,170 +145,13 @@ export const CONFIG_KEYS: readonly ConfigKeyMeta[] = [
     label: "SSE 心跳间隔（毫秒）", defaultValue: "10000", min: 1000, max: 254999,
     desc: "必须显著小于 Bun.serve 的 idleTimeout（255 秒），切勿大于 254999。",
   },
-  // ============================================
-  // [需求域 R / US-R-01] 互联网工具配置（6 项进配置页，R-13/R-14/R-17）
-  //   进配置页的判定见 §9.1；其余（基址、默认条数、暂存四要素）手工维护，不在此白名单内。
-  // ============================================
-  {
-    key: "INTERNET_ENABLED", group: "internet", groupTitle: "互联网工具配置", type: "bool",
-    label: "联网工具总开关", defaultValue: "true",
-    desc: "控制网页检索/抓取工具是否出现在模型可见工具列表中；保存后热更立即生效（R-13）。",
-  },
-  {
-    key: "INTERNET_SEARCH_PROVIDER", group: "internet", groupTitle: "互联网工具配置", type: "enum",
-    label: "检索供应商", defaultValue: "deepseek", enumValues: ["deepseek"],
-    desc: "网页检索使用的供应商标识；与抓取供应商相互独立，缺密钥只影响各自的 kind（R-07/R-14）。",
-  },
-  {
-    key: "INTERNET_FETCH_PROVIDER", group: "internet", groupTitle: "互联网工具配置", type: "enum",
-    label: "抓取供应商", defaultValue: "deepseek", enumValues: ["deepseek"],
-    desc: "网页抓取使用的供应商标识；与检索供应商相互独立（R-07/R-14）。",
-  },
-  {
-    key: "INTERNET_DEEPSEEK_API_KEY", group: "internet", groupTitle: "互联网工具配置", type: "secret",
-    label: "DeepSeek 供应商密钥", defaultValue: "", secret: true,
-    desc: "留空表示不修改；需删除已保存的密钥请点『清空』。密钥为空时按免鉴权调用（不发送鉴权头，R-15），若该供应商实际需要鉴权则每次调用返回 auth_required（R-16）。",
-  },
-  {
-    key: "INTERNET_TIMEOUT_MS", group: "internet", groupTitle: "互联网工具配置", type: "int",
-    label: "单次请求超时（毫秒）", defaultValue: "20000", min: 1000,
-    desc: "联网工具单次上请求的超时上限（R-39）；超时挂在中止信号上，点「停止」也会中止在途请求（R-40）。",
-  },
-  {
-    key: "INTERNET_FETCH_MAX_CHARS", group: "internet", groupTitle: "互联网工具配置", type: "int",
-    label: "抓取回灌上限（字符）", defaultValue: "8000", min: 200,
-    desc: "单次抓取正文回灌给模型的字符上限，超限按三要素标注截断状态（R-41/R-24）。",
-  },
-
-  // ============================================
-  // [需求域 BR / US-BR-05] 浏览器工具配置（12 项进配置页，BR-62）
-  //   进配置页的是「用户需要决定的策略」；端口、TTL、并发、名单等手工维护，不进白名单。
-  //   校验类型：布尔→bool、整数→int、枚举→enum、路径→string（§13.3-3）。
-  //   ⚠️ 文本项默认不能留空（validateValue 对 string 返回「不能为空」），
-  //      因此「空 = 自动探测」改用固定取值 auto 表达（§13.3-4）。
-  //      [R-04] 例外：BROWSER_PROFILE_DIR 显式声明 allowEmpty，用于表达「留空 = 未配置」。
-  // ============================================
-  {
-    key: "BROWSER_ENABLED", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
-    label: "浏览器工具总开关", defaultValue: "false",
-    desc: "控制 open / observe / act / close 四个工具是否出现在模型可见工具列表中；保存后热更立即生效。默认关闭：开启后模型可让真实浏览器点击真实按钮（可能产生下单、发帖等真实后果）。",
-  },
-  {
-    key: "BROWSER_EXECUTABLE_PATH", group: "browser", groupTitle: "浏览器工具配置", type: "string",
-    label: "浏览器可执行文件路径", defaultValue: "auto",
-    desc: "填 auto 表示自动探测（Edge → Chrome，含 32/64 位 Program Files 与用户级安装目录）；也可填绝对路径覆盖探测结果，路径不存在时启动会失败并列出已尝试路径。",
-  },
-  {
-    key: "BROWSER_HEADLESS", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
-    label: "无头模式", defaultValue: "true",
-    desc: "true=不显示窗口（默认）；false=显示窗口，便于观察模型操作、也便于拖拽一类对无头环境敏感的交互。",
-  },
-  {
-    key: "BROWSER_PROFILE_MODE", group: "browser", groupTitle: "浏览器工具配置", type: "enum",
-    label: "用户数据目录模式", defaultValue: "temp", enumValues: ["temp", "persist"],
-    desc: "temp=每次新建临时目录、会话关闭即删（默认，不继承日常 cookie）；persist=复用固定目录，等于把登录态交给模型，需同时配置 BROWSER_PROFILE_DIR。",
-  },
-  {
-    key: "BROWSER_PROFILE_DIR", group: "browser", groupTitle: "浏览器工具配置", type: "string",
-    label: "持久化用户数据目录", defaultValue: "", allowEmpty: true,
-    desc: "仅在「用户数据目录模式=persist」时使用；留空＝未配置，会回退为临时目录并在日志告警。请填独立目录（如 data/browser-profile），切勿指向你日常 Edge/Chrome 的用户数据目录——那样模型会拿到你真实的 Cookie 与登录态。",
-  },
-  {
-    key: "BROWSER_SESSION_TTL_S", group: "browser", groupTitle: "浏览器工具配置", type: "int",
-    label: "会话空闲回收（秒）", defaultValue: "180", min: 10, max: 86400,
-    desc: "模型超过该时长未调用浏览器工具，会话会被自动回收（浏览器随之关闭）。注意：你在窗口里自己点、自己滚不算「活动」，只有工具调用才算。觉得窗口关得太快就把这里调大（如 1800 = 30 分钟）。",
-  },
-  {
-    key: "BROWSER_ACTION_TIMEOUT_MS", group: "browser", groupTitle: "浏览器工具配置", type: "int",
-    label: "单步动作超时（毫秒）", defaultValue: "8000", min: 500, max: 120000,
-    desc: "单个动作（定位 + 交互 + 变更等待）的超时上限；超时返回 action_timeout，可重试一次。页面脚本繁忙时适当调大。",
-  },
-  {
-    key: "BROWSER_NAV_TIMEOUT_MS", group: "browser", groupTitle: "浏览器工具配置", type: "int",
-    label: "导航超时（毫秒）", defaultValue: "20000", min: 1000, max: 300000,
-    desc: "open 与 action=nav 的导航超时上限（判据是加载完成 + 稳定窗口，不是命令返回）；超时返回 navigation_timeout。",
-  },
-  {
-    key: "BROWSER_SNAPSHOT_MAX_CHARS", group: "browser", groupTitle: "浏览器工具配置", type: "int",
-    label: "快照正文字符上限", defaultValue: "6000", min: 200, max: 12000,
-    desc: "单次返回的正文切片上限；超长正文可用 observe 的 offset 分页续读。上限过高会挤占模型上下文，总结果另有 24000 字符硬预算。",
-  },
-  {
-    key: "BROWSER_BLOCK_PRIVATE_NET", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
-    label: "私有网段阻断", defaultValue: "true",
-    desc: "在浏览器内部对每个请求判定目标地址，命中回环/私有/链路本地地址即阻断（覆盖页面内跳转、子资源与脚本请求）。关闭后仅校验入参 URL，存在内网探测风险。",
-  },
-  {
-    key: "BROWSER_ALLOW_DOWNLOAD", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
-    label: "允许下载", defaultValue: "false",
-    desc: "默认拒绝：页面触发的下载会被取消且不落盘。开启后模型可让页面把文件写到本机，请自行评估风险；该开关不对模型可见。",
-  },
-  {
-    key: "BROWSER_ALLOW_UPLOAD", group: "browser", groupTitle: "浏览器工具配置", type: "bool",
-    label: "允许上传/文件选择", defaultValue: "false",
-    desc: "默认拒绝：文件选择弹窗被拦截，涉及上传的动作会失败。开启后模型可让页面读取本机文件，请自行评估风险；该开关不对模型可见。",
-  },
-
-  // ============================================
-  // [批次三 / SH-46 ~ SH-48] 本机命令执行配置（9 项进配置页；其余 6 项手工维护，见 .env.example）
-  //   ⚠️ 权限档位默认 forbid：任何执行能力都必须由用户显式开启（SH-31）。
-  // ============================================
-  {
-    key: "SHELL_PERMISSION", group: "shell", groupTitle: "本机命令执行配置", type: "enum",
-    label: "命令执行权限档位", defaultValue: "forbid",
-    enumValues: ["forbid", "ask", "allow"],
-    enumLabels: { forbid: "禁止", ask: "需用户同意", allow: "允许" },
-    desc: "禁止＝run 工具不在模型可见列表（默认）；需用户同意＝每次执行都弹窗等用户点确认，用户不在屏幕前就什么也执行不了；允许＝不弹窗直接执行，等于把本机命令行完全交给模型，不再有任何人工闸门。保存后热更立即生效，且不影响已存在的授权记忆。",
-  },
-  {
-    key: "SHELL_APPROVAL_WAIT_MS", group: "shell", groupTitle: "本机命令执行配置", type: "int",
-    label: "审批等待上限（毫秒）", defaultValue: "120000", min: 1000, max: 3600000,
-    desc: "弹窗超过该时长无人应答即返回 approval_timeout（命令不执行）。它只约束「等人」的时间，不延长单条命令的执行超时。",
-  },
-  {
-    key: "SHELL_SESSION_MEMORY_ENABLED", group: "shell", groupTitle: "本机命令执行配置", type: "bool",
-    label: "本会话授权记忆", defaultValue: "true",
-    desc: "开启后，用户选「本会话都允许」的命令在本会话内不再弹窗；关闭则退化为逐次询问。记忆只在服务端内存，不落盘、不进对话历史、不进模型上下文，会话结束或界面断连即清空。",
-  },
-  {
-    key: "SHELL_TYPE", group: "shell", groupTitle: "本机命令执行配置", type: "enum",
-    label: "shell 类型", defaultValue: "cmd",
-    enumValues: ["cmd", "powershell"],
-    enumLabels: { cmd: "cmd", powershell: "PowerShell" },
-    desc: "命令解释器。模型不能选择 shell，只能由这里决定；如需另一种解释器，请改这一项（引号、编码、权限语义随 shell 变化）。PowerShell 以 -NoProfile -NonInteractive 启动，不加载用户配置。",
-  },
-  {
-    key: "SHELL_TIMEOUT_DEFAULT_MS", group: "shell", groupTitle: "本机命令执行配置", type: "int",
-    label: "默认执行超时（毫秒）", defaultValue: "30000", min: 1000, max: 3600000,
-    desc: "模型未传 timeoutMs 时使用的超时。超时会终止整个进程树（含 cmd 派生的子孙进程），不是只杀直接子进程。",
-  },
-  {
-    key: "SHELL_OUTPUT_MAX_CHARS", group: "shell", groupTitle: "本机命令执行配置", type: "int",
-    label: "输出回灌上限（字符）", defaultValue: "8000", min: 500, max: 24000,
-    desc: "单次执行回灌给模型的**结果总长**上限（含命令原文、退出码、头尾标注与约束尾行），不是输出片段上限。超限按三要素标注：已显示区间、原始字节数、后续获取方式（重定向到文件后用读文件工具读取）。须显著小于平台兜底上限 TOOL_RESULT_MAX_CHARS（默认 32000）。",
-  },
-  {
-    key: "SHELL_UTF8_UNIFY", group: "shell", groupTitle: "本机命令执行配置", type: "bool",
-    label: "UTF-8 统一编码", defaultValue: "true",
-    desc: "开启后先按 UTF-8 严格解码；失败则按控制台代码页（如 GBK）解码，并在回灌正文里显式告知「输出编码可能不匹配」，不会静默回灌乱码。注意：为满足「弹窗展示与执行同源」，本实现不改写命令（不拼 chcp 前缀），编码统一发生在解码侧。",
-  },
-  {
-    key: "SHELL_DENY_LIST", group: "shell", groupTitle: "本机命令执行配置", type: "string",
-    label: "拒绝清单（逗号分隔）", defaultValue: "format,diskpart,bcdedit,vssadmin delete,vssadmin resize,cipher /w,wbadmin delete,reg delete,reg add,shutdown,restart-computer,stop-computer,net user,net localgroup,takeown /f,icacls . /reset,del /f /s /q c:,rd /s /q c:,rmdir /s /q c:",
-    desc: "命中即本地拒绝（denied_by_policy），不创建进程、不弹窗。大小写不敏感、去多余空白后按「包含」匹配整条命令文本。⚠️ 这是启发式：可通过变量展开、字符串拼接、别名、脚本文件、转义变体绕过，不能当作安全保证。",
-  },
-  {
-    key: "SHELL_ALLOW_LIST", group: "shell", groupTitle: "本机命令执行配置", type: "string",
-    label: "允许清单（逗号分隔，none=未启用）", defaultValue: "none",
-    desc: "非空时只放行「首 token 命中」的命令，且优先于拒绝清单判定；填 none 表示不启用。允许清单**不能替代审批**：命中清单仍会弹窗（除非权限档位为允许或授权记忆命中）。同样是启发式，可绕过。",
-  },
 ] as const;
 
-/** 键名白名单集合（PUT 校验用） */
+/** 键名白名单集合（系统项；PUT 的写入白名单 = 本集合 ∪ 本次扫描注册键） */
 export const CONFIG_KEY_SET: ReadonlySet<string> = new Set(CONFIG_KEYS.map((m) => m.key));
 
 /** 分组顺序（前端渲染顺序） */
-export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "file", "log", "stab", "internet", "browser", "shell"];
+export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "log", "stab"];
 
 // ============================================
 // 校验
@@ -361,7 +182,6 @@ export function validateValue(meta: ConfigKeyMeta, raw: string): string | null {
     case "secret":
       return t === "" ? "不能为空" : null;
     default:
-      // [R-04] allowEmpty 的项允许留空（语义由该项 desc 说明）
       if (t === "") return meta.allowEmpty ? null : "不能为空";
       return null;
   }
@@ -383,7 +203,6 @@ export interface EnvFileSnapshot {
 export function readEnvFile(): EnvFileSnapshot {
   if (!existsSync(ENV_PATH)) return { exists: false, text: "", eol: "\n" };
   const text = readFileSync(ENV_PATH, "utf-8");
-  // 检测换行风格：首个换行符前是否有 \r
   const m = text.match(/\r?\n/);
   const eol: "\n" | "\r\n" = m && m[0] === "\r\n" ? "\r\n" : "\n";
   return { exists: true, text, eol };
@@ -403,47 +222,54 @@ export function parseEnvText(text: string): Map<string, string> {
 }
 
 /**
- * 逐键替换：仅改写 changes 中出现的键，其余行（含注释、空行、无法解析的行）原样保留。
- * 文件中不存在的新键 → 追加到末尾。
+ * 逐键改写 + 追加 + 删除：
+ *   - changes 里的键：**同名多处全部改写**（FIX-DUP-01 结论不变），文件里没有则追加
+ *   - deleteKeys 里的键：**同名多处全部删除**，其余行（含注释、空行、无法解析的行）原样保留
+ *   - 不重排文件、不改换行风格
  *
- * [FIX-DUP-01] 同名键出现多次时必须**全部改写**，不能只改第一处。
- *
- * 起因（现场故障 2026-10-22 第三例）：用户把 `.env.example` 的整段浏览器配置块
- * 追加到 `.env` 末尾，于是 `BROWSER_ENABLED` 出现两次（前 true / 后 false）。
- * 旧实现用 `pending.delete(key)` 命中第一处后即从待改集合移除，后续同名行原样保留：
- *   - 配置页保存 → 只把**第一行**改成新值，末尾那行 false 仍在；
- *   - `reloadEnvExcluding` / `parseEnvText` 都是「按文件顺序，后者覆盖前者」，
- *     于是运行时读到的仍是末尾的 false —— 页面回执「已保存并热更」，
- *     但开关状态毫无变化，且没有任何提示。
- *
- * 修法：命中一处后**不**从 pending 移除（只记入 found），使同名行全部被改成同一个值；
- * 这样无论按「首个」还是「最后一个」生效，结果都一致，重复键退化为无害。
- * 不改动行的位置、缩进与注释，避免误删用户内容。
+ * [FIX-DUP-01] 同名键出现多次时必须**全部改写**：旧实现命中第一处后即从待改集合移除，
+ *   于是「配置页保存只改第一行、末尾那行仍旧值」，而运行时按「后者覆盖前者」取值 ——
+ *   表现为「页面回执已保存并热更，开关却毫无变化」。
  */
-export function mergeEnvText(snapshot: EnvFileSnapshot, changes: Record<string, string>): string {
+export function mergeEnvText(
+  snapshot: EnvFileSnapshot,
+  changes: Record<string, string>,
+  deleteKeys: readonly string[] = [],
+): string {
   const pending = new Map<string, string>(
     Object.entries(changes).map(([k, v]) => [k, String(v).trim()] as [string, string]),
   );
+  const del = new Set(deleteKeys.map((k) => k.trim()));
   const lines = snapshot.exists ? snapshot.text.split(/\r?\n/) : [];
   /** 文件中确实存在过的键（用于区分「需追加的新键」/「同名多处」） */
   const found = new Set<string>();
 
-  const out = lines.map((line) => {
+  const out: string[] = [];
+  for (const line of lines) {
     const trimmed = line.trim();
     // 注释行 / 空行 / 无法解析的行 → 原样保留（不丢用户内容）
-    if (!trimmed || trimmed.startsWith("#")) return line;
+    if (!trimmed || trimmed.startsWith("#")) {
+      out.push(line);
+      continue;
+    }
     const eq = trimmed.indexOf("=");
-    if (eq === -1) return line;
-
+    if (eq === -1) {
+      out.push(line);
+      continue;
+    }
     const key = trimmed.slice(0, eq).trim();
-    if (!pending.has(key)) return line;
+
+    if (del.has(key) && !pending.has(key)) continue;    // 删除（同名多处全部删除）
+    if (!pending.has(key)) {
+      out.push(line);
+      continue;
+    }
 
     // 保留原行「= 之前的一切」，只替换 = 之后的内容（不改动缩进与行尾空白风格）
     found.add(key);
-    const value = pending.get(key)!;
     const eqIdxInLine = line.indexOf("=");
-    return line.slice(0, eqIdxInLine + 1) + value;
-  });
+    out.push(line.slice(0, eqIdxInLine + 1) + (pending.get(key) as string));
+  }
 
   // 仅「文件中完全没有出现」的键 → 追加（单独成行）
   for (const [k, v] of pending) {
@@ -554,14 +380,13 @@ export interface ConfigItem {
   secret: boolean;
   /** [R-17 / §9.2] 必需项不显示「清空」按钮（UI 依据）；未声明视为非必需 */
   required?: boolean;
-  /** [R-04] 该项允许留空（前端应放行空值提交，如 BROWSER_PROFILE_DIR） */
+  /** [R-04] 该项允许留空（前端应放行空值提交） */
   allowEmpty?: boolean;
   /** secret 键：文件中是否已有非空值 */
   hasValue?: boolean;
   /** secret 键：掩码，如 sk-****cdef */
   mask?: string;
   enumValues?: readonly string[];
-  /** [批次三 / SH-47 ①] 枚举项中文显示名（与 ConfigKeyMeta.enumLabels 同源） */
   enumLabels?: Record<string, string>;
   min?: number;
   max?: number;
@@ -582,8 +407,8 @@ export function maskSecret(value: string): string {
 }
 
 /**
- * 装配 GET /api/config 的 items。
- * @param restartOnly  需重启的键集合（阶段 A 传全部 15 个键；阶段 B 传 {APP_PORT}）
+ * 装配 GET /api/config 的系统项 items。
+ * @param restartOnly  需重启的键集合
  * @param shadowed     被系统环境变量遮蔽的键集合（来自 env.ts 的 envShadowedBySystem）
  * @param effectiveOf  可选：运行时实际生效值（阶段 B 回填）
  */
@@ -597,7 +422,7 @@ export function buildConfigItems(
 
   return CONFIG_KEYS.map((meta) => {
     // 文件中缺失该键 → 回填默认值（AC-CFG-9）
-    const raw = fileMap.has(meta.key) ? fileMap.get(meta.key)! : meta.defaultValue;
+    const raw = fileMap.has(meta.key) ? (fileMap.get(meta.key) as string) : meta.defaultValue;
     const base: ConfigItem = {
       key: meta.key, group: meta.group, groupTitle: meta.groupTitle,
       type: meta.type, label: meta.label, desc: meta.desc,
@@ -621,9 +446,35 @@ export function buildConfigItems(
 // 保存总入口
 // ============================================
 
+export interface ApplyRequest {
+  /** 需要写入的键值（系统项 + 已校验的工具键） */
+  changes?: Record<string, string>;
+  /** 系统密文项清空（沿用 R-17：写空串，不是删行） */
+  clearKeys?: readonly string[];
+  /** 需要删除的键（恢复默认 / 存量迁移 / 遗留键清理）：同名多处全部删除 */
+  deleteKeys?: readonly string[];
+  /** 本次扫描注册的键（**写入**白名单的并集，§9.1） */
+  allowedKeys?: ReadonlySet<string>;
+  /**
+   * **删除**侧的额外白名单（旧键 / 遗留键）。缺省 = 空集。
+   *
+   * ⚠️ 为什么必须与 `allowedKeys` 分开（R-24）：**「可写」与「可删」是两个不同的集合**。
+   *   · 迁移要删的是**已被移出 `CONFIG_KEYS` 的旧键**（`FILE_READ_ENABLED` 等）——
+   *     它们按定义不在任何白名单里；
+   *   · 遗留键接口要删的是**未被本次扫描注册的托管键**——按定义也不在 `allowedKeys` 里。
+   *   用一个白名单同时校验写入与删除，会让这两个功能 **100% 失败**（落入 unknown → `ok:false`）。
+   */
+  allowDeleteKeys?: ReadonlySet<string>;
+  /** 不备份（遗留键独立接口：§10.2「删除不备份」） */
+  skipBackup?: boolean;
+}
+
 export interface ApplyResult {
   ok: boolean;
-  changed: string[];
+  /** 实际写入的键 */
+  written: string[];
+  /** 实际删除的键（= 恢复默认 / 迁移 / 遗留键清理） */
+  deleted: string[];
   backupFile: string | null;
   envCreated: boolean;
   degraded?: boolean;
@@ -632,97 +483,106 @@ export interface ApplyResult {
   error?: string;
 }
 
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 /**
- * 应用一批改动：校验 → 备份 → 逐键替换 → 原子写
+ * 应用一批改动：白名单 → 键名硬校验 → 写删互斥 → 密文清空约束 → 系统值校验 → 备份 → 合并 → 原子写
  *
- * [需求域 R / US-R-06 / R-17、§9.2] 新增 clearKeys：
- *   清空**只能**经该参数表达（写入空串并持久化），不复用「changes 中传空串＝不修改」的既有约定。
- *   校验（全部通过才写盘，与 §4.3 一致）：
- *     1. 必须是白名单键；
- *     2. 必须是密文类型（非密文键一律拒绝）；
- *     3. 不得是必需项（必需项写空会导致热更校验判缺失并退出进程，§9.2 约束 4）；
- *     4. 同一键不得同时出现在 changes 与 clearKeys。
- *   任一不满足 → 整请求拒绝，文件不被改写。
+ * [R-24] 写入与删除**分别**校验白名单（见 ApplyRequest.allowDeleteKeys 的注释）。
  */
-export function applyConfigChanges(
-  changes: Record<string, string>,
-  clearKeys: readonly string[] = [],
-): ApplyResult {
-  const keys = Object.keys(changes);
+export function applyConfigChanges(req: ApplyRequest): ApplyResult {
+  const changes = req.changes ?? {};
+  const clearKeys = req.clearKeys ?? [];
+  const deleteKeys = req.deleteKeys ?? [];
+  const written = [...new Set([...Object.keys(changes), ...clearKeys])];
+  const deleted = [...new Set(deleteKeys)];
+  const fail = (invalid: Array<{ key: string; reason: string }>): ApplyResult =>
+    ({ ok: false, written: [], deleted: [], backupFile: null, envCreated: false, invalid });
 
-  // ① 白名单（changes 与 clear 均需校验）
-  const unknown = [...keys, ...clearKeys].filter((k) => !CONFIG_KEY_SET.has(k));
-  if (unknown.length > 0) {
-    return {
-      ok: false, changed: [], backupFile: null, envCreated: false,
-      invalid: unknown.map((k) => ({ key: k, reason: "未知配置项（不在白名单内）" })),
-    };
+  // ① 白名单（§9.1）：写入与删除**分别**校验（R-24，切勿合并成一个集合）
+  //    写入 = 系统项 ∪ 本次扫描注册键
+  const writeAllowed = new Set<string>(CONFIG_KEY_SET);
+  if (req.allowedKeys) for (const k of req.allowedKeys) writeAllowed.add(k);
+  //    删除 = 写入白名单 ∪ 调用方显式声明的可删键（旧键 / 遗留键）
+  const deleteAllowed = new Set<string>(writeAllowed);
+  if (req.allowDeleteKeys) for (const k of req.allowDeleteKeys) deleteAllowed.add(k);
+
+  const unknownWrites = written.filter((k) => !writeAllowed.has(k));
+  const unknownDeletes = deleted.filter((k) => !deleteAllowed.has(k));
+  if (unknownWrites.length > 0) {
+    return fail(unknownWrites.map((k) => ({
+      key: k, reason: "未知配置项（不在「系统项 ∪ 本次扫描注册键」之内）",
+    })));
+  }
+  if (unknownDeletes.length > 0) {
+    return fail(unknownDeletes.map((k) => ({
+      key: k, reason: "不允许删除该键（不在「系统项 ∪ 注册键 ∪ 调用方声明的可删键」之内）",
+    })));
   }
 
-  // ①-b [R-17 / §9.2] clear 的合法性校验（在任何写盘动作之前）
+  // ② 键名硬校验（防「值里夹换行拼出一个新键」/ 非法标识符）：§9.1
+  const badKey = [...written, ...deleted].filter((k) => !ENV_KEY_RE.test(k));
+  if (badKey.length > 0) {
+    return fail([...new Set(badKey)].map((k) => ({
+      key: k, reason: "键名不符合环境变量格式（^[A-Za-z_][A-Za-z0-9_]*$）",
+    })));
+  }
+
+  // ③ 同一键不得同时「写」与「删」
+  const both = written.filter((k) => deleted.includes(k));
+  if (both.length > 0) {
+    return fail([...new Set(both)].map((k) => ({ key: k, reason: "同一项不得同时出现在写入与删除中" })));
+  }
+
+  // ④ 系统密文清空的既有约束（R-17：只允许非必需密文项）
   const clearInvalid: Array<{ key: string; reason: string }> = [];
-  const seenClear = new Set<string>();
-  for (const k of clearKeys) {
-    if (seenClear.has(k)) continue;          // 重复项去重，不算错误
-    seenClear.add(k);
-    if (keys.includes(k)) {
-      clearInvalid.push({ key: k, reason: "同一项不得同时出现在 changes 与 clear 中" });
-      continue;
-    }
+  for (const k of new Set(clearKeys)) {
     const meta = CONFIG_KEYS.find((m) => m.key === k);
-    if (!meta) continue;                     // 未知键已在 ① 拦下
-    if (!meta.secret) {
-      clearInvalid.push({ key: k, reason: "仅密文项支持清空（非密文项请直接改值）" });
-      continue;
-    }
+    if (!meta) continue;                       // 工具键不会走 clear（工具键用 changes / deleteKeys）
+    if (!meta.secret) { clearInvalid.push({ key: k, reason: "仅密文项支持清空（非密文项请直接改值）" }); continue; }
     if (meta.required) {
-      clearInvalid.push({
-        key: k,
-        reason: "必需项不支持清空：写空后热更会判定缺失并导致进程退出，请填入新的有效值",
-      });
+      clearInvalid.push({ key: k, reason: "必需项不支持清空：写空后热更会判定缺失并导致进程退出，请填入新的有效值" });
     }
   }
-  if (clearInvalid.length > 0) {
-    return { ok: false, changed: [], backupFile: null, envCreated: false, invalid: clearInvalid };
-  }
+  if (clearInvalid.length > 0) return fail(clearInvalid);
 
-  // ② 校验（全部通过才写盘；需求 §4.3：失败不写文件）
+  // ⑤ 系统项取值校验（工具键已由调用方用声明校验过，读取端还会再校验一次）
   const invalid: Array<{ key: string; reason: string }> = [];
-  for (const k of keys) {
-    const meta = CONFIG_KEYS.find((m) => m.key === k)!;
-    const reason = validateValue(meta, changes[k]!);
+  for (const [k, v] of Object.entries(changes)) {
+    const meta = CONFIG_KEYS.find((m) => m.key === k);
+    if (!meta) continue;
+    const reason = validateValue(meta, v);
     if (reason) invalid.push({ key: k, reason });
   }
-  if (invalid.length > 0) {
-    return { ok: false, changed: [], backupFile: null, envCreated: false, invalid };
-  }
+  if (invalid.length > 0) return fail(invalid);
 
-  // ③ 备份（.env 不存在则跳过，AC-CFG-9）
+  // ⑥ 备份（可跳过；.env 不存在则跳过，AC-CFG-9）
   const snap = readEnvFile();
-  const backupFile = backupEnv();
+  const backupFile = req.skipBackup ? null : backupEnv();
 
-  // ④ 合并 + 原子写（清空项以空串进入同一写入映射，逐键替换后落盘为 KEY=）
+  // ⑦ 合并 + 原子写
   const writeMap: Record<string, string> = { ...changes };
   for (const k of clearKeys) writeMap[k] = "";
-  // [FIX-DUP-01] 重复键显式告警：本次写盘会把**所有同名行**改成同一个值，
-  //   但仍建议用户删掉多余行 —— 否则日后手工编辑第一行时会出现「改了不生效」。
   const dupInFile = countDuplicateKeys(snap.text);
   const dupTouched = [...dupInFile.entries()].filter(([k]) => k in writeMap);
   if (dupTouched.length > 0) {
     console.warn(
       `⚠️  [.env] 以下键在文件中重复出现，本次已把全部同名行改成同一值：` +
-        dupTouched.map(([k, n]) => `${k}×${n}`).join(", ") +
-        `；建议删掉多余行，避免日后手工改第一行却不生效。`,
+      dupTouched.map(([k, n]) => `${k}×${n}`).join(", ") + `；建议删掉多余行。`,
     );
   }
-  const next = mergeEnvText(snap, writeMap);
+  const next = mergeEnvText(snap, writeMap, deleted);
   const w = writeEnvAtomic(next);
   if (!w.ok) {
-    return { ok: false, changed: [], backupFile: null, envCreated: false, error: w.error };
+    return { ok: false, written: [], deleted: [], backupFile: null, envCreated: false, error: w.error };
   }
 
   return {
-    ok: true, changed: [...keys, ...clearKeys], backupFile,
-    envCreated: !snap.exists, degraded: w.degraded,
+    ok: true,
+    written,
+    deleted,
+    backupFile,
+    envCreated: !snap.exists,
+    degraded: w.degraded,
   };
 }

@@ -11,7 +11,10 @@
  *   模型手里的旧 e1 会与新元素同号，refTable 直接覆盖 → 点错按钮。
  *   这比设计里「代次内单调」更严，见 IMPLEMENTATION-browser.md 第 17 章差异表。
  */
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 import { withTail, TAIL_LINE } from "./_browser_errors";
 import type { BrowserDriver, DriverFailureKind, ElementFact } from "./_browser_driver";
 import type { RefEntry, Session, TabsReport } from "./_browser_session";
@@ -263,8 +266,8 @@ export async function buildSnapshot(
   driver: BrowserDriver,
   o: SnapshotOptions,
 ): Promise<SnapshotOutcome> {
-  const cfgMaxElements = Math.max(1, Number(env.BROWSER_SNAPSHOT_MAX_ELEMENTS) || 120);
-  const cfgBodyChars = Math.max(200, Number(env.BROWSER_SNAPSHOT_MAX_CHARS) || 6000);
+  const cfgMaxElements = Math.max(1, Number(B.get<number>("snapshot_max_elements")) || 120);
+  const cfgBodyChars = Math.max(200, Number(B.get<number>("snapshot_max_chars")) || 6000);
   const offset = Math.max(0, Math.trunc(o.offset ?? 0));
 
   // [REQ-browser BR-17/BR-21] 先与驱动对账标签：既刷新标签清单，也保证「活跃标签」的

@@ -156,14 +156,25 @@
     // ============================================
 
     /**
-     * 转义 HTML 特殊字符，防止 XSS
+     * 转义 HTML 特殊字符，防止 XSS。
      * @param {string} text
      * @returns {string}
      */
     function escapeHtml(text) {
-        const div = document.createElement("div");
-        div.textContent = text;
-        return div.innerHTML;
+        // [R-49] 必须连引号一起转义：本函数产物既进文本节点，也进 value="…" / placeholder="…"
+        //   / data-*="…" 这类**属性值**。旧实现走 div.textContent → div.innerHTML，只转 & < >
+        //   （序列化文本节点不需要转引号），于是 string_array 类设置项（落盘为
+        //   ["format","diskpart",…] JSON 文本）会把属性提前闭合：value="["format",…]"
+        //   → 浏览器解析出的输入框值只剩 "["。后果：保存时 settings 里凭空多出一条
+        //   …deny_list = "["，后端 parseSettingValue 判「必须为合法 JSON 数组文本」→
+        //   整次保存 ERR_INVALID_VALUE「存在不合法变更」，而错误落点藏在未展开的
+        //   设置项面板里，用户只看到一句摘要（与 R-48 同一表现）。
+        //   改为显式字符表替换，顺带省掉一次性 DOM 节点分配。
+        const ESCAPE_MAP = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+        return String(text === null || text === undefined ? "" : text)
+            .replace(/[&<>"']/g, (ch) => ESCAPE_MAP[ch]);
+
+
     }
 
     /**
@@ -1784,6 +1795,20 @@
         dirty: false,
         /** @type {Set<string>} [需求域 R / R-17、§9.2] 已标记清空的密钥键（保存后生效） */
         clearKeys: new Set(),
+        /** [C-11 / §9.3] 本次 GET 拿到的扫描版本；PUT 必须原样带回 */
+        scanVersion: "",
+        /** [C-11 / §11] 工具树（目录 + 工具组，含门禁状态与设置项） */
+        toolTree: [],
+        /** [C-11 / §10.2] 底部遗留键 */
+        orphanKeys: [],
+        /** 待提交的开关变更：节点 id → 布尔（仅记录用户真正改过的） */
+        dirToggles: {},
+        groupToggles: {},
+        /** 待提交的设置项变更在保存时直接从 DOM 收集（见 collectToolChanges），不另存草稿状态 */
+        /** 待提交的「恢复默认」（删键）集合 */
+        restoreKeys: new Set(),
+        /** 已展开的设置项折叠区（"dir:local" / "group:local/shell"） */
+        openSettings: new Set(),
     };
 
     /** 拉取并渲染配置视图（进入视图 / 保存成功后调用） */
@@ -1797,6 +1822,13 @@
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const data = await resp.json();
             configState.items = data.items || [];
+            configState.scanVersion = data.scanVersion || "";
+            configState.toolTree = data.toolTree || [];
+            configState.orphanKeys = data.orphanKeys || [];
+            // 重新拉取后，先前待提交的工具变更全部作废（服务端已是权威状态）
+            configState.dirToggles = {};
+            configState.groupToggles = {};
+            configState.restoreKeys = new Set();
             renderConfigForm(box);
             bindClearButtons(box);   // [需求域 R / R-17] 绑定密文项「清空」按钮（§9.2）
             setConfigDirty(false);
@@ -1809,13 +1841,15 @@
     /** 按分组渲染 43 个控件 / 8 组（AC-CFG-1 / 需求 §4.8.2；[批次三 / SH-48] 计数与 CONFIG_KEYS 同步） */
     function renderConfigForm(box) {
         const titles = {
-            app: "应用配置", llm: "LLM 配置", file: "文件工具配置",
+            app: "应用配置", llm: "LLM 配置",
             log: "LLM 对话日志配置", stab: "复杂问题稳定性配置",
-            internet: "互联网工具配置", browser: "浏览器工具配置",
-            // [批次三 / SH-47] 新分组：本机命令执行配置（9 项）
-            shell: "本机命令执行配置",
+
+
+
         };
-        const groups = ["app", "llm", "file", "log", "stab", "internet", "browser", "shell"];
+        // [C-11] 系统项只剩 4 组（file / internet / browser / shell 已下沉为工具树）；
+        //   按数据里实际出现的分组渲染，避免日后新增系统项分组时在页面上「消失」
+        const groups = [...new Set((configState.items || []).map((it) => it.group))];
 
         box.innerHTML = groups.map((g) => {
             const items = (configState.items || []).filter((it) => it.group === g);
@@ -1828,6 +1862,10 @@
         }).join("");
 
         // 绑定输入事件：任何修改 → 置脏（F-CFG-1）
+        // [C-11 / §11 / §10.2] 工具树与遗留键区块接在系统项之后
+        box.insertAdjacentHTML("beforeend", renderToolSection() + renderOrphanSection());
+        bindToolTreeEvents(box);
+
         box.querySelectorAll("[data-config-key]").forEach((el) => {
             el.addEventListener("input", () => setConfigDirty(true));
             el.addEventListener("change", () => setConfigDirty(true));
@@ -1996,20 +2034,37 @@
     /** 保存（AC-CFG-2 / F-CFG-2~F-CFG-5） */
     async function saveConfig() {
         const changes = collectConfigChanges();
+        const toolChanges = collectToolChanges();
         const keys = Object.keys(changes);
         // [需求域 R / R-17] 清空项单独收集：与普通修改项分开确认、分开提交（§9.2 互斥校验）
         const clearKeys = [...configState.clearKeys];
-        if (keys.length === 0 && clearKeys.length === 0) return;
+        const toolCount = Object.keys(toolChanges.dirToggles).length
+            + Object.keys(toolChanges.groupToggles).length
+            + Object.keys(toolChanges.settings).length
+            + toolChanges.restore.length;
+        if (keys.length === 0 && clearKeys.length === 0 && toolCount === 0) return;
 
         // 二次确认（列出将被修改的键）
         const confirmParts = [];
+        const dirCount = Object.keys(toolChanges.dirToggles).length;
+        const groupCount = Object.keys(toolChanges.groupToggles).length;
+        if (dirCount + groupCount > 0) {
+            confirmParts.push("工具开关：目录 " + dirCount + " 个、工具组 " + groupCount + " 个");
+        }
+        const settingKeys = Object.keys(toolChanges.settings);
+        if (settingKeys.length > 0) confirmParts.push("工具设置项：\n" + settingKeys.join("\n"));
+        if (toolChanges.restore.length > 0) {
+            confirmParts.push("恢复默认（删键）：\n" + toolChanges.restore.join("\n"));
+        }
         if (keys.length > 0) confirmParts.push(`修改：\n${keys.join("\n")}`);
         if (clearKeys.length > 0) confirmParts.push(`清空密钥（保存后写为空值）：\n${clearKeys.join("\n")}`);
         const okConfirm = window.confirm(`确认应用以下变更？\n\n${confirmParts.join("\n\n")}\n\n修改前会自动备份 .env。`);
         if (!okConfirm) return;
 
         // 清空上一次的逐项错误
-        document.querySelectorAll("[data-error-for]").forEach((n) => { n.hidden = true; n.textContent = ""; });
+        document.querySelectorAll("[data-error-for],[data-node-error]").forEach((n) => { n.hidden = true; n.textContent = ""; });
+        const tfh = document.getElementById("config-tool-fields");
+        if (tfh) { tfh.hidden = true; tfh.textContent = ""; }
         const resultEl = document.getElementById("config-result");
         if (resultEl) resultEl.textContent = "保存中…";
 
@@ -2017,16 +2072,52 @@
             const resp = await fetch("/api/config", {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ confirm: true, changes, clear: clearKeys }),
+                body: JSON.stringify({
+                    confirm: true,
+                    scanVersion: configState.scanVersion,   // [§9.3] 版本过期后端会 409
+                    changes,
+                    clear: clearKeys,
+                    dirToggles: toolChanges.dirToggles,
+                    groupToggles: toolChanges.groupToggles,
+                    settings: toolChanges.settings,
+                    restore: toolChanges.restore,
+                }),
             });
             const data = await resp.json();
 
+            if (resp.status === 409) {
+                // [§9.3] 扫描版本过期：工具目录有变化或页面停留过久 → 重扫后让用户重新确认
+                if (resultEl) {
+                    resultEl.textContent = "⚠️ 工具目录已变化（扫描版本过期），已自动刷新，请复核后重新保存。";
+                }
+                await loadConfigView();
+                return;
+            }
             if (!resp.ok) {
-                // AC-CFG-3/F-CFG-5：逐项显示原因，**不清空用户已填内容**
+                // AC-CFG-3/F-CFG-5：逐项显示原因，**不清空用户已填内容**（含开关节点的落点，见下）
+                // 无落点的错误（例如目录/工具组开关被后端拒绝）统一汇总到工具区顶部，绝不静默吞掉
+                const toolFieldHolder = document.getElementById("config-tool-fields");
                 if (data.fields) {
                     Object.entries(data.fields).forEach(([k, reason]) => {
-                        const box = document.querySelector(`[data-error-for="${k}"]`);
-                        if (box) { box.hidden = false; box.textContent = `❌ ${reason}`; }
+                        // [R-47] 错误落点有三类：系统项/工具设置项（key = 配置键）、目录节点（key = 目录路径）、工具组（key = 组 id）
+                        const box = document.querySelector(`[data-error-for="${k}"]`)
+                            || document.querySelector(`[data-node-error="dir:${k}"]`)
+                            || document.querySelector(`[data-node-error="group:${k}"]`);
+                        if (!box) {
+                            if (toolFieldHolder) {
+                                toolFieldHolder.hidden = false;
+                                toolFieldHolder.textContent += (toolFieldHolder.textContent ? "\n" : "")
+                                    + "· " + k + "：" + reason;
+                            }
+                        }
+                        if (box) { box.hidden = false; box.textContent = `❌ ${reason}`; revealToolError(box); }
+                        // [R-48] 顺手把「工具区顶部汇总」也点亮：摘要里至少给出键名，
+                        //   即使落点节点在页面下方也能对上号
+                        if (box && toolFieldHolder) {
+                            toolFieldHolder.hidden = false;
+                            toolFieldHolder.textContent += (toolFieldHolder.textContent ? "\n" : "")
+                                + "· " + k + "：" + reason;
+                        }
                     });
                 }
                 if (resultEl) resultEl.textContent = `❌ 保存失败（${data.code || resp.status}）：${data.error || ""}`;
@@ -2036,7 +2127,17 @@
             // 成功：分组提示（AC-CFG-5 / F-CFG-3）
             const hot = data.hotApplied || [];
             const need = data.restartRequired || [];
-            const lines = [`✅ 已保存 ${data.changed.length} 项。`];
+            const written = data.written || [];
+            const restored = data.restored || [];
+            // [C-08 回执] 后端字段是 written / restored（旧前端读的是 data.changed，已废弃）
+            const lines = [`✅ 已写入 ${written.length} 项、恢复默认 ${restored.length} 项。`];
+            if (restored.length) lines.push(`↩️ 已恢复默认（键已删除）：${restored.join(", ")}`);
+            if (Array.isArray(data.managedByValues) && data.managedByValues.length) {
+                lines.push(`⚡ 工具配置即时生效（取值层读 .env）：${data.managedByValues.length} 项`);
+            }
+            if (Array.isArray(data.skippedByWhitelist) && data.skippedByWhitelist.length) {
+                lines.push(`⚠️ 未注入进程环境（不在热重载白名单）：${data.skippedByWhitelist.join(", ")}`);
+            }
             if (data.backupFile) lines.push(`🗂 备份：data/envbk/${data.backupFile}`);
             if (Array.isArray(data.cleared) && data.cleared.length > 0) lines.push(`🧹 已清空：${data.cleared.join(", ")}`);
             if (data.envCreated) lines.push("🆕 已创建 .env（首次保存）。");
@@ -2046,6 +2147,10 @@
             if (resultEl) resultEl.textContent = lines.join("\n");
 
             configState.clearKeys.clear();   // [R-17] 保存成功后清空标记（服务端已落盘为空值）
+            // [C-11] 工具域的待提交变更同样清空：随后 loadConfigView() 会拿到服务端的权威状态
+            configState.dirToggles = {};
+            configState.groupToggles = {};
+            configState.restoreKeys = new Set();
             await loadConfigView();   // F-CFG-4：重拉使 mask 等派生字段刷新
             setConfigDirty(false);
         } catch (e) {
@@ -2064,6 +2169,518 @@
     /**
      * 自动调整输入框高度
      */
+    /* ============================================
+     * [C-11 / 规范 §11] 工具树：目录 → 工具组 → 组设置项
+     *   数据来自 GET /api/config 的 toolTree（后端已算好门禁与挂起原因）。
+     *   ⚠️ 前端灰显/禁用只是提示，写入端仍会独立复查（§3.5），不得以此当安全边界。
+     * ============================================ */
+
+    /** 把嵌套的工具树摊平成数组（渲染与收集都用它） */
+    function flattenToolTree(nodes, out) {
+        const acc = out || [];
+        (nodes || []).forEach((n) => {
+            acc.push(n);
+            flattenToolTree(n.children, acc);
+        });
+        return acc;
+    }
+
+    /** 折叠区的键："dir:local" / "group:local/shell" */
+    function toolNodeDomKey(node) {
+        return node.type + ":" + node.id;
+    }
+
+    /** 组内可见工具名摘要 */
+    function toolNamesText(node) {
+        if (!node.tools || node.tools.length === 0) return "（当前无可见工具）";
+        return node.tools.map((t) => t.visibleName).join("、");
+    }
+
+    /* ============================================================
+     * [C-11 / §8.2 / §11] 门禁就地重算
+     *   规范要点：父开 → 子级可各自独立开关；父关 → 全部子孙关闭且界面不可操作。
+     *   ⚠️ 页面上「灰显/可勾选」只是提示，最终判定仍在后端（§3.5）。
+     *     但如果前端不重算，用户勾了父级后子级永远停在 disable，
+     *     且会带着「上级已关闭却要开启子级」的草稿提交，被后端判为
+     *     ERR_INVALID_VALUE「存在不合法变更」—— 这两件事是同一个根因。
+     * ============================================================ */
+
+    /** 节点开关在「当前草稿状态」下的值（本次改过就用草稿，否则用服务端值） */
+    function toolNodeDraftOn(node) {
+        const map = node.type === "dir" ? configState.dirToggles : configState.groupToggles;
+        return Object.prototype.hasOwnProperty.call(map, node.id) ? map[node.id] === true : node.on === true;
+    }
+
+    /** 服务端的目录开关快照（id = 目录路径，如 "internet"） */
+    function serverDirOnMap() {
+        const m = new Map();
+        flattenToolTree(configState.toolTree).forEach((n) => {
+            if (n.type === "dir") m.set(n.id, n.on === true);
+        });
+        return m;
+    }
+
+    /** 挂起的目录集合（自身加载失败 / 声明非法：其整棵子树不可用） */
+    function suspendedDirSet() {
+        const s = new Set();
+        flattenToolTree(configState.toolTree).forEach((n) => {
+            if (n.type === "dir" && n.suspended === true) s.add(n.id);
+        });
+        return s;
+    }
+
+    /** 目录在「当前草稿状态」下是否开启 */
+    function dirOnByDraft(path, serverOn) {
+        if (Object.prototype.hasOwnProperty.call(configState.dirToggles, path)) {
+            return configState.dirToggles[path] === true;
+        }
+        return serverOn.get(path) === true;
+    }
+
+    /**
+     * 祖先链状态（不含自身）：null = 全开；"dir_off" = 某层关闭；"dir_suspended" = 某层挂起。
+     * 判定顺序与后端 parentChainState/dirChainState 一致（先判挂起、再判开关）。
+     */
+    function ancestorChainState(node, serverOn, suspendedDirs) {
+        const segs = String(node.id || "").split("/").filter((s) => s.length > 0);
+        segs.pop();                        // 自身（目录名 / 入口文件名）不算祖先
+        let acc = "";
+        for (const seg of segs) {
+            acc = acc === "" ? seg : acc + "/" + seg;
+            if (suspendedDirs.has(acc)) return "dir_suspended";
+            if (!dirOnByDraft(acc, serverOn)) return "dir_off";
+        }
+        return null;
+    }
+
+
+    /**
+     * 祖先链在**服务端快照**下是否全开（不含自身）。
+     * 只在响应里缺少 `suspended` 字段（旧缓存页面）时用于兜底反推「自身是否挂起」。
+     */
+    function serverAncestorAllOn(node, serverOn, suspendedDirs) {
+        const segs = String(node.id || "").split("/").filter((s) => s.length > 0);
+        segs.pop();
+        let acc = "";
+        for (const seg of segs) {
+            acc = acc === "" ? seg : acc + "/" + seg;
+            if (suspendedDirs.has(acc)) return false;
+            if (serverOn.get(acc) !== true) return false;
+        }
+        return true;
+    }
+
+    /** 节点在「当前草稿状态」下的门禁结果（渲染首屏与交互重算共用同一套判定） */
+    function toolNodeGate(node, serverOn, suspendedDirs) {
+        const chain = ancestorChainState(node, serverOn, suspendedDirs);
+
+
+        // [R-50] 「自身挂起」必须是**自身**属性，不能拿服务端的 disabled 反推：
+        //   disabled = 祖先没全开 ∨ 自身挂起，而服务端算 disabled 用的是**已保存**的开关值。
+        //   一旦用户把父级勾上（草稿里父级变开），chain 立刻变 null，旧写法
+        //   `node.disabled === true && chain === null` 就成立 → 把「因上级关闭而灰显」
+        //   误判成「自身挂起」→ 子级永远解不了禁。这正是用户看到的
+        //   「勾了顶层目录，下一层始终 disable」。
+        //   正确口径：有 suspended 字段就只认它（后端恒给布尔值）；缺字段（旧缓存页面）
+        //   才退化为「服务端祖先全开却被判 disabled」——此时才只可能是自身挂起。
+        const selfSuspended = node.suspended === true
+            || (typeof node.suspended !== "boolean"
+                && node.disabled === true
+                && serverAncestorAllOn(node, serverOn, suspendedDirs));
+        const disabled = chain !== null || selfSuspended;
+        const reason = selfSuspended
+            ? (node.suspendReason || node.reason || "不可用")
+            : chain === "dir_suspended" ? "上级目录不可用"
+                : chain === "dir_off" ? "上级目录已关闭"
+                    : undefined;
+        const on = toolNodeDraftOn(node);
+        return { disabled, reason, on, available: !disabled && on, selfSuspended };
+    }
+
+    /** 节点徽标（首屏与重算共用；避免两处文案漂移） */
+    function toolNodeBadgeHtml(node, gate) {
+        const badges = [];
+        if (gate.disabled) {
+            badges.push(`<span class="config-badge config-badge--shadow">${escapeHtml(gate.reason || "不可用")}</span>`);
+        } else if (!gate.on) {
+            badges.push('<span class="config-badge">已关闭</span>');
+        } else {
+            badges.push('<span class="config-badge">已开启</span>');
+        }
+        if (node.type === "group" && gate.available) {
+            badges.push(`<span class="config-badge config-badge--set">模型可见 ${(node.tools || []).length} 个</span>`);
+        }
+        return badges.join("");
+    }
+
+    /** 撤掉某目录下「想要开启」的子孙待提交项（父关时子孙一律不可操作，§8.2） */
+    function dropEnabledDescendantDrafts(dirId) {
+        const prefix = dirId + "/";
+        [configState.dirToggles, configState.groupToggles].forEach((map) => {
+            Object.keys(map).forEach((k) => {
+                if (!k.startsWith(prefix)) return;
+                if (map[k] === true) delete map[k];
+            });
+        });
+    }
+
+    /** 就地重算整棵工具树的可勾选 / 灰显 / 徽标状态（不重新请求接口，不丢设置项草稿） */
+    function refreshToolGate() {
+        const serverOn = serverDirOnMap();
+        const suspendedDirs = suspendedDirSet();
+        flattenToolTree(configState.toolTree).forEach((node) => {
+            const gate = toolNodeGate(node, serverOn, suspendedDirs);
+            const domKey = toolNodeDomKey(node);
+            const row = document.querySelector(`[data-node-key="${domKey}"]`);
+            if (!row) return;
+
+            const toggle = row.querySelector(":scope > .tool-node__head > .tool-node__toggle");
+            if (toggle) {
+                toggle.checked = gate.on;
+                toggle.disabled = gate.disabled;
+            }
+            const badges = row.querySelector("[data-node-badges]");
+            if (badges) badges.innerHTML = toolNodeBadgeHtml(node, gate);
+            row.classList.toggle("tool-node--disabled", gate.disabled);
+
+            // 本节点的设置项随门禁一起解禁 / 灰显（节点是平铺渲染的，子孙各走自己的一轮）
+            const panel = row.querySelector(`[data-tool-settings="${domKey}"]`);
+            if (!panel) return;
+            panel.querySelectorAll("[data-tool-setting]").forEach((el) => {
+                const key = String(el.id || "").replace(/^cfg-/, "");
+                el.disabled = gate.disabled || configState.restoreKeys.has(key);
+            });
+            panel.querySelectorAll("[data-tool-restore]").forEach((el) => {
+                el.disabled = gate.disabled;
+            });
+        });
+    }
+
+    /**
+     * 保存流程的两个补丁（R-47 / R-48）：
+     * · pruneToolToggleDrafts()：提交前自净，撤掉与门禁矛盾的「开启」草稿；
+     * · revealToolError()：把后端返回的逐项原因展开到用户看得见的地方。
+     */
+    /**
+     * [R-48] 把错误提示暴露到可见处。
+     * 工具设置项的错误 div 位于「设置项」折叠面板内，面板默认收起（`hidden`）——
+     * 于是错误虽然写进了 DOM，用户却看不到，只剩一句「存在不合法变更」。
+     * 这里把面板展开、同步箭头，并把该行滚进视口（不做 re-render，避免丢草稿）。
+     * @param {HTMLElement} box 错误提示容器
+     */
+    function revealToolError(box) {
+        const holder = box && box.closest ? box.closest("[data-tool-settings]") : null;
+        if (holder) {
+            const domKey = holder.dataset ? holder.dataset.toolSettings : "";
+            if (domKey) {
+                holder.hidden = false;
+                configState.openSettings.add(domKey);
+                const btn = document.querySelector(`[data-tool-expand="${domKey}"]`);
+                if (btn) btn.textContent = btn.textContent.replace(/[▾▴]\s*$/, "▴");
+            }
+        }
+        const target = holder || box;
+        if (target && target.scrollIntoView) {
+            try { target.scrollIntoView({ block: "nearest" }); } catch { /* 老浏览器忽略 */ }
+        }
+    }
+
+    /** 提交前自净：与门禁矛盾的「开启」草稿一律撤掉（后端仍会独立复查，§3.5）。 */
+    function pruneToolToggleDrafts() {
+        const serverOn = serverDirOnMap();
+        const suspendedDirs = suspendedDirSet();
+        flattenToolTree(configState.toolTree).forEach((node) => {
+            const map = node.type === "dir" ? configState.dirToggles : configState.groupToggles;
+            if (!Object.prototype.hasOwnProperty.call(map, node.id)) return;
+            if (map[node.id] !== true) return;
+            if (toolNodeGate(node, serverOn, suspendedDirs).disabled) delete map[node.id];
+        });
+    }
+
+    /** 单个工具设置项控件（按 kind 映射；secret 不回显明文，留空 = 不修改） */
+    function renderToolSetting(node, s) {
+        const id = "cfg-" + s.key;
+        const disabled = node.disabled || s.disabled;
+        let control;
+        if (s.secret) {
+            control = `<input class="config-input" id="${id}" data-tool-setting="1"
+                type="password" autocomplete="new-password"${disabled ? " disabled" : ""}
+                placeholder="${escapeHtml(s.hasValue ? (s.mask || "****") : "未设置（留空即不修改）")}" value="">`;
+        } else if (s.kind === "boolean") {
+            control = `<select class="config-input" id="${id}" data-tool-setting="1"${disabled ? " disabled" : ""}>
+                <option value="true"${s.value === "true" ? " selected" : ""}>true</option>
+                <option value="false"${s.value === "false" ? " selected" : ""}>false</option>
+              </select>`;
+        } else if (Array.isArray(s.options) && s.options.length > 0) {
+            const labels = s.optionLabels || {};
+            control = `<select class="config-input" id="${id}" data-tool-setting="1"${disabled ? " disabled" : ""}>
+                ${s.options.map((v) => `<option value="${escapeHtml(v)}"${s.value === v ? " selected" : ""}>${escapeHtml(labels[v] || v)}</option>`).join("")}
+              </select>`;
+        } else {
+            const numeric = s.kind === "number" ? ' inputmode="numeric"' : "";
+            control = `<input class="config-input" id="${id}" data-tool-setting="1"
+                type="text"${numeric}${disabled ? " disabled" : ""} value="${escapeHtml(String(s.value === null || s.value === undefined ? "" : s.value))}">`;
+        }
+        const range = s.kind === "number" && (s.min !== undefined || s.max !== undefined)
+            ? `（${s.min === undefined ? "-∞" : s.min} ~ ${s.max === undefined ? "+∞" : s.max}）`
+            : "";
+        const badges = [];
+        if (s.secret) badges.push('<span class="config-badge config-badge--set">密钥</span>');
+        if (s.isDefault === false) badges.push('<span class="config-badge">已改</span>');
+        const defText = s.secret ? "（密钥项默认值不展示）" : `默认：${s.defaultValue}`;
+        return `
+          <div class="config-item config-item--tool">
+            <div class="config-item__head">
+              <label class="config-item__label" for="${id}">${escapeHtml(s.name)}${escapeHtml(range)}</label>
+              <code class="config-item__key">${escapeHtml(s.key)}</code>
+              ${badges.join("")}
+              <button type="button" class="config-item__clear" data-tool-restore="${escapeHtml(s.key)}"${disabled ? " disabled" : ""}>恢复默认</button>
+            </div>
+            ${control}
+            <div class="config-item__desc">${escapeHtml(s.desc || "")} ${escapeHtml(defText)}</div>
+            <div class="config-item__error" data-error-for="${escapeHtml(s.key)}" hidden></div>
+          </div>`;
+    }
+
+    /** 单个工具节点（目录或工具组） */
+    function renderToolNode(node) {
+        const domKey = toolNodeDomKey(node);
+        const pad = 6 + Math.max(0, (node.depth || 0) - 1) * 16;
+        const isGroup = node.type === "group";
+        const toggle = `<input type="checkbox" class="tool-node__toggle"
+            data-toggle-type="${node.type}" data-toggle-id="${escapeHtml(node.id)}"
+            ${node.on ? "checked" : ""}${node.disabled ? " disabled" : ""}>`;
+        const badges = toolNodeBadgeHtml(node, {
+            disabled: node.disabled,
+            on: node.on,
+            available: node.available,
+            reason: node.reason,
+        });
+        const detail = [];
+        if (isGroup) {
+            detail.push(`<div class="tool-node__tools">可见工具：${escapeHtml(toolNamesText(node))}</div>`);
+        }
+        if (!isGroup && Array.isArray(node.ignored) && node.ignored.length > 0) {
+            const text = node.ignored.map((x) => x.name + "（" + x.reason + "）").join("、");
+            detail.push(`<div class="tool-node__warn">已忽略：${escapeHtml(text)}</div>`);
+        }
+        const hasSettings = Array.isArray(node.settings) && node.settings.length > 0;
+        const opened = configState.openSettings.has(domKey);
+        const settingsBtn = hasSettings
+            ? `<button type="button" class="tool-node__expand" data-tool-expand="${escapeHtml(domKey)}">设置项 ${node.settings.length} 项 ${opened ? "▴" : "▾"}</button>`
+            : "";
+        const settingsBox = hasSettings
+            ? `<div class="tool-node__settings" data-tool-settings="${escapeHtml(domKey)}"${opened ? "" : " hidden"}>
+                 ${node.settings.map((s) => renderToolSetting(node, s)).join("")}
+               </div>`
+            : "";
+        return `
+          <div class="tool-node tool-node--${node.type}${node.disabled ? " tool-node--disabled" : ""}"
+               data-node-key="${escapeHtml(domKey)}" style="padding-left:${pad}px">
+            <div class="tool-node__head">
+              ${toggle}
+              <span class="tool-node__name">${escapeHtml(node.name || "(根目录)")}</span>
+              <code class="tool-node__id">${escapeHtml(node.id || "/")}</code>
+              <span class="tool-node__badges" data-node-badges="1">${badges}</span>
+              ${settingsBtn}
+            </div>
+            ${detail.join("")}
+            ${settingsBox}
+            <div class="config-item__error" data-node-error="${escapeHtml(domKey)}" hidden></div>
+          </div>`;
+    }
+
+    /** 工具树整段（含「刷新」按钮：§12 强制重扫） */
+    function renderToolSection() {
+        const flat = flattenToolTree(configState.toolTree);
+        const groupCount = flat.filter((n) => n.type === "group").length;
+        const head = `
+          <h3 class="config-section__title">
+            工具配置（按 目录 → 工具组 逐级开启）
+            <button type="button" class="config-btn config-btn--inline" id="config-refresh-tree">🔄 刷新</button>
+          </h3>`;
+        if (flat.length === 0) {
+            return `<section class="config-section">${head}
+              <div class="config-item__desc">未扫描到任何工具目录。请确认 <code>etc/tools</code> 下存在入口文件后点「🔄 刷新」。</div>
+            </section>`;
+        }
+        return `<section class="config-section">${head}
+          <div class="config-item__desc">
+            共 ${groupCount} 个工具组。上级目录关闭时，其下所有工具组一律不可用；保存后立即生效，无需重启。
+            私有模块（文件名以 <code>_</code> 开头）的改动需重启进程。
+          </div>
+          <div class="config-item__error" id="config-tool-fields" hidden></div>
+          ${flat.map((n) => renderToolNode(n)).join("")}
+        </section>`;
+    }
+
+    /** 底部遗留键区块（§10.2：只在此处出现，可整体删除） */
+    function renderOrphanSection() {
+        const keys = configState.orphanKeys || [];
+        if (keys.length === 0) return "";
+        return `<section class="config-section config-section--orphan">
+          <h3 class="config-section__title">🧹 遗留键 ${keys.length}</h3>
+          <div class="config-item__desc">
+            这些键带受管前缀（<code>TOOLON__</code> / <code>TOOLSET__</code> / <code>etc__tools__</code>），
+            但本次扫描没有任何工具声明它们（工具被删除或改名，或键名手写错误）。删除不影响其他键。
+          </div>
+          <div class="tool-node__tools">
+            ${keys.map((k) => `<label class="orphan-row"><input type="checkbox" class="orphan-check" value="${escapeHtml(k)}"> <code>${escapeHtml(k)}</code></label>`).join("")}
+          </div>
+          <button type="button" class="config-btn" id="config-orphan-delete">删除所选遗留键</button>
+          <div class="config-item__error" id="config-orphan-error" hidden></div>
+        </section>`;
+    }
+
+    /** 绑定工具树交互：开关、设置项展开、恢复默认、刷新、删遗留键 */
+    function bindToolTreeEvents(box) {
+        box.querySelectorAll("[data-tool-expand]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const key = btn.dataset.toolExpand;
+                if (!key) return;
+                const panel = box.querySelector(`[data-tool-settings="${key}"]`);
+                if (!panel) return;
+                const opened = configState.openSettings.has(key);
+                if (opened) configState.openSettings.delete(key);
+                else configState.openSettings.add(key);
+                // opened = 切换前的状态：原本展开 → 收起（hidden=true），反之展开
+                panel.hidden = opened;
+                // 只切换箭头，不重渲染（重渲染会丢掉尚未保存的草稿值）
+                btn.textContent = btn.textContent.replace(/[▾▴]\s*$/, opened ? "▾" : "▴");
+            });
+        });
+
+        box.querySelectorAll("[data-toggle-type]").forEach((el) => {
+            el.addEventListener("change", () => {
+                const type = el.dataset.toggleType;
+                const id = el.dataset.toggleId;
+                if (!type || !id) return;
+                if (type === "dir") configState.dirToggles[id] = el.checked;
+                else configState.groupToggles[id] = el.checked;
+                // 父关 → 全部子孙关闭且界面不可操作（§8.2）：
+                //   撤掉子孙里「想要开启」的草稿，否则提交会带上矛盾组合被后端整单拒绝
+                if (type === "dir" && !el.checked) dropEnabledDescendantDrafts(id);
+                // 就地重算门禁：勾上父级后子孙立刻可勾选，取消父级后立刻灰显（无需刷新页面）
+                refreshToolGate();
+                setConfigDirty(true);
+            });
+        });
+
+        box.querySelectorAll("[data-tool-setting]").forEach((el) => {
+            el.addEventListener("input", () => setConfigDirty(true));
+            el.addEventListener("change", () => setConfigDirty(true));
+        });
+
+        box.querySelectorAll("[data-tool-restore]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const key = btn.dataset.toolRestore;
+                if (!key) return;
+                const input = document.getElementById(`cfg-${key}`);
+                if (configState.restoreKeys.has(key)) {
+                    configState.restoreKeys.delete(key);
+                    btn.textContent = "恢复默认";
+                } else {
+                    configState.restoreKeys.add(key);
+                    if (input) input.value = "";     // 标记恢复默认后清空草稿（保存时走 restore 字段删键）
+                    btn.textContent = "撤销恢复";
+                }
+                // 禁用态交给门禁统一判定：既尊重「已标记恢复默认」，又不会被重新启用
+                refreshToolGate();
+                setConfigDirty(true);
+            });
+        });
+
+        const refreshBtn = document.getElementById("config-refresh-tree");
+        if (refreshBtn) refreshBtn.addEventListener("click", refreshToolTree);
+
+        const orphanBtn = document.getElementById("config-orphan-delete");
+        if (orphanBtn) orphanBtn.addEventListener("click", deleteOrphanKeys);
+    }
+
+    /** 收集工具域改动（开关 / 设置项 / 恢复默认），与系统项 changes 分开提交 */
+    function collectToolChanges() {
+        const settings = {};
+        flattenToolTree(configState.toolTree).forEach((node) => {
+            (node.settings || []).forEach((s) => {
+                if (configState.restoreKeys.has(s.key)) return;   // 走 restore 字段（删键回默认）
+                const el = document.getElementById(`cfg-${s.key}`);
+                if (!el) return;
+                // [R-49 / R-50] 灰显控件里的「差异」一律不是用户改的，不得提交：
+                //   ① 上级目录关闭 / 组挂起时输入框是 disabled，用户根本没机会编辑；
+                //   ② 属性值一旦被提前闭合（R-49 的引号 bug），DOM 值会退化成残片（如 "["），
+                //      与声明值「天然不同」→ 每次保存都凭空多提交一条非法设置项 → 整单 400，
+                //      而用户看到的却是与操作无关的「存在不合法变更」。
+                if (el.disabled === true) return;
+                const next = String(el.value).trim();
+                if (s.secret) {
+                    if (next !== "") settings[s.key] = next;      // 密钥留空 = 不修改（与系统项同口径）
+                    return;
+                }
+                if (next !== String(s.value === null || s.value === undefined ? "" : s.value)) {
+                    settings[s.key] = next;
+                }
+            });
+        });
+        // 提交前自净：与门禁矛盾的「开启」类草稿一律撤掉（否则后端整单 400，见 §3.5 / §8.2）
+        pruneToolToggleDrafts();
+        return {
+            dirToggles: Object.assign({}, configState.dirToggles),
+            groupToggles: Object.assign({}, configState.groupToggles),
+            settings,
+            restore: [...configState.restoreKeys],
+        };
+    }
+
+    /** 重新扫描工具目录（§12 refresh）：只重画工具树，不动系统项已保存值 */
+    async function refreshToolTree() {
+        if (configState.dirty && !window.confirm("重新扫描会丢弃当前未保存的更改，继续？")) return;
+        const resultEl = document.getElementById("config-result");
+        try {
+            const resp = await fetch("/api/config/refresh", { method: "POST" });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            configState.scanVersion = data.scanVersion || "";
+            configState.toolTree = data.toolTree || [];
+            configState.orphanKeys = data.orphanKeys || [];
+            configState.dirToggles = {};
+            configState.groupToggles = {};
+            configState.restoreKeys = new Set();
+            const box = document.getElementById("config-form");
+            if (box) renderConfigForm(box);
+            setConfigDirty(false);
+            if (resultEl) resultEl.textContent = "🔄 已重新扫描（版本 " + configState.scanVersion + "）。";
+        } catch (e) {
+            if (resultEl) resultEl.textContent = "❌ 刷新失败：" + String(e.message || e);
+        }
+    }
+
+    /** 删除所选遗留键（§10.2：独立接口、不备份、不参与保存流程） */
+    async function deleteOrphanKeys() {
+        const errEl = document.getElementById("config-orphan-error");
+        const keys = [...document.querySelectorAll(".orphan-check:checked")].map((el) => el.value);
+        if (keys.length === 0) {
+            if (errEl) { errEl.hidden = false; errEl.textContent = "❌ 请先勾选要删除的遗留键"; }
+            return;
+        }
+        if (!window.confirm("确认删除以下 " + keys.length + " 个遗留键？\n\n" + keys.join("\n") + "\n\n（删除不备份，可在 data/envbk 的最近备份中找回）")) return;
+        try {
+            const resp = await fetch("/api/config/orphans", {
+                method: "DELETE",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ confirm: true, keys }),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            configState.orphanKeys = data.remaining || [];
+            const box = document.getElementById("config-form");
+            if (box) renderConfigForm(box);
+            const resultEl = document.getElementById("config-result");
+            if (resultEl) resultEl.textContent = "🧹 已删除 " + keys.length + " 个遗留键。";
+        } catch (e) {
+            if (errEl) { errEl.hidden = false; errEl.textContent = "❌ 删除失败：" + String(e.message || e); }
+        }
+    }
+
     function autoResizeInput() {
         $dom.input.style.height = "auto";
         $dom.input.style.height = Math.min($dom.input.scrollHeight, 150) + "px";

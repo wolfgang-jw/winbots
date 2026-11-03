@@ -3,7 +3,7 @@
  * 修改文件工具集（US-MOD-1 ~ US-MOD-4，需求六）
  *
  * 契约：导出 tools: Tool[]，调用名 local.fileModify.<name>
- * 安全：全部工具经 _shared.resolveInRoot() 白名单校验 + isModifyEnabled() 门控
+ * 安全：全部工具经 _shared.resolveInRoot() 白名单校验；可用性由平台侧按「目录 AND 组开关」统一判定（§8.3）
  * 语义：只负责「改动已有内容」；创建新内容归 fileNew.ts，读取归 fileRead.ts
  *
  * 工具清单：
@@ -16,7 +16,6 @@ import type { Tool } from "@/tools";
 import {
     resolveInRoot,
     assertRealPathInRoot,
-    isModifyEnabled,
     ok,
     fail,
     getFileRoot,      // [配置页 / US-CFG-PAGE-6] 常量 → 函数
@@ -63,10 +62,6 @@ export const tools: Tool[] = [
             required: ["path", "content", "confirm"],
         },
         handler: async (args) => {
-            // ① 修改开关门控（F6-12）
-            if (!isModifyEnabled()) {
-                return fail("ERR_MODIFY_DISABLED", "修改操作已关闭（FILE_MODIFY_ENABLED=false）");
-            }
             // ② 二次确认（F6-2）
             if (args.confirm !== true) {
                 return fail("ERR_CONFIRM_REQUIRED", "覆盖操作需显式确认（confirm: true）");
@@ -132,10 +127,6 @@ export const tools: Tool[] = [
             required: ["path", "oldText", "newText"],
         },
         handler: async (args) => {
-            // ① 修改开关门控（F6-12）
-            if (!isModifyEnabled()) {
-                return fail("ERR_MODIFY_DISABLED", "修改操作已关闭（FILE_MODIFY_ENABLED=false）");
-            }
             // ② 路径白名单
             let abs: string;
             try {
@@ -248,10 +239,6 @@ export const tools: Tool[] = [
             required: ["from", "to"],
         },
         handler: async (args) => {
-            // ① 修改开关门控（F6-12）
-            if (!isModifyEnabled()) {
-                return fail("ERR_MODIFY_DISABLED", "修改操作已关闭（FILE_MODIFY_ENABLED=false）");
-            }
             // ② 源与目标均需通过路径白名单（F6-7 边界）
             let fromAbs: string;
             let toAbs: string;
@@ -338,10 +325,6 @@ export const tools: Tool[] = [
             required: ["path", "confirm"],
         },
         handler: async (args) => {
-            // ① 修改开关门控（F6-12 / F6-13：复用修改开关，无独立删除开关）
-            if (!isModifyEnabled()) {
-                return fail("ERR_MODIFY_DISABLED", "修改操作已关闭（FILE_MODIFY_ENABLED=false）");
-            }
             // ② 二次确认（F6-9）
             if (args.confirm !== true) {
                 return fail("ERR_CONFIRM_REQUIRED", "删除操作需显式确认（confirm: true）");

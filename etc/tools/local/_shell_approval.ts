@@ -11,8 +11,11 @@
  *   4. 审批结果 → 错误码 / 回灌文案（AP-16 / AP-18 / SH-42）
  * ⚠️ 不在此文件创建进程、不弹窗；弹窗由界面（approval.js）完成。
  */
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
 import { maskSecrets, stripAnsi, type ShellPermission } from "./_shell_policy";
+
+/** [规范 §7.3] 本文件服务 local/shell 组；每次实时取值，禁止模块级缓存（SH-46） */
+const S = groupScope("local", "shell");
 
 /** 告知块三段的生成版本号（AP-20 审计要求记录；改模板必须同时改这里） */
 export const APPROVAL_NOTICE_VERSION = "ap-2026-10-31.1";
@@ -122,7 +125,7 @@ export function memoryKey(sessionId: string, command: string, absCwd: string): s
 
 /** 是否命中授权记忆（记忆开关关闭时恒 false，SH-46 每次实时读） */
 export function memoryHit(sessionId: string, command: string, absCwd: string): boolean {
-    if (env.SHELL_SESSION_MEMORY_ENABLED === false) return false;
+    if (S.get<boolean>("session_memory_enabled") === false) return false;
     return sessionAllowAll.has(sessionId) || sessionCommandMemo.has(memoryKey(sessionId, command, absCwd));
 }
 
@@ -149,12 +152,12 @@ export function rememberDecision(
     absCwd: string,
 ): void {
     if (!decision.allow) {
-        const cooldownMs = Math.max(0, Number(env.SHELL_DENY_COOLDOWN_MS) || 60000);
+        const cooldownMs = Math.max(0, Number(S.get<number>("deny_cooldown_ms")) || 60000);
         denyCooldown.set(memoryKey(sessionId, command, absCwd), Date.now() + cooldownMs);
         return;
     }
     if (decision.scope !== "session") return;                       // AP-14：单次允许不留记忆
-    if (env.SHELL_SESSION_MEMORY_ENABLED === false) return;          // 关掉记忆 → 退化为逐次询问
+    if (S.get<boolean>("session_memory_enabled") === false) return;           // 关掉记忆 → 退化为逐次询问
     if (decision.target === "all") sessionAllowAll.add(sessionId);
     else sessionCommandMemo.add(memoryKey(sessionId, command, absCwd));
 }
@@ -234,4 +237,23 @@ export function approvalGrantedNote(scope: {
         return "用户已选择「本会话都允许 · 仅当前命令」：本会话内逐字符相同的同一条命令（同一工作目录）不再询问，其它命令仍会询问。";
     }
     return "用户已批准「仅当次」：本次执行完成后，后续调用仍会重新询问用户。";
+}
+
+/* ============================================================
+ * 四、审批等待上限（C-13：平台模块不再读工具配置）
+ * ============================================================ */
+
+/**
+ * 审批等待上限（毫秒）：实时读组设置项 `approval_wait_ms`（SH-46）。
+ *
+ * 为什么在本文件、而不是 `src/infra/approval.ts`（R-25）：
+ *   §7.3 规定组设置项仅该组可读；平台模块读 `TOOLSET__local__shell__*` 属于跨组越权。
+ *   现在平台侧只接收调用方传进来的 `waitMs`，配置的解析与默认值都留在本组。
+ *
+ * 为什么用 getSoft：本函数在「弹窗挂起」这段关键路径上被调用，
+ *   组一旦因声明不合法被挂起，严格读会抛错 → 命令直接失败且没有可读原因；
+ *   回落到改造前的默认值 120s 至少保持旧行为，并在日志里留一次性告警。
+ */
+export function approvalWaitMs(): number {
+    return Math.max(1000, Number(S.getSoft<number>("approval_wait_ms", 120000)) || 120000);
 }

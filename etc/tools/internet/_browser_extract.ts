@@ -17,7 +17,10 @@
  *    （页面原语在 _browser_driver.ts 的 PAGE_LIB 里）。
  * ⚠️ 不得 import browser.ts（会与门面形成环）；也不得改 Session 的任何字段（P4 出口判据）。
  */
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 import { ok, type Envelope } from "./_common";
 import { failEnvelope, TAIL_LINE, type BrowserErrorCode } from "./_browser_errors";
 import { createMasker, previewText } from "./_browser_policy";
@@ -205,7 +208,7 @@ function planOf(s: Session, args: Record<string, unknown>): Plan | PlanFail {
     sel = pre.selector;
   }
 
-  const maxItems = Math.max(1, Math.min(200, Number(env.BROWSER_EXTRACT_MAX_ELEMENTS) || 20));
+  const maxItems = Math.max(1, Math.min(200, Number(B.get<number>("extract_max_elements")) || 20));
   const includeHidden = args.includeHidden === true || args.includeHidden === "true";
   const includeHtml = args.includeHtml === true || args.includeHtml === "true";
 
@@ -530,9 +533,9 @@ export async function runExtract(s: Session, args: Record<string, unknown>): Pro
   // [REQ-browser BR-33/NB-06] 三层预算：清单条数 → 总量。页面侧已按 itemChars 切过单元素。
   const budget = Math.min(
     HARD_MAX_CHARS,
-    Math.max(500, Number(env.BROWSER_EXTRACT_MAX_CHARS) || 12000),
+    Math.max(500, Number(B.get<number>("extract_max_chars")) || 12000),
   );
-  const itemMax = Math.max(1, Math.min(200, Number(env.BROWSER_EXTRACT_MAX_ELEMENTS) || 20));
+  const itemMax = Math.max(1, Math.min(200, Number(B.get<number>("extract_max_elements")) || 20));
   const attempts = [itemMax, Math.min(itemMax, 10), Math.min(itemMax, 5), Math.min(itemMax, 3)];
 
   let text = "";

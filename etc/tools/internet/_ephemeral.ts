@@ -13,7 +13,10 @@
  *
  * ⚠️ 本文件【不导出 tools】，文件名以 _ 开头 → 加载器跳过、不告警（R-04 / R-05）。
  */
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/web 组；每次实时取值，禁止模块级缓存 */
+const S = groupScope("internet", "web");
 
 export interface Entry {
     /** 会话作用域（无会话标识时的实现见 web.ts） */
@@ -21,7 +24,7 @@ export interface Entry {
     /** 归一化后的 URL（暂存键的一部分） */
     url: string;
     title: string;
-    /** 全文（未截断；回灌时的截断由调用方按 INTERNET_FETCH_MAX_CHARS 处理） */
+    /** 全文（未截断；回灌时的截断由调用方按组设置项 fetch_max_chars 处理） */
     text: string;
     /** 写入时刻（毫秒） */
     at: number;
@@ -48,7 +51,7 @@ function keyOf(scope: string, url: string): string {
 }
 
 function ttlMs(): number {
-    const s = env.INTERNET_STORE_TTL_S;
+    const s = S.get<number>("store_ttl_s");
     return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
 }
 
@@ -105,7 +108,7 @@ export interface PutResult {
  * 条数/全局字符超限：按 LRU 从最旧开始淘汰。
  */
 export function put(scope: string, url: string, title: string, text: string): PutResult {
-    const maxItem = env.INTERNET_STORE_MAX_CHARS_PER_ITEM;
+    const maxItem = S.get<number>("store_max_chars_per_item");
     if (Number.isFinite(maxItem) && maxItem > 0 && text.length > maxItem) {
         return { stored: false, reason: `单条超过 ${maxItem} 字符上限，未暂存（续读需重新抓取）` };
     }
@@ -114,7 +117,7 @@ export function put(scope: string, url: string, title: string, text: string): Pu
     drop(key);   // 同键覆盖前先摘除，避免字符计数重复
 
     // 单会话条数上限：淘汰本会话最旧的条目
-    const maxItems = env.INTERNET_STORE_MAX_ITEMS_PER_SESSION;
+    const maxItems = S.get<number>("store_max_items_per_session");
     if (Number.isFinite(maxItems) && maxItems > 0) {
         const same = [...entries.entries()].filter(([, e]) => e.scope === scope);
         while (same.length >= maxItems) {
@@ -128,7 +131,7 @@ export function put(scope: string, url: string, title: string, text: string): Pu
     totalChars += text.length;
 
     // 全局字符上限：从最旧（LRU 队首）开始淘汰
-    const maxTotal = env.INTERNET_STORE_MAX_CHARS_TOTAL;
+    const maxTotal = S.get<number>("store_max_chars_total");
     if (Number.isFinite(maxTotal) && maxTotal > 0) {
         while (totalChars > maxTotal && entries.size > 0) {
             const first = entries.keys().next();

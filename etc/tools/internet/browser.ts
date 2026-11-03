@@ -1,6 +1,6 @@
 /**
  * etc/tools/internet/browser.ts
- * 浏览器工具门面（唯一被 loadTools 加载的文件，BR-02）
+ * 浏览器工具门面（本目录唯一的入口文件，由 src/tools/scan.ts 扫描加载；BR-02）
  *
  * 契约：导出 tools: Tool[]，调用名 internet.browser.<name>
  *       模型可见名固定 internet__browser__open / __observe / __act / __extract / __close（BR-03）
@@ -11,7 +11,14 @@
  * ⚠️ 工具内部永不向平台抛业务异常（BR-45）；失败一律返回结构化信封。
  */
 import type { Tool, ToolContext } from "@/tools";
-import { env } from "@/infra/env";
+import { groupScope, type SettingDef } from "@/infra/settings";
+
+/**
+ * [规范 §7.3] 本组作用域（只有 internet/browser 可读）。
+ * 私有模块 `_browser_*.ts` 服务本组，用显式形式 groupScope("internet","browser")。
+ * ⚠️ 每次调用实时读，禁止模块级缓存（保存即生效的前提）。
+ */
+const B = groupScope("internet", "browser");
 import { ok, type Envelope } from "./_common";
 import { failEnvelope, withTail, type BrowserErrorCode } from "./_browser_errors";
 import { precheckUrl, reasonLabel, urlForLog } from "./_browser_policy";
@@ -57,11 +64,11 @@ function errText(err: unknown): string {
 }
 
 function navTimeout(): number {
-  return Math.max(1000, Number(env.BROWSER_NAV_TIMEOUT_MS) || 20000);
+  return Math.max(1000, Number(B.get<number>("nav_timeout_ms")) || 20000);
 }
 
 function stableWindow(): number {
-  return Math.max(0, Number(env.BROWSER_STABLE_WINDOW_MS) || 400);
+  return Math.max(0, Number(B.get<number>("stable_window_ms")) || 400);
 }
 
 /**
@@ -124,7 +131,7 @@ type ForegroundAttempt =
  */
 async function raiseWindow(s: Session): Promise<ForegroundAttempt> {
   if (s.headless) return { attempted: false, why: "headless" };
-  if (!env.BROWSER_FOREGROUND_ON_OPEN) return { attempted: false, why: "switch_off" };
+  if (!B.get<boolean>("foreground_on_open")) return { attempted: false, why: "switch_off" };
   const fn = s.driver.bringToFront;
   if (typeof fn !== "function") return { attempted: false, why: "driver_unsupported" };
 
@@ -220,7 +227,7 @@ function keptAliveDetail(s: Session, targetUrl: string, reason: string, ttl: num
 
 async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promise<Envelope> {
   // ① 开关复检（BR-08：即使平台放行也必须再检查，且不得启动浏览器）
-  if (!env.BROWSER_ENABLED) {
+  if (!isBrowserGroupOn()) {
     return failEnvelope("tool_disabled", "浏览器工具已禁用，本次未执行");
   }
 
@@ -265,9 +272,9 @@ async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promis
   //   起因：会话「有就复用」，用户把「无头」改成「有头」后再 open，拿到的仍是旧的无头浏览器，
   //   而结果文本又按 env 报「有头」——表现就是「说是有头，屏幕上还是什么都没有」。
   //   只在 open（用户明确要求打开）时重建，act / observe 不擅自打断在途任务。
-  if (s.headless !== Boolean(env.BROWSER_HEADLESS)) {
+  if (s.headless !== B.get<boolean>("headless")) {
     const from = s.headless ? "无头" : "有头";
-    const to = env.BROWSER_HEADLESS ? "无头" : "有头";
+    const to = B.get<boolean>("headless") ? "无头" : "有头";
     console.log(`[browser] 窗口模式已变更（${from} → ${to}），按新配置重建会话 ${s.prefix}`);
     await closeSession(s, "窗口模式配置变更，按新配置重建");
     const again = await ensureSession(ctx?.sessionId);
@@ -459,7 +466,7 @@ async function runOpen(args: Record<string, unknown>, ctx?: ToolContext): Promis
 // ============================================================
 
 async function runObserve(args: Record<string, unknown>, ctx?: ToolContext): Promise<Envelope> {
-  if (!env.BROWSER_ENABLED) {
+  if (!isBrowserGroupOn()) {
     return failEnvelope("tool_disabled", "浏览器工具已禁用，本次未执行");
   }
 
@@ -519,7 +526,7 @@ async function runObserve(args: Record<string, unknown>, ctx?: ToolContext): Pro
 // ============================================================
 
 async function runActTool(args: Record<string, unknown>, ctx?: ToolContext): Promise<Envelope> {
-  if (!env.BROWSER_ENABLED) {
+  if (!isBrowserGroupOn()) {
     return failEnvelope("tool_disabled", "浏览器工具已禁用，本次未执行");
   }
 
@@ -557,7 +564,7 @@ async function runActTool(args: Record<string, unknown>, ctx?: ToolContext): Pro
  * 任何一条被破坏都会让模型手里的 ref 在毫无征兆的情况下失效。
  */
 async function runExtractTool(args: Record<string, unknown>, ctx?: ToolContext): Promise<Envelope> {
-  if (!env.BROWSER_ENABLED) {
+  if (!isBrowserGroupOn()) {
     return failEnvelope("tool_disabled", "浏览器工具已禁用，本次未执行");
   }
 
@@ -656,7 +663,8 @@ export const tools: Tool[] = [
     name: "open",
     description: DESC_OPEN,
     parameters: SCHEMA_OPEN,
-    enabled: () => env.BROWSER_ENABLED,
+    // [§8.4] 旧总开关 BROWSER_ENABLED 已废弃：自身条件改为「组开关状态」（§8.3 第三环节）
+    enabled: () => isBrowserGroupOn(),
     handler: async (args, ctx) => {
       try {
         return await runOpen(args, ctx);
@@ -669,7 +677,8 @@ export const tools: Tool[] = [
     name: "observe",
     description: DESC_OBSERVE,
     parameters: SCHEMA_OBSERVE,
-    enabled: () => env.BROWSER_ENABLED,
+    // [§8.4] 旧总开关 BROWSER_ENABLED 已废弃：自身条件改为「组开关状态」（§8.3 第三环节）
+    enabled: () => isBrowserGroupOn(),
     handler: async (args, ctx) => {
       try {
         return await runObserve(args, ctx);
@@ -682,7 +691,8 @@ export const tools: Tool[] = [
     name: "act",
     description: DESC_ACT,
     parameters: SCHEMA_ACT,
-    enabled: () => env.BROWSER_ENABLED,
+    // [§8.4] 旧总开关 BROWSER_ENABLED 已废弃：自身条件改为「组开关状态」（§8.3 第三环节）
+    enabled: () => isBrowserGroupOn(),
     handler: async (args, ctx) => {
       try {
         return await runActTool(args, ctx);
@@ -695,7 +705,8 @@ export const tools: Tool[] = [
     name: "close",
     description: DESC_CLOSE,
     parameters: SCHEMA_CLOSE,
-    enabled: () => env.BROWSER_ENABLED,
+    // [§8.4] 旧总开关 BROWSER_ENABLED 已废弃：自身条件改为「组开关状态」（§8.3 第三环节）
+    enabled: () => isBrowserGroupOn(),
     handler: async (args, ctx) => {
       try {
         return await runClose(args, ctx);
@@ -709,7 +720,8 @@ export const tools: Tool[] = [
     name: "extract",
     description: DESC_EXTRACT,
     parameters: SCHEMA_EXTRACT,
-    enabled: () => env.BROWSER_ENABLED,
+    // [§8.4] 旧总开关 BROWSER_ENABLED 已废弃：自身条件改为「组开关状态」（§8.3 第三环节）
+    enabled: () => isBrowserGroupOn(),
     handler: async (args, ctx) => {
       try {
         return await runExtractTool(args, ctx);
@@ -719,3 +731,178 @@ export const tools: Tool[] = [
     },
   },
 ];
+// ============================================================
+// [规范 §8.3 / §8.4] 执行时的层级门禁复检
+// ============================================================
+
+import { groupState } from "@/infra/settings";
+
+/**
+ * 组是否可用（祖先目录全开 + 组开关开 + 未挂起）。
+ *
+ * 为什么保留「工具内部再查一次」：BR-08 要求「即使平台放行也必须再检查」，
+ *   而 §8.5 明确「清单按快照固定，执行时实时复查」——两者叠加正是这里的用途。
+ * 为什么读 groupState 而不是读旧开关：`BROWSER_ENABLED` 已在 §9.2 迁移中删除，
+ *   可用性唯一来源是「目录链 AND 组开关」（§8.3）。日志/开关值都不在此打印（§8.7）。
+ */
+function isBrowserGroupOn(): boolean {
+  return groupState("internet/browser").available;
+}
+
+/* ============================================================
+ * [规范 §7.1] 组设置项声明（仅 internet/browser 可读，§7.3）
+ *   · 键名与 migrate.ts 的 DOWN_SINK 一一对应（改名 = 用户旧值变孤儿键）；
+ *   · 默认值只在这里写一次（§3.2）；BROWSER_ENABLED 已废弃，不在声明内（§8.4）；
+ *   · 与默认值相同的取值不落盘（§9.1）；越界 / 类型不符读取端回退默认（§7.4）。
+ * ============================================================ */
+export const settings: Record<string, SettingDef> = {
+    executable_path: {
+        kind: "string",
+        default: "auto",
+        desc: "浏览器可执行文件路径；auto = 自动探测 Edge → Chrome。显式路径必须存在，否则启动失败并列出已尝试路径。",
+    },
+    foreground_on_open: {
+        kind: "boolean",
+        default: true,
+        desc: "open 时是否把窗口带到最前（无头模式无效）。关闭后也不再以最大化启动。",
+    },
+    headless: {
+        kind: "boolean",
+        default: true,
+        desc: "无头模式：窗口不出现在屏幕上（操作仍在真实浏览器内执行）。改为 false 后下一次 open 会按新配置重建实例。",
+    },
+    debug_port: {
+        kind: "number",
+        default: 0,
+        min: 0,
+        max: 65535,
+        desc: "调试端口；0 = 随机分配。固定值用于端口冲突排查。",
+    },
+    profile_mode: {
+        kind: "string",
+        default: "temp",
+        options: ["temp", "persist"],
+        desc: "temp = 临时 profile（关闭即删）；persist = 持久 profile（登录态会保留给模型使用）。",
+    },
+    profile_dir: {
+        kind: "string",
+        default: "",
+        desc: "仅 persist 模式使用；为空时回退临时 profile 并在日志告警。",
+    },
+    session_ttl_s: {
+        kind: "number",
+        default: 180,
+        min: 10,
+        max: 86400,
+        desc: "会话空闲存活秒数，到期自动关闭浏览器并删除临时 profile。",
+    },
+    max_sessions: {
+        kind: "number",
+        default: 2,
+        min: 1,
+        max: 10,
+        desc: "并发会话上限（打开失败后被保留的会话同样占名额）。",
+    },
+    max_tabs: {
+        kind: "number",
+        default: 10,
+        min: 1,
+        max: 20,
+        desc: "单会话标签数上限；= 1 即退回单标签语义（同标签导航、不登记站点新标签）。",
+    },
+    action_timeout_ms: {
+        kind: "number",
+        default: 8000,
+        min: 500,
+        max: 120000,
+        desc: "单步动作超时（毫秒）。",
+    },
+    nav_timeout_ms: {
+        kind: "number",
+        default: 20000,
+        min: 1000,
+        max: 300000,
+        desc: "导航超时（毫秒）。",
+    },
+    stable_window_ms: {
+        kind: "number",
+        default: 400,
+        min: 0,
+        max: 5000,
+        desc: "导航/跳转后判定「加载完成」的稳定窗口（毫秒）。",
+    },
+    snapshot_max_elements: {
+        kind: "number",
+        default: 120,
+        min: 1,
+        max: 1000,
+        desc: "快照列出的元素上限。",
+    },
+    snapshot_max_chars: {
+        kind: "number",
+        default: 6000,
+        min: 200,
+        max: 12000,
+        desc: "快照正文字符上限（整页概览，与 extract 的细读上限相互独立）。",
+    },
+    extract_max_chars: {
+        kind: "number",
+        default: 12000,
+        min: 500,
+        max: 24000,
+        desc: "单次 extract 回灌字符上限（硬上限 24000）。",
+    },
+    extract_max_elements: {
+        kind: "number",
+        default: 20,
+        min: 1,
+        max: 200,
+        desc: "extract 命中清单条数上限。",
+    },
+    max_actions: {
+        kind: "number",
+        default: 10,
+        min: 1,
+        max: 30,
+        desc: "单次 act 的动作数上限。",
+    },
+    domain_allowlist: {
+        kind: "string_array",
+        default: [],
+        desc: "域名白名单（后缀匹配）；空 = 不额外限制（私有网段仍被阻断）。",
+    },
+    domain_blocklist: {
+        kind: "string_array",
+        default: [],
+        desc: "域名黑名单，优先于白名单。",
+    },
+    block_private_net: {
+        kind: "boolean",
+        default: true,
+        desc: "阻断内网 / 回环地址（含 DNS 解析后的私有地址）。",
+    },
+    allow_download: {
+        kind: "boolean",
+        default: false,
+        desc: "是否允许下载（默认拒绝）。",
+    },
+    allow_upload: {
+        kind: "boolean",
+        default: false,
+        desc: "是否允许上传（默认拒绝）。",
+    },
+    drag_steps: {
+        kind: "number",
+        default: 12,
+        min: 10,
+        max: 60,
+        desc: "拖拽插值步数（代码强制下限 10：步数过小会被拖拽库判定为点击）。",
+    },
+    type_delay_ms: {
+        kind: "number",
+        default: 0,
+        min: 0,
+        max: 100,
+        desc: "逐字输入的时间间隔（毫秒）。",
+    },
+};

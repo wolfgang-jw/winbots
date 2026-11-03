@@ -11,7 +11,10 @@
  * 注入点（NB-04）：`setDriverFactoryForTest()` 可整体替换驱动，用例全程零真实浏览器。
  */
 import type { ChildProcess } from "node:child_process";
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 import { CdpConnection, CdpClosedError } from "./_browser_cdp";
 import { buildArgs, proc } from "./_browser_proc";
 // [REQ-browser BR-01/BR-03] 目标发现与计数落在 _browser_targets.ts（NB-01：驱动不再承载标签逻辑）
@@ -836,7 +839,7 @@ class ChromiumDriver implements BrowserDriver {
 
     let port = 0;
     try {
-      const configured = Number(env.BROWSER_DEBUG_PORT);
+      const configured = Number(B.get<number>("debug_port"));
       if (Number.isInteger(configured) && configured > 0) {
         if (await proc().isPortBusy(configured)) {
           return dFail(
@@ -1092,7 +1095,7 @@ class ChromiumDriver implements BrowserDriver {
       )
       .catch(() => undefined);
     // 粗粒度兜底：覆盖请求暂停事件覆盖不到的资源类型（WebSocket 等，已知缺口）
-    if (env.BROWSER_BLOCK_PRIVATE_NET) {
+    if (B.get<boolean>("block_private_net")) {
       await cdp
         .send(
           "Network.setBlockedURLs",
@@ -1125,8 +1128,8 @@ class ChromiumDriver implements BrowserDriver {
         value: { count: list.length, activeIndex: list.length > 0 ? 1 : 0, list },
       };
     }
-    // [REQ-browser BR-25] BROWSER_MAX_TABS=1：站点自开的目标一律不登记、不报数（单标签退化）
-    const maxTabs = Math.min(20, Math.max(1, Number(env.BROWSER_MAX_TABS) || 10));
+    // [REQ-browser BR-25] 单会话标签上限 =1：站点自开的目标一律不登记、不报数（单标签退化）
+    const maxTabs = Math.min(20, Math.max(1, Number(B.get<number>("max_tabs")) || 10));
     const r = await hub.sync({ ignoreNew: maxTabs <= 1 });
     const snap = hub.briefs();
     // 驱动侧「活跃标签」与标签中心对齐：cmd 依赖 this.targetId 解析 sessionId
@@ -1655,7 +1658,7 @@ class ChromiumDriver implements BrowserDriver {
 
   async typeChars(text: string): Promise<DriverResult<void>> {
     try {
-      const delayMs = Math.min(100, Math.max(0, Number(env.BROWSER_TYPE_DELAY_MS) || 0));
+      const delayMs = Math.min(100, Math.max(0, Number(B.get<number>("type_delay_ms")) || 0));
       for (const ch of text) {
         await this.cmd("Input.dispatchKeyEvent", { type: "keyDown", text: ch, unmodifiedText: ch, key: ch });
         await this.cmd("Input.dispatchKeyEvent", { type: "keyUp", key: ch });

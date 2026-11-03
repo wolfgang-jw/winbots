@@ -13,20 +13,28 @@
  */
 import type { Tool, ToolContext } from "@/tools";
 import { getSessionDetail } from "@/infra/session";
-import { env } from "@/infra/env";
+import { groupScope, type SettingDef } from "@/infra/settings";
 import { ok, fail } from "./_shared";
 import {
     checkCommand, checkCwd, checkIntent, checkTimeout, currentPermission, denialReason,
     maskSecrets, packStreams, runLogLine, truncationNote,
+    DEFAULT_SHELL_DENY_LIST,
 } from "./_shell_policy";
 import {
     consoleEncoding, currentShellType, execCommand, tryAcquireSlot, tryLockSession,
 } from "./_shell_exec";
 import {
-    approvalGrantedNote, buildNotices, clearSessionMemory, inDenyCooldown,
+    approvalGrantedNote, approvalWaitMs, buildNotices, clearSessionMemory, inDenyCooldown,
     looksDestructive, memoryHit, outcomeMessage, outcomeToCode, rememberDecision,
 } from "./_shell_approval";
-import { approvalWaitMs, onChannelClosed, registerApproval, type ApprovalDecision } from "@/infra/approval";
+import { onChannelClosed, registerApproval, type ApprovalDecision } from "@/infra/approval";
+
+/**
+ * [规范 §7.3] 本组作用域（只有 local/shell 可读）。
+ * 私有模块 `_shell_*.ts` 服务本组，用显式形式 groupScope("local","shell")。
+ * ⚠️ 每次调用实时读，禁止模块级缓存（SH-46）。
+ */
+const S = groupScope("local", "shell");
 
 /**
  * 工具描述（SH-06 的六点 + SH-08 的两条示例 + 参数说明）。
@@ -114,7 +122,7 @@ export function createRunTool(deps: Partial<RunDeps> = {}): Tool {
                 return fail(
                     "tool_disabled",
                     "命令执行当前为「禁止」档：工具不在模型可见列表内，本次未创建任何进程。" +
-                        "如需使用，请由用户把配置项 SHELL_PERMISSION 改为 ask（每次询问）或 allow（不再询问）。",
+                        "如需使用，请让用户把配置页 › 本机命令执行配置 › 权限档位 改为 ask（每次询问）或 allow（不再询问）。",
                 );
             }
 
@@ -172,7 +180,7 @@ export function createRunTool(deps: Partial<RunDeps> = {}): Tool {
                         permission,
                         memoryHit: false,
                         destructive: looksDestructive(cmd.text),
-                        allowAllOption: env.SHELL_ALLOW_ALL_OPTION !== false,
+                        allowAllOption: S.get<boolean>("allow_all_option"),
                     });
                     if (!notices) {
                         console.error("⛔ [审批] 告知块不完整，已按保守策略拒绝（未弹窗、未创建进程）");
@@ -226,7 +234,7 @@ export function createRunTool(deps: Partial<RunDeps> = {}): Tool {
                 if (!releaseSlot) {
                     return fail(
                         "busy",
-                        `已达到全局执行并发上限（${env.SHELL_MAX_CONCURRENCY}）。` +
+                        `已达到全局执行并发上限（${S.get<number>("max_concurrency")}）。` +
                             "本工具不排队：请等当前命令结束后重试。",
                     );
                 }
@@ -250,7 +258,7 @@ export function createRunTool(deps: Partial<RunDeps> = {}): Tool {
                     return fail(
                         "spawn_failed",
                         `进程无法创建（不是命令执行失败）：${maskSecrets(r.message || "未知原因")}。` +
-                            "请检查 SHELL_TYPE 配置、shell 是否存在于 PATH、以及服务进程是否有权创建进程。",
+                            "请让用户检查「shell 类型」配置、shell 是否存在于 PATH、以及服务进程是否有权创建进程。",
                     );
                 }
                 if (r.kind === "timeout") {
@@ -285,8 +293,8 @@ export function createRunTool(deps: Partial<RunDeps> = {}): Tool {
                 }
 
                 // ── 输出整形（预算 = 配置上限 − 头尾固定字段；SH-26 / SH-30）
-                const limit = Math.max(500, Number(env.SHELL_OUTPUT_MAX_CHARS) || 8000);
-                const utf8Unify = env.SHELL_UTF8_UNIFY !== false;
+                const limit = Math.max(500, Number(S.get<number>("output_max_chars")) || 8000);
+                const utf8Unify = S.get<boolean>("utf8_unify");
                 const enc = consoleEncoding();
                 const shell = currentShellType();
 
@@ -397,3 +405,109 @@ function sessionTitleOf(sessionId: string): string {
 onChannelClosed((sessionId) => clearSessionMemory(sessionId));
 
 export const tools: Tool[] = [createRunTool()];
+
+/* ============================================================
+ * [规范 §7.1] 组设置项声明（仅 local/shell 可读，§7.3）
+ *   · 键名与 migrate.ts 的 DOWN_SINK 一一对应（`SHELL_TYPE` → `type`）；
+ *   · 默认值只在这里写一次（§3.2）；`SHELL_PERMISSION` **不是**启用开关，是档位（R-10），
+ *     可用性由「目录链 AND 组开关」判定（§8.3），档位只作「工具自身附加条件」；
+ *   · 与默认值相同的取值不落盘（§9.1）；越界 / 类型不符读取端回退默认（§7.4）。
+ * ============================================================ */
+export const settings: Record<string, SettingDef> = {
+    permission: {
+        kind: "string",
+        default: "forbid",
+        options: ["forbid", "ask", "allow"],
+        optionLabels: {
+            forbid: "禁止（工具不在模型可见列表）",
+            ask: "需用户同意（每次执行都要用户点一次确认）",
+            allow: "允许（等于把本机命令行完全交给模型，不再有任何人工闸门）",
+        },
+        desc: "权限档位。forbid 时工具不出现在模型可见列表；allow 等于关闭人工闸门，请谨慎。",
+    },
+    approval_wait_ms: {
+        kind: "number",
+        default: 120000,
+        min: 1000,
+        max: 3600000,
+        desc: "审批等待上限（毫秒）。超时按 approval_timeout 保守拒绝，不默认放行。",
+    },
+    session_memory_enabled: {
+        kind: "boolean",
+        default: true,
+        desc: "本会话授权记忆：开启后「本会话都允许」不再逐次弹窗；关闭则退化为逐次询问。",
+    },
+    allow_all_option: {
+        kind: "boolean",
+        default: true,
+        desc: "是否提供「本会话都允许 · 所有命令」选项（界面隐藏 + 服务端拒绝两道）。",
+    },
+    deny_cooldown_ms: {
+        kind: "number",
+        default: 60000,
+        min: 0,
+        max: 3600000,
+        desc: "用户拒绝后的冷却时长（毫秒）：期间原样重发不再弹窗。",
+    },
+    type: {
+        kind: "string",
+        default: "cmd",
+        options: ["cmd", "powershell"],
+        desc: "解释器类型。模型不能选择，只由本配置决定。",
+    },
+    timeout_default_ms: {
+        kind: "number",
+        default: 30000,
+        min: 1000,
+        max: 3600000,
+        desc: "未指定 timeoutMs 时的默认超时。",
+    },
+    timeout_max_ms: {
+        kind: "number",
+        default: 120000,
+        min: 1000,
+        max: 3600000,
+        desc: "单次执行的超时上限（模型给的 timeoutMs 会被钳制到该值）。",
+    },
+    output_max_chars: {
+        kind: "number",
+        default: 8000,
+        min: 500,
+        max: 24000,
+        desc: "回灌给模型的输出字符预算（stdout/stderr 合计，含头尾固定字段）。",
+    },
+    max_command_chars: {
+        kind: "number",
+        default: 4000,
+        min: 16,
+        max: 32000,
+        desc: "单条命令的长度上限。",
+    },
+    max_concurrency: {
+        kind: "number",
+        default: 1,
+        min: 1,
+        max: 8,
+        desc: "全局并发执行上限（批准后才占槽，取不到立即 busy，不排队）。",
+    },
+    utf8_unify: {
+        kind: "boolean",
+        default: true,
+        desc: "优先按 UTF-8 解码输出；失败时回退控制台代码页并显式告知。",
+    },
+    deny_list: {
+        kind: "string_array",
+        default: DEFAULT_SHELL_DENY_LIST,
+        desc: "拒绝清单（命中即拦截，不弹窗）。启发式规则，不是安全保证。",
+    },
+    allow_list: {
+        kind: "string_array",
+        default: [],
+        desc: "允许清单（按命令首 token 匹配）；留空 = 不启用。",
+    },
+    extra_env_keys: {
+        kind: "string_array",
+        default: [],
+        desc: "追加传给子进程的环境变量键（命中 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL 的键一律剔除）。",
+    },
+};

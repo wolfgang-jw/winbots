@@ -8,7 +8,10 @@
  * [设计] 第 8 章、§9 act 批次执行器
  */
 import type { ToolContext } from "@/tools";
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 import { ok, type Envelope } from "./_common";
 import {
   failEnvelope,
@@ -136,7 +139,7 @@ export function validateActArgs(raw: unknown): ValidationResult {
   }
 
   // ③ 数量上限
-  const max = Math.max(1, Number(env.BROWSER_MAX_ACTIONS) || 10);
+  const max = Math.max(1, Number(B.get<number>("max_actions")) || 10);
   if (list.length > max) {
     return {
       ok: false,
@@ -518,9 +521,9 @@ interface StepFail {
 
 type StepOutcome = StepOk | StepFail;
 
-const stepTimeoutMs = (): number => Math.max(1000, Number(env.BROWSER_ACTION_TIMEOUT_MS) || 8000);
-const navTimeoutMs = (): number => Math.max(1000, Number(env.BROWSER_NAV_TIMEOUT_MS) || 20000);
-const stableWindowMs = (): number => Math.max(0, Number(env.BROWSER_STABLE_WINDOW_MS) || 400);
+const stepTimeoutMs = (): number => Math.max(1000, Number(B.get<number>("action_timeout_ms")) || 8000);
+const navTimeoutMs = (): number => Math.max(1000, Number(B.get<number>("nav_timeout_ms")) || 20000);
+const stableWindowMs = (): number => Math.max(0, Number(B.get<number>("stable_window_ms")) || 400);
 
 interface ChangeInfo {
   changed: boolean;
@@ -889,7 +892,7 @@ async function execOne(
     };
   }
 
-  const steps = Math.max(10, Math.min(60, Number(env.BROWSER_DRAG_STEPS) || 12));
+  const steps = Math.max(10, Math.min(60, Number(B.get<number>("drag_steps")) || 12));
   let strategy = "";
   let degraded = false;
 

@@ -14,26 +14,48 @@
  *   6. 敏感值掩码（SH-37）
  */
 import { statSync } from "fs";
-import { env, type ShellPermission } from "@/infra/env";
+import { env } from "@/infra/env";
+import { groupScope, secretSettingValues } from "@/infra/settings";
 import { resolveInRoot } from "./_shared";
 import { escapedChars } from "./_fileReadRange";
 
 /**
- * 权限档位的三值枚举。⚠️ 类型定义**只有一处**（src/infra/env.ts，配置的源头），
- * 这里只做再导出，避免「两处各写一遍字面量联合类型」后悄悄漂移（复核 R17）。
+ * [规范 §7.3] 本文件服务 local/shell 组；每次实时取值，禁止模块级缓存（SH-46）。
  */
-export type { ShellPermission };
+const S = groupScope("local", "shell");
+
+/**
+ * 权限档位的三值枚举。
+ * ⚠️ 类型定义的**唯一来源**已随 C-06-1 从 `src/infra/env.ts` 搬到本文件（平台层不再持有工具配置类型）：
+ *   配置本体是组设置项 `TOOLSET__local__shell__permission`，其合法取值由这里与 `settings` 声明共同定义。
+ */
+export type ShellPermission = "forbid" | "ask" | "allow";
+
+/** 合法取值（顺序即配置页下拉顺序） */
+export const SHELL_PERMISSIONS: readonly ShellPermission[] = ["forbid", "ask", "allow"];
+
+/**
+ * [SH-33] 内置拒绝清单默认集（大小写不敏感、去多余空白后按「包含」匹配）。
+ * ⚠️ 这是**启发式**，不是安全保证（SH-36）；覆盖磁盘级与系统级破坏性操作。
+ * 值为数组（组设置项声明类型 `string_array`，落盘为 JSON 文本）。
+ */
+export const DEFAULT_SHELL_DENY_LIST: readonly string[] = [
+    "format", "diskpart", "bcdedit", "vssadmin delete", "vssadmin resize", "cipher /w",
+    "wbadmin delete", "reg delete", "reg add", "shutdown", "restart-computer", "stop-computer",
+    "net user", "net localgroup", "takeown /f", "icacls . /reset",
+    "del /f /s /q c:", "rd /s /q c:", "rmdir /s /q c:",
+];
 
 /* ============================================================
  * 一、权限档位（AP-01 ~ AP-05）
  * ============================================================ */
 
 /**
- * 当前档位：**每次实时读** env（SH-46：不得在模块顶层缓存，否则热更失效）。
+ * 当前档位：**每次实时读**组设置项（SH-46：不得在模块顶层缓存，否则热更失效）。
  * 非法值一律回退 "forbid"（保守失败：宁可工具消失，也不误开）。
  */
 export function currentPermission(): ShellPermission {
-    const raw = String(env.SHELL_PERMISSION ?? "").toLowerCase();
+    const raw = String(S.get<string>("permission") ?? "").toLowerCase();
     return raw === "ask" || raw === "allow" ? raw : "forbid";
 }
 
@@ -65,7 +87,7 @@ export function checkCommand(raw: unknown): TextCheck {
                 "请给出更短的命令后重试；如确需长命令，请改写为脚本文件后用一条命令执行。",
         };
     }
-    const max = Math.max(1, Number(env.SHELL_MAX_COMMAND_CHARS) || 4000);
+    const max = Math.max(1, Number(S.get<number>("max_command_chars")) || 4000);
     if (text.length > max) {
         return {
             ok: false,
@@ -150,8 +172,8 @@ export type TimeoutCheck = { ok: true; ms: number } | { ok: false; message: stri
  *   合法但越界 → 钳制到 [1000, SHELL_TIMEOUT_MAX_MS]。
  */
 export function checkTimeout(raw: unknown): TimeoutCheck {
-    const max = Math.max(TIMEOUT_MIN_MS, Number(env.SHELL_TIMEOUT_MAX_MS) || 120000);
-    const def = Math.min(Math.max(Number(env.SHELL_TIMEOUT_DEFAULT_MS) || 30000, TIMEOUT_MIN_MS), max);
+    const max = Math.max(TIMEOUT_MIN_MS, Number(S.get<number>("timeout_max_ms")) || 120000);
+    const def = Math.min(Math.max(Number(S.get<number>("timeout_default_ms")) || 30000, TIMEOUT_MIN_MS), max);
     if (raw === undefined || raw === null || raw === "") return { ok: true, ms: def };
     const n = Number(raw);
     if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
@@ -169,13 +191,10 @@ export function checkTimeout(raw: unknown): TimeoutCheck {
  * 三、拒绝清单 / 允许清单（SH-33 / SH-34 / SH-36）
  * ============================================================ */
 
-/** 逗号分隔文本 → 数组；"none" 与空串都表示「未启用」（SH-47 ③） */
-export function splitList(raw: unknown): string[] {
-    const text = String(raw ?? "").trim();
-    if (text === "" || text.toLowerCase() === "none") return [];
-    return text
-        .split(",")
-        .map((s) => s.trim())
+/** 名单规范化：去空白项；`none` 与空串都表示「未启用」（沿用旧语义，SH-47 ③） */
+export function normalizeList(items: readonly string[]): string[] {
+    return (items ?? [])
+        .map((s) => String(s ?? "").trim())
         .filter((s) => s !== "" && s.toLowerCase() !== "none");
 }
 
@@ -199,24 +218,24 @@ export function firstToken(command: string): string {
 export function denialReason(command: string): string | null {
     const normalized = normalizeForDeny(command);
 
-    for (const pattern of splitList(env.SHELL_DENY_LIST)) {
+    for (const pattern of normalizeList(S.get<string[]>("deny_list"))) {
         const p = normalizeForDeny(pattern);
         if (p && normalized.includes(p)) {
             return (
                 `命中拒绝清单（${pattern}）。` +
-                "该命令被本地策略拦截，未创建进程；如确需执行，请由用户调整 SHELL_DENY_LIST 配置。"
+                "该命令被本地策略拦截，未创建进程；如确需执行，请让用户调整「拒绝清单」配置。"
             );
         }
     }
 
-    const allow = splitList(env.SHELL_ALLOW_LIST);
+    const allow = normalizeList(S.get<string[]>("allow_list"));
     if (allow.length > 0) {
         const token = firstToken(command);
         const hit = allow.some((a) => a.toLowerCase() === token);
         if (!hit) {
             return (
                 `未命中允许清单（命令首 token = "${token}"，允许清单已启用且只放行首 token 命中的命令）。` +
-                "请改用清单内允许的程序，或由用户调整 SHELL_ALLOW_LIST（填 none 表示不启用）。"
+                "请改用清单内允许的程序，或让用户调整「允许清单」（留空表示不启用）。"
             );
         }
     }
@@ -254,7 +273,7 @@ export interface ChildEnvResult {
 export function buildChildEnv(): ChildEnvResult {
     const out: Record<string, string> = {};
     const dropped: string[] = [];
-    const keys = [...BASE_ENV_KEYS, ...splitList(env.SHELL_EXTRA_ENV_KEYS)];
+    const keys = [...BASE_ENV_KEYS, ...normalizeList(S.get<string[]>("extra_env_keys"))];
 
     for (const key of keys) {
         if (!key) continue;
@@ -275,9 +294,13 @@ export function buildChildEnv(): ChildEnvResult {
 /**
  * 需要掩码的字面值：已配置的密钥（精确匹配，不做通配）。
  * 长串优先替换，避免「短密钥是长密钥前缀」时残留片段。
+ *
+ * - 系统密钥 `LLM_API_KEY` 由平台自己取（系统项允许平台读）；
+ * - 工具域的密钥**不在这里跨组读**（§7.3 组设置项仅本组可读），
+ *   而是由取值层 `secretSettingValues()` 统一枚举所有声明了 `secret: true` 的项（R-25 / V-22）。
  */
 export function secretLiterals(): string[] {
-    const list = [String(env.LLM_API_KEY ?? ""), String(env.INTERNET_DEEPSEEK_API_KEY ?? "")];
+    const list = [String(env.LLM_API_KEY ?? ""), ...secretSettingValues()];
     return [...new Set(list.filter((s) => s !== ""))].sort((a, b) => b.length - a.length);
 }
 

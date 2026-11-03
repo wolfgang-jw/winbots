@@ -16,7 +16,7 @@ import { Hono } from "hono";
 import { env } from "@/infra/env";
 import { isValidSessionId } from "@/infra/session";
 import {
-    attachChannel, getPending, submitDecision, type ApprovalDecision, type ApprovalEvent,
+    attachChannel, getPending, getPendingById, submitDecision, type ApprovalDecision, type ApprovalEvent,
 } from "@/infra/approval";
 
 const router = new Hono();
@@ -117,10 +117,19 @@ router.post("/:requestId/decision", async (c) => {
         );
     }
 
-    // AP-15：配置关闭「所有命令」选项时，服务端同样拒绝该选项（界面隐藏 + 接口拒绝两道）
-    if (decision.target === "all" && decision.scope === "session" && env.SHELL_ALLOW_ALL_OPTION === false) {
+    // AP-15：弹窗创建时若未提供「所有命令」选项，服务端同样拒绝该选项（界面隐藏 + 接口拒绝两道）。
+    // [C-14 / R-25] 判据取自**该请求自己的 payload**（弹窗创建时固化的 allowAllOption）：
+    //   旧写法读 SHELL_ALLOW_ALL_OPTION 这个环境变量 —— 那是工具配置（§7.3 组设置项），平台侧不许读；
+    //   且读「当前配置」会让「弹窗挂着时改了配置」把已渲染的弹窗变成提交即 400（口径分裂）。
+    const pendingReq = getPendingById(requestId);
+    if (
+        pendingReq !== null &&
+        decision.target === "all" &&
+        decision.scope === "session" &&
+        pendingReq.allowAllOption === false
+    ) {
         return c.json(
-            { ok: false, code: "ERR_OPTION_DISABLED", error: "「本会话都允许 · 所有命令」已被配置禁用，请选择其它选项" },
+            { ok: false, code: "ERR_OPTION_DISABLED", error: "「本会话都允许 · 所有命令」在该弹窗中未提供，请选择其它选项" },
             400,
         );
     }

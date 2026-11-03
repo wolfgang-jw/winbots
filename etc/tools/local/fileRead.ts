@@ -3,7 +3,7 @@
  * 只读文件工具集（US-READ-1 ~ US-READ-4，需求四）
  *
  * 契约：导出 tools: Tool[]，调用名 local.fileRead.<name>
- * 安全：全部工具经 _shared.resolveInRoot() 白名单校验 + isReadEnabled() 门控
+ * 安全：全部工具经 _shared.resolveInRoot() 白名单校验；可用性由平台侧按「目录 AND 组开关」统一判定（§8.3）
  *
  * 工具清单：
  *   - list_directory   列出目录（可选递归）      US-READ-1
@@ -16,7 +16,6 @@ import type { Tool } from "@/tools";
 import {
     resolveInRoot,
     assertRealPathInRoot,
-    isReadEnabled,
     ok,
     fail,
     getFileRoot,          // [配置页 / US-CFG-PAGE-6] FILE_ROOT 常量 → 函数
@@ -24,6 +23,11 @@ import {
 import { readdir, stat, readFile } from "fs/promises";
 import { join, relative, sep } from "path";
 // [批次一 / FR-21、FR-38、FR-39] 预算上限与默认行数：每次调用实时读取，禁止模块级缓存
+// [规范 §7.3] default_lines 已从 EnvConfig 下沉为本组的组设置项（只本组可读）
+import { groupScope, type SettingDef } from "@/infra/settings";
+
+/** 本组作用域（入口文件也可用 groupSettings(import.meta)，显式形式更利于 grep） */
+const G = groupScope("local", "fileRead");
 import { env } from "@/infra/env";
 // [批次一] 分段读取纯函数（不导出 tools，loadTools 会跳过 _ 前缀文件）
 import {
@@ -167,8 +171,8 @@ const READ_FILE_DESCRIPTION =
     "读取总操作目录下文本文件的内容，支持整文件与按行区间两种模式。" +
     "①整文件模式：只传 path，返回整个文件（单次上限 256KB，超出会截断 truncated=true；" +
     "若整文件序列化后超出结果长度预算，会自动降级为区间模式：mode=range、从第 1 行起返回完整行）。" +
-    "②区间模式：传 startLine（行号，从 1 起）与可选 lineCount（行数；省略时取配置 " +
-    "FILE_READ_DEFAULT_LINES，通常 2000；上限 50000），只返回该区间；" +
+    "②区间模式：传 startLine（行号，从 1 起）与可选 lineCount（行数；省略时默认 " +
+    "2000 行，可在配置页调整；上限 50000），只返回该区间；" +
     "只给 lineCount 而没给 startLine 会返回 ERR_BAD_RANGE；区间越过末行时截到末行并返回成功。" +
     "续读字段用法：nextStartLine 就是下一次调用应传入的 startLine（已到文末为 null，调用方不要自己加一）；" +
     "lastLineNum 是本次返回的最后一行行号；totalLines 是文件总行数；" +
@@ -193,10 +197,6 @@ export const tools: Tool[] = [
             required: ["path"],
         },
         handler: async (args) => {
-            // ① 读开关门控（F4-10）
-            if (!isReadEnabled()) {
-                return fail("ERR_READ_DISABLED", "读操作已关闭（FILE_READ_ENABLED=false）");
-            }
             // ② 路径白名单（F4-2）
             let abs: string;
             try {
@@ -260,9 +260,6 @@ export const tools: Tool[] = [
             required: ["path"],
         },
         handler: async (args) => {
-            if (!isReadEnabled()) {
-                return fail("ERR_READ_DISABLED", "读操作已关闭（FILE_READ_ENABLED=false）");
-            }
             let abs: string;
             try {
                 abs = resolveInRoot(String(args.path ?? ""));
@@ -308,17 +305,13 @@ export const tools: Tool[] = [
                     minimum: 1,
                     maximum: MAX_LINES_PER_CALL,
                     description:
-                        "区间模式下最多返回的行数；省略则取配置 FILE_READ_DEFAULT_LINES（通常 2000），" +
+                        "区间模式下最多返回的行数；省略则取本工具默认行数（通常 2000，可在配置页调整），" +
                         "上限 50000。实际行数以返回的 lastLineNum 为准。",
                 },
             },
             required: ["path"],
         },
         handler: async (args) => {
-            // ① 读开关门控（F4-10）
-            if (!isReadEnabled()) {
-                return fail("ERR_READ_DISABLED", "读操作已关闭（FILE_READ_ENABLED=false）");
-            }
             // ② 路径白名单
             let abs: string;
             try {
@@ -357,7 +350,7 @@ export const tools: Tool[] = [
                 // FR-22：lineCount 与配置默认值都受 50000 钳制；默认值每次调用实时读取（FR-39）
                 const maxLines = hasCount
                     ? Math.min(args.lineCount as number, MAX_LINES_PER_CALL)
-                    : Math.min(env.FILE_READ_DEFAULT_LINES, MAX_LINES_PER_CALL);
+                    : Math.min(G.get<number>("default_lines"), MAX_LINES_PER_CALL);
 
                 // ④ 目标必须存在且为文件（F4-3 边界）
                 const st = await stat(abs);
@@ -465,10 +458,6 @@ export const tools: Tool[] = [
             required: ["pattern"],
         },
         handler: async (args) => {
-            // ① 读开关门控（F4-10）
-            if (!isReadEnabled()) {
-                return fail("ERR_READ_DISABLED", "读操作已关闭（FILE_READ_ENABLED=false）");
-            }
             // ② 路径白名单（起始目录，默认沙箱根）
             let base: string;
             try {
@@ -528,10 +517,6 @@ export const tools: Tool[] = [
             required: ["keyword"],
         },
         handler: async (args) => {
-            // ① 读开关门控（F4-10）
-            if (!isReadEnabled()) {
-                return fail("ERR_READ_DISABLED", "读操作已关闭（FILE_READ_ENABLED=false）");
-            }
             // ② 路径白名单
             let base: string;
             try {
@@ -605,3 +590,21 @@ export const tools: Tool[] = [
         },
     },
 ];
+
+/* ============================================================
+ * [规范 §7.1] 组设置项声明（只有本组可读，§7.3）
+ *   · 默认值只在这里写一次（§3.2），配置页只展示、不得改；
+ *   · 与默认值相同的取值不落盘（§9.1「值等于默认值即删键」）；
+ *   · 越界值由读取端一次性告警并回退默认（§7.4）。
+ * ============================================================ */
+export const settings: Record<string, SettingDef> = {
+    default_lines: {
+        kind: "number",
+        default: 2000,
+        min: 1,
+        max: 50000,
+        desc:
+            "read_file 区间模式的默认行数（省略 lineCount 时使用）；单次调用最多 50000 行。" +
+            "改动后立即生效，无需重启。",
+    },
+};

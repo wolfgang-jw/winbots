@@ -11,7 +11,10 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
+
+/** [规范 §7.3] 本文件服务 internet/browser 组；每次实时取值，禁止模块级缓存 */
+const B = groupScope("internet", "browser");
 
 // ============================================================
 // 可执行文件探测（BR-09 / US-03）
@@ -55,7 +58,7 @@ export function candidatePaths(): string[] {
  * 否则直接返回 null（不静默回退到探测：用户配错了要被告知）。
  */
 export function resolveExecutable(): { path: string | null; tried: string[] } {
-  const configured = String(env.BROWSER_EXECUTABLE_PATH ?? "").trim();
+  const configured = String(B.get<string>("executable_path") ?? "").trim();
   if (configured && configured.toLowerCase() !== "auto") {
     return existsSync(configured)
       ? { path: configured, tried: [configured] }
@@ -144,14 +147,14 @@ export function makeTempProfileDir(prefix: string): string {
 
 /** 持久 profile 目录（配置为空 → 返回 null，由调用方回退临时并告警） */
 export function resolvePersistDir(): string | null {
-  if (env.BROWSER_PROFILE_MODE !== "persist") return null;
-  const dir = String(env.BROWSER_PROFILE_DIR ?? "").trim();
+  if (B.get<string>("profile_mode") !== "persist") return null;
+  const dir = String(B.get<string>("profile_dir") ?? "").trim();
   if (!dir) {
     // [R-04] 选了 persist 却没填目录：必须说清「已回退临时」，
     //   否则用户以为登录态被保留，实际每次都是空 profile。
     console.warn(
-      "⚠️ [browser] BROWSER_PROFILE_MODE=persist 但 BROWSER_PROFILE_DIR 为空，已回退临时 profile（会话关闭即删）。" +
-        "请在配置页「持久化用户数据目录」填一个独立目录。",
+      "⚠️ [browser] 「用户数据目录模式」=persist 但「持久化用户数据目录」为空，已回退临时 profile（会话关闭即删）。" +
+        "请在配置页 › 浏览器工具配置 › 持久化用户数据目录 填一个独立目录。",
     );
     return null;
   }
@@ -269,7 +272,7 @@ export function buildArgs(o: { headless: boolean; userDataDir: string; port: num
   //     ① 无头不加（headless 没有窗口，加了只是噪声）；
   //     ② 置前开关关闭时不加 —— NB-04 规定 BROWSER_FOREGROUND_ON_OPEN=false 是 INC-02 的
   //        唯一回滚旋钮；关掉它却仍然最大化启动，等于「只回滚一半」。
-  if (!o.headless && env.BROWSER_FOREGROUND_ON_OPEN) args.unshift("--start-maximized");
+  if (!o.headless && B.get<boolean>("foreground_on_open")) args.unshift("--start-maximized");
   if (o.headless) args.unshift("--headless=new");
   return args;
 }

@@ -78,7 +78,8 @@
  */
 import { Hono } from "hono";
 import { env } from "@/infra/env";
-import { loadTools, getToolDefinitions, executeTool, toDisplayName } from "@/tools";
+// [T-HOT / §4.1] 工具注册表不再有「一次性加载」入口，改为「指纹校验 + 可重入扫描」的门面
+import { ensureToolRegistry, getToolDefinitions, executeTool, toDisplayName } from "@/tools";
 import {
     generateSessionId,
     isValidSessionId,
@@ -411,7 +412,10 @@ async function pipeStream(
  */
 router.post("/stream", async (c) => {
     try {
-        await loadTools();   // R1：确保工具注册表已构建（幂等，失败可重试）
+        // [T-HOT / §4.1] 每次对话请求前做一次目录指纹校验：指纹未变直接复用注册表，
+        //   变了（增 / 删 / 改入口文件）则重扫 —— 不进入配置页也能立即生效。
+        //   幂等：并发请求共用同一次扫描；扫描失败保留「未就绪」，下次请求自动重试。
+        await ensureToolRegistry();
 
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
@@ -520,17 +524,10 @@ router.post("/stream", async (c) => {
 
         // 工具定义快照（每次请求实时取，见 T-01）
         const toolDefs = getToolDefinitions();
-        // [FIX-BOOT-05] 工具可见性留痕。
-        //   现场故障：用户以为开了开关，模型却回答「我没有浏览器工具」，而服务端日志里
-        //   没有任何一行能判断到底是「没注册」还是「被开关过滤」。这里每次请求打一行，
-        //   把「模型实际看到多少个工具、其中浏览器几个」固定成可核对的证据。
-        const browserVisible = toolDefs.filter((d) =>
-            d.function.name.startsWith("internet__browser__")
-        ).length;
-        console.log(
-            `🧰 模型可见工具 ${toolDefs.length} 个｜浏览器 ${browserVisible}/4｜` +
-                `BROWSER_ENABLED=${env.BROWSER_ENABLED ? "true" : "false"}`
-        );
+        // [T-VIS / §8.7] 工具可见性日志已下沉到 getToolDefinitions()：它按「祖先目录 / 组开关 /
+        //   组挂起」三种原因分别记录被排除的组，且**不打印任何设置项取值**。
+        //   此处不再重复打印（重复会出现两行数字不一致的错觉），也不再读 BROWSER_ENABLED
+        //   （该旧开关已在迁移时删除，见 §9.2 与 migrate.ts）。
 
         // ── [US-3.3] 创建取消句柄并登记 ────────────────────────────
         const upstreamController = new AbortController();

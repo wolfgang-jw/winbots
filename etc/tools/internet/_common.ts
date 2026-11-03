@@ -5,7 +5,7 @@
  * 职责（唯一负责「选供应商 → 取配置 → 发请求 → 整形结果 → 错误映射」）：
  * 1. 供应商定义（ProviderDef）：表达四类差异 —— 基址+端点路径、鉴权头形式、
  *    请求体字段映射、响应字段→内部结构的映射（R-08，不得只有地址与密钥）；
- * 2. 配置读取一律走 env 实时取值，不在模块顶层缓存（R-10，热更立即生效）；
+ * 2. 配置读取一律走取值层（groupScope 实时取值），不在模块顶层缓存（R-10，热更立即生效）；
  * 3. 传输层：超时（R-39）+ 用户中断（R-40）+ 有限重试与退避（R-35）；
  * 4. 错误映射：状态码 → 结构化错误码与可指导模型行动的文案（§8.5.1、R-36、R-38）；
  * 5. 统一信封：成功 { ok:true, text, meta } / 失败 { ok:false, error:{ code, message } }（R-37）；
@@ -16,8 +16,14 @@
  *    再用 try/catch 做最后一道兜底。
  * ⚠️ 密钥永不落日志、永不进错误文案（R-38 / R-44）。
  */
-import { env } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
 import type { ToolContext } from "@/tools";
+
+/**
+ * [规范 §7.3] 本文件服务 internet/web 组（入口是 web.ts），故用显式组作用域。
+ * 每次取值实时读（R-10：不得在模块顶层缓存，否则热更失效）。
+ */
+const S = groupScope("internet", "web");
 
 // ============================================================
 // 基础类型与信封
@@ -170,9 +176,9 @@ function asRecord(v: unknown): Record<string, unknown> {
  *      - Search 响应：{ results: [{ rerank_score, title, url, snippet, summary,
  *                      content, site_name, site_icon, date, authority }] }
  *      - Fetch  响应：{ title, content }（content 为 Markdown 正文）
- *    端点仍保留环境变量覆盖能力（便于接自建网关）：
- *      - 改基址：INTERNET_DEEPSEEK_BASE_URL
- *      - 改路径：INTERNET_DEEPSEEK_SEARCH_PATH / INTERNET_DEEPSEEK_FETCH_PATH
+ *    端点仍可在配置页覆盖（便于接自建网关；均为 TOOLSET__internet__web__* 组设置项）：
+ *      - 改基址：TOOLSET__internet__web__deepseek_base_url
+ *      - 改路径：TOOLSET__internet__web__deepseek_search_path / ..._deepseek_fetch_path
  *
  * ⚠️ 历史缺陷（已修）：旧默认值 `/v1/search`、`/v1/fetch` 在官方并不存在，
  *    网关对未知路由返回 404，被 mapStatus 归为 not_extractable（「网页抓不到」），
@@ -182,14 +188,14 @@ function asRecord(v: unknown): Record<string, unknown> {
 const DEEPSEEK: ProviderDef = {
     id: "deepseek",
     label: "DeepSeek",
-    keyEnv: "INTERNET_DEEPSEEK_API_KEY",
-    apiKey: () => env.INTERNET_DEEPSEEK_API_KEY,
-    baseUrl: () => env.INTERNET_DEEPSEEK_BASE_URL,
+    keyEnv: S.key("deepseek_api_key"),   // 由组作用域生成，避免键名再次漂移（旧 INTERNET_DEEPSEEK_API_KEY 已由迁移删除）
+    apiKey: () => S.get<string>("deepseek_api_key"),
+    baseUrl: () => S.get<string>("deepseek_base_url"),
     // 鉴权头形式：Bearer；空密钥 → {}（R-15：不发送空凭据）
     authHeaders: (key) => (key ? { Authorization: `Bearer ${key}` } : {}),
     search: {
         method: () => "POST",
-        path: () => env.INTERNET_DEEPSEEK_SEARCH_PATH,
+        path: () => S.get<string>("deepseek_search_path"),
         // 请求体字段映射：query / count / need_content（R-19：检索语法原样透传，不做拆分）
         //   - count：官方字段名（1–50）。旧实现用 max_results，官方「未知字段忽略」→ 条数静默回落 10，
         //     且结果文本里的「（请求 N 条）」与实际不符。
@@ -224,7 +230,7 @@ const DEEPSEEK: ProviderDef = {
     },
     fetch: {
         method: () => "POST",
-        path: () => env.INTERNET_DEEPSEEK_FETCH_PATH,
+        path: () => S.get<string>("deepseek_fetch_path"),
         // 请求体字段映射：单个 URL（R-28：一次只抓一个）
         body: (a) => ({ url: a.url }),
         // 响应字段映射：兼容 { data: {...} } 包裹与裸对象
@@ -261,8 +267,8 @@ export function providerIds(kind?: Kind): string[] {
 export function getProvider(
     kind: Kind,
 ): { provider: ProviderDef } | { error: EnvelopeFail; providerId: string } {
-    const envKey = kind === "search" ? "INTERNET_SEARCH_PROVIDER" : "INTERNET_FETCH_PROVIDER";
-    const id = (kind === "search" ? env.INTERNET_SEARCH_PROVIDER : env.INTERNET_FETCH_PROVIDER).trim();
+    const envKey = S.key(kind === "search" ? "search_provider" : "fetch_provider");
+    const id = (kind === "search" ? S.get<string>("search_provider") : S.get<string>("fetch_provider")).trim();
     const kindLabel = kind === "search" ? "检索" : "抓取";
     const provider = PROVIDERS[id];
     if (!provider) {
@@ -436,8 +442,8 @@ function mapStatus(
                     message: withDetail(
                         `检索请求返回 404（not_extractable）：实际请求 ${endpointOf(url)}。` +
                             "搜索引擎不会用 404 表达「没有结果」（那是 200 + 空数组），" +
-                            "因此这通常是端点路径与供应商不一致。请核对 INTERNET_DEEPSEEK_BASE_URL 与 " +
-                            "INTERNET_DEEPSEEK_SEARCH_PATH（DeepSeek 官方为 /v1/tools/search）后重试；" +
+                            `因此这通常是端点路径与供应商不一致。请核对 ${S.key("deepseek_base_url")} 与 ` +
+                            `${S.key("deepseek_search_path")}（DeepSeek 官方为 /v1/tools/search）后重试；` +
                             "属配置问题，更换检索词不会成功。",
                     ),
                 };
@@ -535,7 +541,7 @@ export async function callProvider<A, R>(
     };
     const method = endpoint.method();
     const body = method === "GET" ? undefined : JSON.stringify(endpoint.body(args));
-    const timeoutMs = env.INTERNET_TIMEOUT_MS;
+    const timeoutMs = S.get<number>("timeout_ms");
 
     let retries = 0;
     let last: CallResult = { ok: false, retries: 0, url };

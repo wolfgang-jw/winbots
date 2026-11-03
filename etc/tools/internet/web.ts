@@ -17,7 +17,7 @@
  * 本期只实现两个工具，浏览器类工具仅预留命名（internet.browser.*，R-06/X-03）。
  */
 import type { Tool, ToolContext } from "@/tools";
-import { env } from "@/infra/env";
+import { groupScope, type SettingDef } from "@/infra/settings";
 import {
     callProvider,
     endpointOf,
@@ -31,6 +31,13 @@ import {
     type Envelope,
 } from "./_common";
 import * as store from "./_ephemeral";
+
+/**
+ * [规范 §7.3] 本组的组设置项作用域（只有 internet/web 可读）。
+ * 私有模块 `_common.ts` / `_ephemeral.ts` 服务本组，用显式形式 groupScope("internet","web")。
+ * ⚠️ 每次调用实时读，禁止模块级缓存 —— 否则「保存即生效」失效。
+ */
+const S = groupScope("internet", "web");
 
 /** [R-18] 检索词长度上限 */
 const QUERY_MAX_CHARS = 128;
@@ -87,7 +94,7 @@ async function runSearch(args: Record<string, unknown>, ctx?: ToolContext): Prom
     }
 
     // ② 条数：默认取配置，代码侧钳制到 1–10（R-18）
-    let count = env.INTERNET_DEFAULT_COUNT;
+    let count = S.get<number>("default_count");
     if (args.count !== undefined && args.count !== null && args.count !== "") {
         const n = typeof args.count === "number" ? args.count : Number(args.count);
         if (!Number.isFinite(n)) {
@@ -257,7 +264,7 @@ async function runFetch(args: Record<string, unknown>, ctx?: ToolContext): Promi
 
     const scope = scopeOf(ctx);
     const cacheable = scope !== "";          // [R-34] 无会话标识时不写暂存
-    const maxChars = env.INTERNET_FETCH_MAX_CHARS;
+    const maxChars = S.get<number>("fetch_max_chars");
 
     // ② 续读命中暂存 → 本地切片，不发起请求（R-31 / AC-39）
     const lookup: store.Lookup = cacheable
@@ -268,7 +275,7 @@ async function runFetch(args: Record<string, unknown>, ctx?: ToolContext): Promi
     let fullText = "";
     let cacheHit = false;
     let retries = 0;
-    let providerId = env.INTERNET_FETCH_PROVIDER;
+    let providerId = S.get<string>("fetch_provider");
     let notice: string | null = null;
     let storeNote: string | null = null;
     /** [修订] 本次实际请求端点（host+path）；续读命中暂存时为 null（未发请求） */
@@ -432,7 +439,7 @@ export const tools: Tool[] = [
             required: ["query"],
         },
         // [R-13 / T-01] 总开关：每次取定义时判定 → 热更立即生效，无需重启
-        enabled: () => env.INTERNET_ENABLED,
+        enabled: () => isWebGroupOn(),
         handler: async (args, ctx) => {
             try {
                 return await runSearch(args, ctx);
@@ -466,7 +473,7 @@ export const tools: Tool[] = [
             },
             required: ["url"],
         },
-        enabled: () => env.INTERNET_ENABLED,
+        enabled: () => isWebGroupOn(),
         handler: async (args, ctx) => {
             try {
                 return await runFetch(args, ctx);
@@ -476,3 +483,108 @@ export const tools: Tool[] = [
         },
     },
 ];
+// ============================================================
+// [规范 §8.3 / §8.4] 组门禁复检（替代已废弃的 INTERNET_ENABLED）
+// ============================================================
+
+import { groupState } from "@/infra/settings";
+
+/**
+ * 组是否可用：祖先目录全开 + 自身组开关开 + 未挂起。
+ * 旧总开关 `INTERNET_ENABLED` 已在 §9.2 迁移中删除，可用性唯一来源是层级开关（§8.3）。
+ */
+function isWebGroupOn(): boolean {
+    return groupState("internet/web").available;
+}
+
+/* ============================================================
+ * [规范 §7.1] 组设置项声明（仅 internet/web 可读，§7.3）
+ *   · 键名与 migrate.ts 的 DOWN_SINK 一一对应（改名 = 用户旧值变孤儿键）；
+ *   · 默认值只在这里写一次（§3.2），配置页只展示、不得改；
+ *   · 与默认值相同的取值不落盘（§9.1「值等于默认值即删键」）；
+ *   · 越界 / 类型不符由读取端一次性告警并回退默认（§7.4）。
+ * ============================================================ */
+export const settings: Record<string, SettingDef> = {
+    search_provider: {
+        kind: "string",
+        default: "deepseek",
+        options: ["deepseek"],
+        desc: "检索供应商。未识别的取值会在调用时返回 invalid_provider（不静默回退）。",
+    },
+    fetch_provider: {
+        kind: "string",
+        default: "deepseek",
+        options: ["deepseek"],
+        desc: "抓取供应商。未识别的取值会在调用时返回 invalid_provider（不静默回退）。",
+    },
+    deepseek_api_key: {
+        kind: "string",
+        default: "",
+        secret: true,
+        desc: "供应商密钥。留空 = 免鉴权（不发送鉴权头）。页面不回显明文。",
+    },
+    deepseek_base_url: {
+        kind: "string",
+        default: "https://api.deepseek.com",
+        desc: "供应商基址，可改为自建网关。端点路径配错会稳定返回 404（见错误码说明）。",
+    },
+    deepseek_search_path: {
+        kind: "string",
+        default: "/v1/tools/search",
+        desc: "检索端点路径（DeepSeek 官方为 /v1/tools/search）。",
+    },
+    deepseek_fetch_path: {
+        kind: "string",
+        default: "/v1/tools/fetch",
+        desc: "抓取端点路径（DeepSeek 官方为 /v1/tools/fetch）。",
+    },
+    default_count: {
+        kind: "number",
+        default: 5,
+        min: 1,
+        max: 10,
+        desc: "检索默认条数；代码侧仍会钳制到 1–10。",
+    },
+    timeout_ms: {
+        kind: "number",
+        default: 20000,
+        min: 1000,
+        max: 300000,
+        desc: "单次上游请求超时（毫秒）。",
+    },
+    fetch_max_chars: {
+        kind: "number",
+        default: 8000,
+        min: 500,
+        max: 24000,
+        desc: "抓取回灌的单段字符上限（续读用「下一段偏移」）。",
+    },
+    store_ttl_s: {
+        kind: "number",
+        default: 300,
+        min: 0,
+        max: 86400,
+        desc: "抓取全文暂存的空闲存活秒数；0 = 不按时间淘汰（仍受条数与字符上限约束）。",
+    },
+    store_max_items_per_session: {
+        kind: "number",
+        default: 8,
+        min: 0,
+        max: 200,
+        desc: "暂存的单会话条数上限；0 = 不限制条数。",
+    },
+    store_max_chars_per_item: {
+        kind: "number",
+        default: 200000,
+        min: 0,
+        max: 4000000,
+        desc: "暂存的单条字符上限；超上限不暂存（不截断存储，避免续读偏移指向不存在的内容）。",
+    },
+    store_max_chars_total: {
+        kind: "number",
+        default: 4194304,
+        min: 0,
+        max: 67108864,
+        desc: "暂存的全局字符上限，超出按 LRU 淘汰最旧条目。",
+    },
+};

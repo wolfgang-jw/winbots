@@ -3,7 +3,7 @@
  * 新建文件工具集（US-NEW-1 ~ US-NEW-3，需求五）
  *
  * 契约：导出 tools: Tool[]，调用名 local.fileNew.<name>
- * 安全：全部工具经 _shared.resolveInRoot() 白名单校验 + isCreateEnabled() 门控
+ * 安全：全部工具经 _shared.resolveInRoot() 白名单校验；可用性由平台侧按「目录 AND 组开关」统一判定（§8.3）
  * 语义：只负责「创建新内容」，绝不覆盖已有文件（覆盖归 fileModify.overwrite_file）
  *
  * 工具清单：
@@ -15,7 +15,6 @@ import type { Tool } from "@/tools";
 import {
     resolveInRoot,
     assertRealPathInRoot,
-    isCreateEnabled,
     ok,
     fail,
     getFileRoot,          // [配置页 / US-CFG-PAGE-6] FILE_ROOT 常量 → 函数
@@ -45,10 +44,6 @@ export const tools: Tool[] = [
             required: ["path"],
         },
         handler: async (args) => {
-            // ① 新建开关门控（F5-5）
-            if (!isCreateEnabled()) {
-                return fail("ERR_CREATE_DISABLED", "新建操作已关闭（FILE_CREATE_ENABLED=false）");
-            }
             // ② 路径白名单（F5-6）
             let abs: string;
             try {
@@ -100,10 +95,6 @@ export const tools: Tool[] = [
             required: ["path"],
         },
         handler: async (args) => {
-            // ① 新建开关门控（F5-5）
-            if (!isCreateEnabled()) {
-                return fail("ERR_CREATE_DISABLED", "新建操作已关闭（FILE_CREATE_ENABLED=false）");
-            }
             // ② 路径白名单（F5-6）
             let abs: string;
             try {
@@ -175,10 +166,6 @@ export const tools: Tool[] = [
             required: ["path", "content"],
         },
         handler: async (args) => {
-            // ① 新建开关门控（F5-5）
-            if (!isCreateEnabled()) {
-                return fail("ERR_CREATE_DISABLED", "新建操作已关闭（FILE_CREATE_ENABLED=false）");
-            }
             // ② 路径白名单（F5-6）
             let abs: string;
             try {

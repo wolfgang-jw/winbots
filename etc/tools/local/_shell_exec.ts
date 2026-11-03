@@ -11,15 +11,22 @@
  *   4. 超时与取消：统一的绝对时间上限 + 进程树终止（SH-15 / SH-16 / SH-22）
  *   5. 会话串行锁 与 全局并发槽（AP-08 / SH-17；两把锁语义不同，见注释）
  */
-import { env, type ShellType } from "@/infra/env";
+import { groupScope } from "@/infra/settings";
 import { buildChildEnv, codePageToEncoding } from "./_shell_policy";
 
-/** shell 类型。⚠️ 类型定义只有一处（src/infra/env.ts），这里再导出，避免两处字面量漂移（复核 R17）。 */
-export type { ShellType };
+/**
+ * shell 类型。
+ * ⚠️ 类型定义的**唯一来源**已随 C-06-1 从 `src/infra/env.ts` 搬到本文件（平台层不再持有工具配置类型）；
+ *   配置本体是组设置项 `TOOLSET__local__shell__type`。
+ */
+export type ShellType = "cmd" | "powershell";
+
+/** [规范 §7.3] 本文件服务 local/shell 组；每次实时取值，禁止模块级缓存（SH-46） */
+const S = groupScope("local", "shell");
 
 /** 当前 shell 类型（实时读配置，SH-46） */
 export function currentShellType(): ShellType {
-    return String(env.SHELL_TYPE ?? "").toLowerCase() === "powershell" ? "powershell" : "cmd";
+    return String(S.get<string>("type") ?? "").toLowerCase() === "powershell" ? "powershell" : "cmd";
 }
 
 /**
@@ -94,7 +101,7 @@ export function tryLockSession(sessionId: string): (() => void) | null {
  * 取不到 → 立即 busy（SH-17：超限立即拒绝，不得排队）。
  */
 export function tryAcquireSlot(): (() => void) | null {
-    const max = Math.max(1, Number(env.SHELL_MAX_CONCURRENCY) || 1);
+    const max = Math.max(1, Number(S.get<number>("max_concurrency")) || 1);
     if (activeSlots >= max) return null;
     activeSlots++;
     return () => { activeSlots = Math.max(0, activeSlots - 1); };

@@ -8,9 +8,9 @@
  *   3. 生命周期终态：允许 / 拒绝 / 超时 / 取消 / 断连 / 会话结束 —— 六种结局都必然走 settle()，
  *      且 settle 幂等（第二次调用直接返回 false），因此不会出现「永不清理的待审批请求」（NH-13）。
  *   4. 只有两行审计日志（AP-20），都经掩码；不含完整命令、不含输出。
+ *   5. **不读任何工具配置**（§7.3 / R-25）：等待上限由调用方（`local/_shell_approval.ts`）算好传进来，
+ *      本模块只接收 waitMs。
  */
-import { env } from "@/infra/env";
-
 export type ApprovalOutcomeKind =
     | "allowed"
     | "denied_by_user"
@@ -262,7 +262,15 @@ export function pendingCount(): number {
     return pending.size;
 }
 
-/** 等待上限（实时读配置，SH-46） */
-export function approvalWaitMs(): number {
-    return Math.max(1000, Number(env.SHELL_APPROVAL_WAIT_MS) || 120000);
+/**
+ * [C-13] 按 requestId 取**挂起中**的请求（只读；已结算 / 不存在返回 null）。
+ *
+ * 用途：`src/routes/approval.ts` 的服务端复检要判断「这个弹窗当时是否提供了某个选项」——
+ *   该事实在弹窗创建时就固化进了 payload（AP-15），必须读**该请求自己的** payload，
+ *   而不是去读（已被下沉为工具设置项的）配置，否则会出现「配置已改 → 旧弹窗的提交被拒」的口径分裂。
+ */
+export function getPendingById(requestId: string): PendingApproval | null {
+    const entry = pending.get(requestId);
+    if (!entry || entry.settled) return null;
+    return entry.payload;
 }
