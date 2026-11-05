@@ -148,6 +148,21 @@
         </div>
     </div>
 
+    <!-- [skill / §11、§12.4] 技能预览容器（只读、等宽、可滚动、可 Esc 关闭）。
+         结构照抄 #approval-modal（复用 .approval-modal 系列视觉类），
+         但语义相反：审批框必须提交决定，本框必须可取消。 -->
+    <div class="approval-modal skill-preview-modal" id="skill-preview-modal" role="dialog" aria-modal="true"
+         aria-labelledby="skill-preview-title" hidden>
+        <div class="approval-modal__backdrop" data-skill-preview-close="1"></div>
+        <div class="approval-modal__panel skill-preview__panel">
+            <div class="approval-modal__title" id="skill-preview-title"></div>
+            <div class="skill-preview__body" id="skill-preview-body"></div>
+            <div class="skill-preview__footer">
+                <button type="button" class="approval-modal__submit" id="skill-preview-close">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- ==================== 历史视图（US-4.8） ==================== -->
     <section class="history-layout" id="view-history" hidden>
         <div class="history-header">

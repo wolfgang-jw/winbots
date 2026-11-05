@@ -80,6 +80,10 @@ import { Hono } from "hono";
 import { env } from "@/infra/env";
 // [T-HOT / §4.1] 工具注册表不再有「一次性加载」入口，改为「指纹校验 + 可重入扫描」的门面
 import { ensureToolRegistry, getToolDefinitions, executeTool, toDisplayName } from "@/tools";
+// [skill / §8.3] skill 子系统：指纹校验 + 请求边界装配 + 工具白名单 + 名称口径
+import {
+    ensureSkillRegistry, assembleForRequest, applyToolWhitelist, SKILL_NAME_PATTERN,
+} from "@/skills";
 import {
     generateSessionId,
     isValidSessionId,
@@ -416,10 +420,23 @@ router.post("/stream", async (c) => {
         //   变了（增 / 删 / 改入口文件）则重扫 —— 不进入配置页也能立即生效。
         //   幂等：并发请求共用同一次扫描；扫描失败保留「未就绪」，下次请求自动重试。
         await ensureToolRegistry();
+        // [skill / §8.3] 技能目录同样按「请求边界」重扫一次；必须在 ensureToolRegistry 之后
+        //   （技能校验要读工具注册表判断 unknown_tool）。
+        await ensureSkillRegistry();
 
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
         const { messages, sessionId, message, requestId } = body;
+        // [skill / C-5] 激活项是**请求级入参**：body.skill 优先，其次 X-Skill 头。
+        //   不落 .env、不做自动匹配（C-4）—— 「切换只影响下一轮」因此结构上不可能被违反。
+        //   形状校验用 @/skills 的 SKILL_NAME_PATTERN（与路由 / 注册表同一份口径）。
+        const skillParam: string | null = (() => {
+            const raw = typeof body?.skill === "string" && body.skill.trim() !== ""
+                ? body.skill.trim()
+                : (c.req.header("X-Skill") ?? "").trim();
+            if (raw === "") return null;
+            return SKILL_NAME_PATTERN.test(raw) ? raw : null;
+        })();
 
         // [Sprint 5.1 / US-LOG-3] 采集请求侧时间（旁路，仅开关开启时有效）
         const logStartedAt = Date.now();
@@ -523,7 +540,24 @@ router.post("/stream", async (c) => {
         };
 
         // 工具定义快照（每次请求实时取，见 T-01）
-        const toolDefs = getToolDefinitions();
+        // [skill / §8.3] 先装配 skill（纯内存计算）。
+        //   ⚠️ 必须在这里算一次、后续整个请求复用（同一请求内不可切换 skill，C-5）。
+        const skillAssembly = assembleForRequest(skillParam);
+        // [skill / §7.3、N-SK-8] 白名单只在这里生效：
+        //   · 未激活 skill（skillName === null）→ tools 为空 → 不收窄（AC-10）；
+        //   · 激活了 skill → 只能收窄，不会放大（交集语义）。
+        const wl = applyToolWhitelist(getToolDefinitions(), skillAssembly.tools);
+        const toolDefs = wl.list;
+        if (skillAssembly.skillName) {
+            // §11「来源标识」的服务端依据：一行日志就能对上「这轮用了哪个 skill」
+            console.log(
+                `🧩 [skill] 本轮激活 ${skillAssembly.skillName}｜` +
+                `L1=${skillAssembly.l1.length} 字｜L2=${skillAssembly.l2.length} 字｜` +
+                `截断=${skillAssembly.truncated ? "是" : "否"}｜` +
+                `可见工具=${toolDefs.length} 个（声明 ${skillAssembly.tools.length}，` +
+                `不可用 ${wl.dropped.length}，自身条件不成立 ${wl.selfDisabled.length}）`,
+            );
+        }
         // [T-VIS / §8.7] 工具可见性日志已下沉到 getToolDefinitions()：它按「祖先目录 / 组开关 /
         //   组挂起」三种原因分别记录被排除的组，且**不打印任何设置项取值**。
         //   此处不再重复打印（重复会出现两行数字不一致的错觉），也不再读 BROWSER_ENABLED
@@ -601,6 +635,23 @@ router.post("/stream", async (c) => {
                                 return out;
                             }
                         );
+                        // [skill / §4.3、§6.4、C-3] 三层统一用 role:"system"，只插**一次**（在 while 之前）：
+                        //   · 只放本次激活 skill 的 L1/L2（已在 assemble 里按预算截断）；
+                        //   · 循环体（含 buildBody）一行不改：它读的 workingMessages 已带 system。
+                        //   ⚠️ 不要写进 while 里，否则每轮工具往返都会再插一条（C-3）。
+                        //   ⚠️ 只注入内存，**不落库**（见 §6.2.8）。
+                        if (skillAssembly.systemText !== "") {
+                            workingMessages = [
+                                { role: "system", content: skillAssembly.systemText },
+                                ...workingMessages,
+                            ];
+                        }
+                        // [skill / C-33] 请求了激活但没能生效（未开启 / 挂起 / 名字错）→ 明确告知，
+                        //   否则用户点了「本轮激活」却看不到任何变化，只会以为功能坏了。
+                        //   ⚠️ 复用既有 notice 事件类型，不新增事件契约（B-05）。
+                        if (skillAssembly.skipReason) {
+                            send({ type: "notice", message: `🧩 ${skillAssembly.skipReason}` });
+                        }
                         // [A-03] 工具轮次的唯一判据：本轮流式聚合出的 tool_calls。
                         //   首轮必然为空 —— 探测请求已删除（A-02/A-04）。
                         let currentToolCalls: PipeResult["toolCalls"] = [];
@@ -745,6 +796,9 @@ router.post("/stream", async (c) => {
                                 const toolResult = await executeTool(wireName, args, {
                                     signal: upstreamController.signal,
                                     sessionId: useServerHistory ? (sessionId as string) : undefined,
+                                    // [skill / §7.5、C-10] 来源标识：只有**本轮确实由某个 skill 装配**时才带，
+                                    //   审批弹窗与审计日志据此显示「此命令来自 skill X」。无 skill 时保持 undefined。
+                                    skill: skillAssembly.skillName ?? undefined,
                                 });
 
                                 // 推送「工具结果」事件
@@ -800,6 +854,9 @@ router.post("/stream", async (c) => {
                             reason: hitMaxRounds ? "max_tool_rounds" : (finalFinishReason || "stop"),
                             usage: finalUsage,
                             raw: finalRaw || {},
+                            // [skill / §11] 来源标识：只在本轮真的装配了 skill 时才带该字段，
+                            //   不带时前端行为与改造前逐字一致（AC-14）
+                            ...(skillAssembly.skillName ? { skill: skillAssembly.skillName } : {}),
                         });
 
                         // [Sprint 5.2 / US-STAB-3] 达上限截断：追加 notice 事件显式告知用户

@@ -47,6 +47,9 @@ const RESERVED_NAMES: ReadonlySet<string> = new Set<string>([
   "__proto__", "constructor", "prototype", "hasownproperty", "isprototypeof",
   "propertyisenumerable", "tolocalestring", "tostring", "valueof",
   "enabled", "disabled", "on", "off", "toggle", "toolon", "toolset",
+  // [skill / 需求 §5.5] skill 的两个前缀同样保留：允许它们当键名 / 目录名，
+  //   会让「键名」「目录名」「SKILLON__ / SKILLSET__ 前缀」三个字符串空间互相混淆。
+  "skillon", "skillset", "skill", "skills",
   "true", "false", "null", "undefined", "default", "defaults",
 ]);
 
@@ -83,6 +86,19 @@ const TOGGLE_NS = "TOOLON";
 const SETTING_NS = "TOOLSET";
 const DIR_NS = "etc";
 const DIR_SUB_NS = "tools";
+/**
+ * [skill / C-20] skill 键空间的两个前缀。
+ *
+ * ⚠️ 必须在本文件（而不是 import `@/skills/paths`）：本文件是零业务依赖底座，
+ *    而 `skills/scan.ts` 反过来要 `import { getRegistry } from "@/tools/scan"`，
+ *    互相 import 会成环。常量各写一份，语义一致性由用例与文档 §19.3 / C-20 约束。
+ *
+ * ⚠️ 为什么这里必须有：`hasManagedPrefix()` 是取值层 `refreshManagedValues()` 与
+ *    遗留键 `listOrphanKeys()` 的**唯一筛键入口**。缺这两个前缀 → `.env` 里的
+ *    `SKILLON__*` 永远进不了取值缓存 → 配置页开关保存成功、刷新后又变回未勾选（读写不对称）。
+ */
+const SKILL_TOGGLE_NS = "SKILLON";
+const SKILL_SETTING_NS = "SKILLSET";
 
 /** 目录路径 → 路径段数组（根目录 "" → []） */
 export function pathSegments(dirPath: string): string[] {
@@ -119,12 +135,18 @@ export function groupSettingKey(dirPath: string, fileBase: string, name: string)
   return joinKey(SETTING_NS, ...pathSegments(dirPath), fileBase, name);
 }
 
-/** 托管键判定（§10.1：只有命中三类保留前缀的键才可能是遗留键） */
+/**
+ * 托管键判定（§10.1：只有命中保留前缀的键才可能是遗留键）。
+ *
+ * [skill / C-20] 自本次改动起多认 `SKILLON__` / `SKILLSET__` 两类：
+ *   本函数是 `refreshManagedValues()`（取值层）与 `listOrphanKeys()`（遗留键）的
+ *   **唯一筛键入口**，漏掉它们会让 skill 开关「写得进、读不回」。
+ */
 export function hasManagedPrefix(key: string): boolean {
   return (
     key.startsWith(`${TOGGLE_NS}__`) ||
     key.startsWith(`${SETTING_NS}__`) ||
-    key.startsWith(`${DIR_NS}__${DIR_SUB_NS}__`)
+    key.startsWith(`${DIR_NS}__${DIR_SUB_NS}__`) || key.startsWith(`${SKILL_TOGGLE_NS}__`) || key.startsWith(`${SKILL_SETTING_NS}__`)
   );
 }
 

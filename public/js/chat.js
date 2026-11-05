@@ -131,6 +131,8 @@
         currentToolEl: null,
         /** @type {string} [US-3.6] 本次回答的模型名（暂存） */
         currentModel: "",
+        /** @type {string} [skill / §11] 本次回答由哪个 skill 装配（无则空串） */
+        currentSkill: "",
         /** @type {boolean} [US-3.7] 本次回答是否已收尾（幂等标记） */
         completed: false,
         /** @type {number} 本次回答开始时间（performance.now()） */
@@ -221,6 +223,11 @@
      * 获取当前时间字符串
      * @returns {string}
      */
+    /** [skill / C-5] 本轮激活的技能 dir（sessionStorage，不落 .env）；空串 = 不激活 */
+    function getActiveSkill() {
+        try { return sessionStorage.getItem("winbots.activeSkill") || ""; } catch { return ""; }
+    }
+
     function getTimeStr() {
         return new Date().toLocaleTimeString("zh-CN");
     }
@@ -272,6 +279,8 @@
         const summary = document.createElement("div");
         summary.className = "message__info-summary";
         // [US-3.6] 中断态：显示"已中断"标识 + token 记 0；正常态：保持原样。
+        // [skill / §11] 有值才拼；无 skill 时字符串与改造前逐字一致（AC-14）
+        const skillPart = info.skill ? ` · 🧩 技能：${escapeHtml(info.skill)}` : "";
         if (info.interrupted) {
             summary.innerHTML =
                 `<span class="message__info-icon">⏹️</span> 已中断`
@@ -279,6 +288,7 @@
                 + ` · ${formatClock(info.startTime)}`
                 + ` · ${formatElapsed(info.elapsedMs)}`
                 + ` · 📊 0 tokens`
+                + skillPart
                 + `<span class="message__info-arrow">▸</span>`;
         } else {
             summary.innerHTML =
@@ -286,6 +296,7 @@
                 + ` · ${formatClock(info.startTime)}`
                 + ` · ${formatElapsed(info.elapsedMs)}`
                 + ` · 📊 ${info.usage.totalTokens} tokens`
+                + skillPart
                 + `<span class="message__info-arrow">▸</span>`;
         }
         el.appendChild(summary);
@@ -340,6 +351,7 @@
             usage: zeroUsage,
             raw: { interrupted: true, usage: zeroUsage },
             interrupted: true,   // [US-3.6] 中断标记：renderInfoBar 据此显示"已中断"
+            skill: state.currentSkill,   // [skill / §11] 中断态同样要显示来源
         });
 
         return state.currentInfoEl;
@@ -1155,6 +1167,8 @@
                     sessionId: state.sessionId,
                     message,
                     requestId: state.currentRequestId,
+                    // [skill / C-5] 激活项走请求级入参（不落 .env）；空串 = 不激活任何 skill
+                    skill: getActiveSkill(),
                 }),
                 signal,
             });
@@ -1214,6 +1228,9 @@
                                 break;
 
                             case "finish":
+                                // [skill / §11] 记录来源技能：必须在 finalizeOnce 之前赋值（它立刻渲染信息栏），
+                                //   也必须在 state.draining 判断之前（排空路径同样要显示来源）。
+                                state.currentSkill = data.skill || "";
                                 // [US-3.2] 排空态下：用户已打断，本次回答不应按"正常完成"处理。
                                 if (state.draining) {
                                     finishStream();
@@ -1259,6 +1276,7 @@
                                             elapsedMs,
                                             usage: data.usage,
                                             raw: data.raw,
+                                            skill: state.currentSkill,   // [skill / §11]
                                         });
                                     }
 
@@ -1421,7 +1439,12 @@
             state.currentInfoEl = null;
             state.currentStartTime = 0;
             state.currentAssistantContent = "";   // [US-3.5] 一并复位累积缓冲
-            state.currentModel = "";              // [US-3.6] 复位本次回答模型名
+            state.currentModel = "";
+        state.currentModel = "";              // [US-3.6] 复位本次回答模型名
+        // [C-31] ⚠️ 此处**不得**复位 state.currentSkill：
+        //   finish 事件的处理顺序是「set currentSkill → finalizeOnce() → finishStream() → 渲染信息栏」，
+        //   若在这里清空，随后渲染信息栏时读到空串，「🧩 技能：X」永远不会显示（实测就是这个 bug）。
+        //   来源技能由「新一轮开始」(sendMessage 开头) 复位，生命周期刚好覆盖整轮渲染。
             state.completed = false;              // [US-3.7] 兜底复位收尾标记
 
             clearDrainTimeout();
@@ -1478,6 +1501,7 @@
         state.currentStartTime = 0;
         state.currentAssistantContent = "";   // [US-3.5] 一并复位累积缓冲
         state.currentModel = "";              // [US-3.6] 复位本次回答模型名
+        state.currentSkill = "";              // [skill / §11] 复位来源技能（防上一轮串到本轮）
         state.completed = false;              // [US-3.7] 新一轮复位收尾标记
 
         setStopBtnVisible(true);          // [US-3.1] 显示「停止」入口
@@ -1613,6 +1637,7 @@
         state.currentStartTime = 0;
         state.currentAssistantContent = "";
         state.currentModel = "";
+        state.currentSkill = "";
         state.completed = false;
 
         // 5. 分配全新会话 ID（D1 绕过缓存）：直接调服务端分配接口，
@@ -1819,6 +1844,17 @@
         restoreKeys: new Set(),
         /** 已展开的设置项折叠区（"dir:local" / "group:local/shell"） */
         openSettings: new Set(),
+        /* ---------- [skill / §12.2] 技能区 ---------- */
+        /** @type {Array<object>} 服务端 skillTree（与 toolTree 并列） */
+        skillTree: [],
+        /** @type {Object<string, boolean>} 待提交的技能开关：dir → 布尔 */
+        skillToggles: {},
+        /** @type {Array<string>} 扫描告警（层级超限 / 多余文件 / 嵌套冲突） */
+        skillWarnings: [],
+        /** @type {string} 技能扫描版本（仅展示与排查；PUT 只校验工具的 scanVersion） */
+        skillScanVersion: "",
+        /** @type {string} 本轮激活的技能 dir（**不落 .env**，存 sessionStorage，C-5） */
+        activeSkill: "",
     };
 
     /** 拉取并渲染配置视图（进入视图 / 保存成功后调用） */
@@ -1835,6 +1871,12 @@
             configState.scanVersion = data.scanVersion || "";
             configState.toolTree = data.toolTree || [];
             configState.orphanKeys = data.orphanKeys || [];
+            // [skill] 技能区：与工具树同一份 GET 返回，一次拿全
+            configState.skillTree = data.skillTree || [];
+            configState.skillWarnings = data.skillWarnings || [];
+            configState.skillScanVersion = data.skillScanVersion || "";
+            // 激活项从 sessionStorage 恢复（它不落 .env，刷新页面后仍需保持用户选择）
+            try { configState.activeSkill = sessionStorage.getItem("winbots.activeSkill") || ""; } catch { /* 忽略 */ }
             // 重新拉取后，先前待提交的工具变更全部作废（服务端已是权威状态）
             configState.dirToggles = {};
             configState.groupToggles = {};
@@ -1873,8 +1915,12 @@
 
         // 绑定输入事件：任何修改 → 置脏（F-CFG-1）
         // [C-11 / §11 / §10.2] 工具树与遗留键区块接在系统项之后
-        box.insertAdjacentHTML("beforeend", renderToolSection() + renderOrphanSection());
+        box.insertAdjacentHTML(
+            "beforeend",
+            renderToolSection() + renderSkillSection() + renderOrphanSection(),
+        );
         bindToolTreeEvents(box);
+        bindSkillTreeEvents(box);
 
         box.querySelectorAll("[data-config-key]").forEach((el) => {
             el.addEventListener("input", () => setConfigDirty(true));
@@ -2051,7 +2097,8 @@
         const toolCount = Object.keys(toolChanges.dirToggles).length
             + Object.keys(toolChanges.groupToggles).length
             + Object.keys(toolChanges.settings).length
-            + toolChanges.restore.length;
+            + toolChanges.restore.length
+            + Object.keys(toolChanges.skillToggles || {}).length;   // [skill] 技能开关也算改动
         if (keys.length === 0 && clearKeys.length === 0 && toolCount === 0) return;
 
         // 二次确认（列出将被修改的键）
@@ -2067,6 +2114,12 @@
             confirmParts.push("恢复默认（删键）：\n" + toolChanges.restore.join("\n"));
         }
         if (keys.length > 0) confirmParts.push(`修改：\n${keys.join("\n")}`);
+        // [skill / §12.2] 只改技能开关时确认框必须有内容，否则用户看不到将改什么
+        const skillToggleKeys = Object.keys(toolChanges.skillToggles || {});
+        if (skillToggleKeys.length > 0) {
+            confirmParts.push("技能开关：\n" + skillToggleKeys
+                .map((d) => `${d} → ${toolChanges.skillToggles[d] ? "开" : "关"}`).join("\n"));
+        }
         if (clearKeys.length > 0) confirmParts.push(`清空密钥（保存后写为空值）：\n${clearKeys.join("\n")}`);
         // [modal] 原生 confirm 改页面内确认框：必须 await（同步布尔 → Promise<boolean>）
         const okConfirm = await WinbotsConfirm({
@@ -2100,6 +2153,7 @@
                     groupToggles: toolChanges.groupToggles,
                     settings: toolChanges.settings,
                     restore: toolChanges.restore,
+                    skillToggles: toolChanges.skillToggles,   // [skill / §12.2]
                 }),
             });
             const data = await resp.json();
@@ -2121,7 +2175,8 @@
                         // [R-47] 错误落点有三类：系统项/工具设置项（key = 配置键）、目录节点（key = 目录路径）、工具组（key = 组 id）
                         const box = document.querySelector(`[data-error-for="${k}"]`)
                             || document.querySelector(`[data-node-error="dir:${k}"]`)
-                            || document.querySelector(`[data-node-error="group:${k}"]`);
+                            || document.querySelector(`[data-node-error="group:${k}"]`)
+                            || document.querySelector(`[data-skill-error="${k}"]`);   // [skill] 第四类落点：技能节点（key = dir）
                         if (!box) {
                             if (toolFieldHolder) {
                                 toolFieldHolder.hidden = false;
@@ -2169,6 +2224,7 @@
             // [C-11] 工具域的待提交变更同样清空：随后 loadConfigView() 会拿到服务端的权威状态
             configState.dirToggles = {};
             configState.groupToggles = {};
+            configState.skillToggles = {};           // [skill]
             configState.restoreKeys = new Set();
             await loadConfigView();   // F-CFG-4：重拉使 mask 等派生字段刷新
             setConfigDirty(false);
@@ -2533,6 +2589,260 @@
         </section>`;
     }
 
+    /* ============================================================
+     * [skill / §11、§12.2] 技能区：与「工具配置」平级，按 dir 层级缩进
+     *   ⚠️ 必须递归渲染：只靠 flatten 后的平铺列表会让层级在视觉上塌成一条线。
+     *   ⚠️ 前端不算门禁、不解析 md：on / status / reason / hint 全部来自 skillTree。
+     * ============================================================ */
+
+    function flattenSkillTree(nodes, out) {
+        const acc = out || [];
+        (nodes || []).forEach((n) => {
+            acc.push(n);
+            flattenSkillTree(n.children, acc);
+        });
+        return acc;
+    }
+
+    /** 单个技能节点：分类目录只做标题（无开关，N-SK-6）；skill = 开关 + 状态 + 预览 + 激活 */
+    function renderSkillNode(node) {
+        const pad = 6 + Math.max(0, String(node.dir || "").split("/").length - 1) * 16;
+
+        if (!node.isSkill) {
+            const ignored = node.ignored || [];
+            const kids = (node.children || []).map((c) => renderSkillNode(c)).join("");
+            return `
+              <div class="tool-node tool-node--dir" style="padding-left:${pad}px">
+                <div class="tool-node__head">
+                  <span class="tool-node__name">${escapeHtml(node.segment)}</span>
+                  <code class="tool-node__id">${escapeHtml(node.dir)}</code>
+                  ${ignored.length > 0
+                    ? `<span class="config-badge config-badge--shadow">已忽略 ${ignored.length} 项</span>` : ""}
+                </div>
+                ${ignored.map((x) => `<div class="tool-node__warn">已忽略：${escapeHtml(x.name)}（${escapeHtml(x.reason)}）</div>`).join("")}
+                ${kids}
+              </div>`;
+        }
+
+        const suspended = node.status === "suspended";
+        /* [C-32] 开关的显示值 = 草稿优先（有未提交草稿就显示草稿，否则用服务端值）。
+           ⚠️ 原实现只读 node.on：用户勾选后徽标仍写「已关闭」、重绘后 checkbox 还会回退成服务端值，
+              看起来像「勾了没反应 / 操作丢了」。草稿状态必须能一眼看见。 */
+        const draftOn = configState.skillToggles
+            ? configState.skillToggles[node.dir]
+            : undefined;
+        const shownOn = draftOn === undefined ? node.on : draftOn === true;
+        const dirtyMark = (draftOn !== undefined && draftOn !== node.on)
+            ? `<span class="config-badge config-badge--shadow">未保存</span>` : "";
+        const badge = suspended
+            ? `<span class="config-badge config-badge--shadow">挂起：${escapeHtml(node.reason || "未知原因")}</span>`
+            : `<span class="config-badge">${shownOn ? "已开启" : "已关闭"}</span>${dirtyMark}`;
+        // §11「报警要给出具体怎么改」：hint 独占一行
+        const hintLine = suspended && node.hint
+            ? `<div class="tool-node__warn">怎么改：${escapeHtml(node.hint)}</div>` : "";
+        const extraLine = (node.extraFiles || []).length > 0
+            ? `<div class="tool-node__warn">目录内多余文件（已忽略）：${escapeHtml(node.extraFiles.join("、"))}</div>` : "";
+        const active = configState.activeSkill === node.dir;
+
+        return `
+          <div class="tool-node tool-node--skill${suspended ? " tool-node--disabled" : ""}"
+               data-skill-dir="${escapeHtml(node.dir)}" style="padding-left:${pad}px">
+            <div class="tool-node__head">
+              <input type="checkbox" class="tool-node__toggle" data-skill-toggle="${escapeHtml(node.dir)}"
+                     ${shownOn ? " checked" : ""}${suspended ? " disabled" : ""}>
+              <span class="tool-node__name">${escapeHtml(node.title || node.segment)}</span>
+              <code class="tool-node__id">${escapeHtml(node.dir)}</code>
+              <span class="tool-node__badges">${badge}</span>
+              <button type="button" class="config-btn config-btn--inline" data-skill-preview="${escapeHtml(node.dir)}">预览</button>
+              ${suspended ? "" : `<label class="config-item__desc">
+                  <input type="radio" name="active-skill" value="${escapeHtml(node.dir)}"${active ? " checked" : ""}>
+                  本轮激活
+              </label>`}
+            </div>
+            <div class="config-item__desc">${escapeHtml(node.summary || "")}</div>
+            ${hintLine}
+            ${extraLine}
+            <div class="config-item__error" data-skill-error="${escapeHtml(node.dir)}" hidden></div>
+          </div>`;
+    }
+
+    /** 技能区整段（递归渲染根节点，保证层级不塌） */
+    function renderSkillSection() {
+        const flat = flattenSkillTree(configState.skillTree);
+        const skillCount = flat.filter((n) => n.isSkill).length;
+        const warns = configState.skillWarnings || [];
+        const head = `
+          <h3 class="config-section__title">
+            技能配置（默认关闭；开启后还要勾选「本轮激活」才生效）
+          </h3>`;
+        const warnBlock = warns.length > 0
+            ? `<div class="tool-node__warn">${warns.map((w) => escapeHtml(w)).join("<br>")}</div>` : "";
+        if (skillCount === 0) {
+            return `<section class="config-section" id="config-skill-section">${head}
+              <div class="config-item__desc">
+                未扫描到任何技能。请在 <code>etc/skills/&lt;分类&gt;/&lt;技能名&gt;/SKILL.md</code> 下新建文档后点「🔄 刷新」。
+              </div>
+              ${warnBlock}
+            </section>`;
+        }
+        return `<section class="config-section" id="config-skill-section">${head}
+          <div class="config-item__desc">
+            共 ${skillCount} 个技能。开关默认关闭；切换后<b>下一次请求</b>生效（当前回复不受影响）。
+            技能只能通过已注册工具做事，涉及写文件 / 执行命令 / 联网的调用一律走审批。
+          </div>
+          ${warnBlock}
+          <div class="config-item__error" id="config-skill-fields" hidden></div>
+          ${(configState.skillTree || []).map((n) => renderSkillNode(n)).join("")}
+        </section>`;
+    }
+
+    /** 绑定技能区交互：开关 / 激活单选 / 预览 */
+    function bindSkillTreeEvents(box) {
+        // ① 开关：只改草稿，保存时统一提交（与工具开关同一心智模型）
+        box.querySelectorAll("[data-skill-toggle]").forEach((el) => {
+            el.addEventListener("change", () => {
+                const dir = el.dataset.skillToggle;
+                if (!dir) return;
+                configState.skillToggles[dir] = el.checked;
+                setConfigDirty(true);
+                // [C-32] 立即把徽标刷成草稿状态：否则用户勾完看不到任何视觉反馈
+                //   （徽标只在 renderSkillNode 时按服务端值渲染，不重绘就一直显示旧值）。
+                const nodeEl = el.closest(".tool-node--skill");
+                const badgeEl = nodeEl ? nodeEl.querySelector(".tool-node__badges") : null;
+                if (badgeEl) {
+                    const shadow = badgeEl.querySelector(".config-badge--shadow");
+                    const base = badgeEl.querySelector(".config-badge:not(.config-badge--shadow)");
+                    if (base && !shadow) {   // 非挂起态才改（挂起态显示原因，不可切换）
+                        base.textContent = el.checked ? "已开启" : "已关闭";
+                        const mark = document.createElement("span");
+                        mark.className = "config-badge config-badge--shadow";
+                        mark.textContent = "未保存";
+                        badgeEl.appendChild(mark);
+                    }
+                }
+            });
+        });
+
+        // ② 激活项：单选，同一时刻只有一个；写 sessionStorage（不落 .env，C-5）
+        box.querySelectorAll('input[name="active-skill"]').forEach((el) => {
+            el.addEventListener("change", () => {
+                if (!el.checked) return;
+                configState.activeSkill = el.value;
+                try { sessionStorage.setItem("winbots.activeSkill", el.value); } catch { /* 忽略 */ }
+                // §11：切换必须提示「下一轮生效」，不得暗示立即改变当前回复
+                //   ⚠️ 激活项**不进 .env** → 不要触碰 setConfigDirty：
+                //      否则会把用户刚改的系统项 / 工具开关一并标成「无未保存更改」，保存按钮变灰。
+                const out = document.getElementById("config-result");
+                if (out) out.textContent = `✅ 已把「${el.value}」设为本轮激活技能：下一次请求生效（当前回复不受影响）。`;
+            });
+        });
+
+        // ③ 预览：独立只读接口（§12.5 要求服务端实际拼装后的文本）
+        box.querySelectorAll("[data-skill-preview]").forEach((btn) => {
+            btn.addEventListener("click", () => openSkillPreview(btn.dataset.skillPreview));
+        });
+    }
+
+    /* ============================================================
+     * [skill / §11、§12.5] 预览浮层：只读展示服务端「实际拼装后」的三层文本
+     *   ⚠️ 正文用 DOM API + textContent，禁止 innerHTML 拼用户文本（§12.4 第 3 条）
+     *   ⚠️ 支持 Esc 关闭 + 焦点锁定（§12.4 第 2 条）
+     * ============================================================ */
+    async function openSkillPreview(dir) {
+        if (!dir) return;
+        const root = document.getElementById("skill-preview-modal");
+        const body = document.getElementById("skill-preview-body");
+        const title = document.getElementById("skill-preview-title");
+        const closeBtn = document.getElementById("skill-preview-close");
+        if (!root || !body || !title || !closeBtn) return;
+
+        const addBlock = (label, text) => {
+            const h = document.createElement("div");
+            h.className = "skill-preview__section";
+            h.textContent = label;
+            const pre = document.createElement("pre");
+            pre.className = "skill-preview__pre";
+            pre.textContent = text || "（空）";
+            body.appendChild(h);
+            body.appendChild(pre);
+        };
+
+        body.textContent = "";
+        title.textContent = "技能预览 · " + dir;
+
+        let data = null;
+        try {
+            const resp = await fetch(
+                "/api/skills/preview?name=" + encodeURIComponent(dir),
+                { cache: "no-store" },
+            );
+            data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+        } catch (e) {
+            // 失败也走同一个页面内浮层（§12.4：禁用 alert / 原生弹窗）
+            const w = document.createElement("div");
+            w.className = "skill-preview__warn";
+            w.textContent = "❌ 预览失败：" + String((e && e.message) || e);
+            body.appendChild(w);
+        }
+
+        if (data) {
+            addBlock("L0（配置页列表里的一句话）", data.l0);
+            addBlock("L1（## 目标 / ## 使用时机 → 注入 system）", data.l1);
+            addBlock("L2（## 方法 / ## 输出格式 / ## 自检 等 → 注入 system）", data.l2);
+            addBlock("最终工具白名单（模型实际能看到的）",
+                (data.tools || []).join("\n") || "（未收窄：给全量）");
+            if (data.toolsDropped && data.toolsDropped.length > 0) {
+                addBlock("被过滤掉的声明（注册表里没有：组被关 / 组挂起 / 名字写错）",
+                    data.toolsDropped.join("\n"));
+            }
+            /* [C-30] 声明了、注册表里也有，但被工具自身 enabled() 挡掉（典型：permission=forbid）。
+               必须与 toolsDropped 分开显示，否则用户会误以为「我写了三个工具，怎么只生效两个」。 */
+            if (data.toolsSelfDisabled && data.toolsSelfDisabled.length > 0) {
+                addBlock("声明了但工具自身条件不成立（如 permission=forbid，需先放开工具权限）",
+                    data.toolsSelfDisabled.join("\n"));
+            }
+            if (data.truncated) {
+                const w = document.createElement("div");
+                w.className = "skill-preview__warn";
+                w.textContent = "⚠️ 该 skill 内容超出预算，注入时已按段落整段截断（见 L2 末尾标注）。";
+                body.appendChild(w);
+            }
+            if (data.hint) {
+                const w = document.createElement("div");
+                w.className = "skill-preview__warn";
+                w.textContent = "怎么改：" + data.hint;
+                body.appendChild(w);
+            }
+        }
+
+        /* 关闭策略（§12.4 第 2 条）：Esc / 点遮罩 / 点「关闭」都能关；焦点锁在按钮上 */
+        const backdrop = root.querySelector("[data-skill-preview-close]");
+        const prevFocus = document.activeElement;
+        const close = () => {
+            root.hidden = true;
+            document.body.classList.remove("approval-open");
+            closeBtn.removeEventListener("click", close);
+            if (backdrop) backdrop.removeEventListener("click", close);
+            document.removeEventListener("keydown", onKey, true);
+            if (prevFocus && typeof prevFocus.focus === "function") {
+                try { prevFocus.focus(); } catch { /* 忽略 */ }
+            }
+        };
+        const onKey = (e) => {
+            if (e.key === "Escape") { e.preventDefault(); close(); return; }
+            if (e.key === "Tab") { e.preventDefault(); closeBtn.focus(); }
+        };
+
+        closeBtn.addEventListener("click", close);
+        if (backdrop) backdrop.addEventListener("click", close);
+        document.addEventListener("keydown", onKey, true);
+
+        root.hidden = false;
+        document.body.classList.add("approval-open");
+        closeBtn.focus();
+    }
+
     /** 底部遗留键区块（§10.2：只在此处出现，可整体删除） */
     function renderOrphanSection() {
         const keys = configState.orphanKeys || [];
@@ -2642,11 +2952,17 @@
         });
         // 提交前自净：与门禁矛盾的「开启」类草稿一律撤掉（否则后端整单 400，见 §3.5 / §8.2）
         pruneToolToggleDrafts();
+        // [skill / §12.2] 技能开关单独一份：key = skill 的 dir（服务端按 dir 反查 SKILLON__<dir>）
+        const skillToggles = {};
+        Object.keys(configState.skillToggles).forEach((dir) => {
+            skillToggles[dir] = configState.skillToggles[dir] === true;
+        });
         return {
             dirToggles: Object.assign({}, configState.dirToggles),
             groupToggles: Object.assign({}, configState.groupToggles),
             settings,
-            restore: [...configState.restoreKeys],
+            restore: [...configState.restoreKeys],   // ← 必须保留
+            skillToggles,
         };
     }
 
@@ -2669,13 +2985,25 @@
             configState.scanVersion = data.scanVersion || "";
             configState.toolTree = data.toolTree || [];
             configState.orphanKeys = data.orphanKeys || [];
+            // [skill] 刷新同样带回技能树与清理结果
+            configState.skillTree = data.skillTree || [];
+            configState.skillWarnings = data.skillWarnings || [];
+            configState.skillScanVersion = data.skillScanVersion || "";
             configState.dirToggles = {};
             configState.groupToggles = {};
+            configState.skillToggles = {};           // [skill]
             configState.restoreKeys = new Set();
             const box = document.getElementById("config-form");
             if (box) renderConfigForm(box);
             setConfigDirty(false);
-            if (resultEl) resultEl.textContent = "🔄 已重新扫描（版本 " + configState.scanVersion + "）。";
+            const cleaned = data.cleanedSkillKeys || [];
+            if (resultEl) {
+                resultEl.textContent = "🔄 已重新扫描（工具 " + configState.scanVersion
+                    + " / 技能 " + (configState.skillScanVersion || "-") + "）。"
+                    + (cleaned.length > 0
+                        ? "\n🧹 已自动清理 " + cleaned.length + " 个已删技能的残留键：" + cleaned.join(", ")
+                        : "");
+            }
         } catch (e) {
             if (resultEl) resultEl.textContent = "❌ 刷新失败：" + String(e.message || e);
         }

@@ -19,6 +19,7 @@ import chatRoute from "@/routes/chat";
 import logRoute from "@/routes/log";   // [Sprint 5.1 / US-LOG-4]
 import configRoute from "@/routes/config";   // [配置页 / US-CFG-PAGE-1]
 import approvalRoute from "@/routes/approval";   // [批次三 / NH-02 ②③] 审批通道
+import skillsRoute from "@/routes/skills";   // [skill] 技能只读查询（清单 / 预览）
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
@@ -44,6 +45,8 @@ app.route("/api/log", logRoute);         // [Sprint 5.1 / US-LOG-4]
 app.route("/api/config", configRoute);   // [配置页 / US-CFG-PAGE-1]
 // [批次三 / NH-02 ③] 审批通道：独立 SSE 端点，不改对话主链路（chat.ts 一行未动）
 app.route("/api/approvals", approvalRoute);
+// [skill] 技能只读接口：配置页「预览」与清单的数据源（必须在 serveStatic 之前注册）
+app.route("/api/skills", skillsRoute);
 
 // ============================================
 // 静态文件服务（前端页面）

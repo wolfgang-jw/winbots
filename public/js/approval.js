@@ -208,6 +208,8 @@
         meta.appendChild(el("span", "", "工作目录：" + req.cwd));
         meta.appendChild(el("span", "", "超时：" + req.timeoutMs + "ms"));
         meta.appendChild(el("span", "", "权限档位：" + req.permission));
+        // [skill / C-23] 来源技能：仅在本轮确实由某个 skill 装配时渲染（字段缺省则不渲染，避免出现空标签）
+        if (req.skill) meta.appendChild(el("span", "approval-modal__skill", "来源技能：" + req.skill));
         panel.appendChild(meta);
 
         // ② 完整命令原文：等宽、可滚动、**不截断、不折叠**（AP-09 ①）

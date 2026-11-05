@@ -95,7 +95,11 @@ export interface MessageMeta {
     startedAt?: number;
 }
 
-/** 历史条数上限（N6：存储规模可控），与前端 MAX_HISTORY 对齐 */
+/**
+ * 历史条数上限（N6：存储规模可控），与前端 MAX_HISTORY 对齐。
+ * ⚠️ [skill / N-SK-11] 自本改动起，本上限**只约束 role <> 'system' 的行**；
+ *    system 行不参与计数、不被裁剪（见 §6.4）。旧库里的 system 行因此会保留。
+ */
 export const MAX_HISTORY = 20;
 
 /** 会话标题默认值（US-4.2 将据此自动生成） */
@@ -231,13 +235,24 @@ export function appendMessage(
             }
         }
 
-        // N6 裁剪：仅保留最近 MAX_HISTORY 条，删除更旧的（含其 meta）
+        // N6 裁剪：仅保留最近 MAX_HISTORY 条「对话消息」，删除更旧的（含其 meta）
+        // [skill / N-SK-11、§6.4] system 行**不参与**这 20 条配额：
+        //   它们是 skill 注入的行为准则，被裁掉会让 skill 在多轮后静默失效。
+        //   做法：下界改成「按 role<>'system' 过滤后，倒数第 $keep 条对话消息的 seq」。
+        //   · COALESCE(..., 0)：对话消息不足 $keep 条时 MIN(seq) 为 NULL → seq < 0 永不成立 → 不删（正确）
+        //   · 不用 MAX(seq) - $keep：system 行会插在中间，那个算法会多删 1~2 条对话
         db.run(
             `DELETE FROM messages
              WHERE session_id = $sid
-               AND seq <= (
-                   SELECT MAX(seq) FROM messages WHERE session_id = $sid
-               ) - $keep`,
+               AND role <> 'system'
+               AND seq < COALESCE((
+                   SELECT MIN(seq) FROM (
+                       SELECT seq FROM messages
+                       WHERE session_id = $sid AND role <> 'system'
+                       ORDER BY seq DESC
+                       LIMIT $keep
+                   )
+               ), 0)`,
             { $sid: sessionId, $keep: MAX_HISTORY }
         );
     });
@@ -259,18 +274,24 @@ export function appendMessage(
  */
 export function getHistory(sessionId: string): SessionMessage[] {
     const db = getDb();
-    // 内层子查询：按 seq 倒序取最近 MAX_HISTORY 条；外层再按 seq 升序还原顺序。
-    // 这样等价于旧实现的「保留最近 N 条」，避免长会话取到最旧 N 条。
+    // [skill / N-SK-11] system 行单独全取（不受 $keep 限制），对话行仍取最近 $keep 条；
+    //   两者用 UNION ALL 合成一段后按 seq 升序还原 —— 保证 system 不会随轮次被挤出窗口。
+    //   外层只 SELECT role, content, meta：grp 只是为了两侧列数一致的占位列，不外泄。
     const rows = db
         .query<
             { role: string; content: string | null; meta: string | null },
             { $sid: string; $keep: number }
         >(
             `SELECT role, content, meta FROM (
-                 SELECT role, content, meta, seq FROM messages
-                 WHERE session_id = $sid
-                 ORDER BY seq DESC
-                 LIMIT $keep
+                 SELECT role, content, meta, seq, 0 AS grp FROM messages
+                 WHERE session_id = $sid AND role = 'system'
+                 UNION ALL
+                 SELECT role, content, meta, seq, 1 AS grp FROM (
+                     SELECT role, content, meta, seq FROM messages
+                     WHERE session_id = $sid AND role <> 'system'
+                     ORDER BY seq DESC
+                     LIMIT $keep
+                 )
              ) ORDER BY seq ASC`
         )
         .all({ $sid: sessionId, $keep: MAX_HISTORY });
@@ -311,16 +332,23 @@ export function getMessagesWithMeta(
     sessionId: string
 ): Array<{ role: string; content: string | null; meta: MessageMeta | null }> {
     const db = getDb();
+    // [skill / N-SK-11] 与 getHistory 同款：system 行全取 + 对话行取最近 $keep 条，
+    //   否则历史重现时 skill 注入的 system 段落会消失（口径漂移）。
     const rows = db
         .query<
             { role: string; content: string | null; meta: string | null },
             { $sid: string; $keep: number }
         >(
             `SELECT role, content, meta FROM (
-                 SELECT role, content, meta, seq FROM messages
-                 WHERE session_id = $sid
-                 ORDER BY seq DESC
-                 LIMIT $keep
+                 SELECT role, content, meta, seq, 0 AS grp FROM messages
+                 WHERE session_id = $sid AND role = 'system'
+                 UNION ALL
+                 SELECT role, content, meta, seq, 1 AS grp FROM (
+                     SELECT role, content, meta, seq FROM messages
+                     WHERE session_id = $sid AND role <> 'system'
+                     ORDER BY seq DESC
+                     LIMIT $keep
+                 )
              ) ORDER BY seq ASC`
         )
         .all({ $sid: sessionId, $keep: MAX_HISTORY });
@@ -526,13 +554,13 @@ export function getSessionDetail(sessionId: string): SessionDetail {
  * @returns 是否实际删除了会话：true=删除成功；false=会话不存在
  */
 export function deleteSession(sessionId: string): boolean {
-   const db = getDb();
-   // 删除会话行；messages 经 ON DELETE CASCADE 自动清除
-   const result = db.run(`DELETE FROM sessions WHERE id = $sid`, { $sid: sessionId });
+    const db = getDb();
+    // 删除会话行；messages 经 ON DELETE CASCADE 自动清除
+    const result = db.run(`DELETE FROM sessions WHERE id = $sid`, { $sid: sessionId });
     // [A1 修复] bun:sqlite 的 run() 自 Bun v1.1.14 起返回 { changes, lastInsertRowid }；
     //   低版本 Bun 下 result.changes 为 undefined，会导致「删除成功也误返回 404」。
     //   兜底策略：优先取 run().changes；若不可用（undefined），改用 SELECT changes()
-//   读取「最近一次 DELETE 影响的行数」，保证跨 Bun 版本语义一致。
+    //   读取「最近一次 DELETE 影响的行数」，保证跨 Bun 版本语义一致。
     let changes = (result as { changes?: number } | undefined)?.changes;
     if (typeof changes !== "number") {
         const row = db

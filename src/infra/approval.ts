@@ -41,6 +41,11 @@ export interface PendingApproval {
     destructiveHint: boolean;
     allowAllOption: boolean;
     createdAt: number;
+    /**
+     * [skill / §7.5、C-23] 本轮命令由哪个 skill 触发（skill 名；无 skill 时缺省）。
+     * 仅用于界面「来源技能」标注与审计日志；**不参与任何权限判定**（N-SK-12）。
+     */
+    skill?: string;
 }
 
 export interface ApprovalResult {
@@ -99,6 +104,7 @@ function audit(kind: "approval_request" | "approval_decision", p: PendingApprova
             cwd: p.cwd,
             permission: p.permission,
             noticeVersion: p.noticeVersion,
+            skill: p.skill,
             ...extra,
         }),
     );

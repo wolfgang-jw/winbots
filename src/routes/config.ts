@@ -16,6 +16,10 @@ import { env, envShadowedBySystem, reloadEnvExcluding } from "@/infra/env";
 import {
   CONFIG_KEYS, CONFIG_KEY_SET, ENV_PATH, BACKUP_DIR,
   buildConfigItems, applyConfigChanges, maskSecret,
+  // [skill / §9.3、C-18] refresh 的残留键清理要读 .env 原始文本。
+  //   ⚠️ 原文件**没有**导入这两个符号（只导入了 applyConfigChanges 等），
+  //      文档 §9.4 早先写的「不需要新增 import」是错的 —— 照抄会编译失败。
+  readEnvFile, parseEnvText,
 } from "@/infra/configFile";
 import {
   getRegistry, listOrphanKeys, SUSPEND_LABEL,
@@ -32,6 +36,13 @@ import {
   type SettingDef,
 } from "@/infra/settings";
 import { hasManagedPrefix, isSensitiveName, pathSegments } from "@/tools/paths";
+import type { SettingEntry } from "@/tools/scan";
+// [skill / §12.1] 技能注册表：只走门面（§1.2「只 import 门面」），不直连 skills/scan.ts
+import {
+  ensureSkillRegistry, getSkillRegistry, listStaleSkillKeys, listSkillDeclaredKeys,
+  skillSettingKey, SKILL_SUSPEND_LABEL,
+  type SkillDirNode, type SkillRecord, type SkillRegistry,
+} from "@/skills";
 
 const router = new Hono();
 
@@ -105,6 +116,62 @@ interface ToolNode {
   tools: Array<{ visibleName: string; name: string }>;
   ignored: Array<{ name: string; reason: string }>;
   children: ToolNode[];
+}
+
+/* ============================================================
+ * [skill / N-2、C-13] 设置项 def 与 dependsOn owner 的双注册表兜底
+ * ============================================================ */
+
+/** [skill] 从 skill 注册表查设置项定义（挂起 skill 的 settings 是空 Map → 自然查不到） */
+function skillDefOf(key: string): SettingDef | undefined {
+  for (const rec of getSkillRegistry().skills.values()) {
+    for (const [name, def] of rec.settings) {
+      if (skillSettingKey(rec.dir, name) === key) return def;
+    }
+  }
+  return undefined;
+}
+
+/** [skill] 统一取 def：先工具、再 skill（两套注册表键前缀不同，互不覆盖） */
+function defOf(key: string): SettingDef | undefined {
+  return getRegistry().settingDefs.get(key) ?? skillDefOf(key);
+}
+
+/**
+ * [skill / C-13] `dependsOn` 的 owner（同级设置项表）。
+ *
+ * `reg.settingOwners` 只由**工具**扫描构建，`SKILLSET__*` 在里面永远查不到 →
+ * 只要某个 skill 的设置项写了 dependsOn，就会走进「成对约束指向的设置项不存在」→ 整单 400。
+ * 「从长到短试目录前缀」与 listStaleSkillKeys 同口径：目录名不允许含 `__`（checkName 已挡）。
+ */
+function skillSettingOwnerOf(key: string): Map<string, SettingEntry> | undefined {
+  if (!key.startsWith("SKILLSET__")) return undefined;
+  const rest = key.split("__").slice(1);
+  const dirSegs = rest.slice(0, -1);            // 最后一段是设置项名，不是目录
+  if (dirSegs.length === 0) return undefined;
+  const reg = getSkillRegistry();
+  for (let cut = dirSegs.length; cut >= 1; cut--) {
+    const rec = reg.skills.get(dirSegs.slice(0, cut).join("/"));
+    if (!rec) continue;
+    const owner = new Map<string, SettingEntry>();
+    for (const [name, def] of rec.settings) {
+      owner.set(name, { key: skillSettingKey(rec.dir, name), def });
+    }
+    return owner;
+  }
+  return undefined;
+}
+
+/**
+ * [skill / C-22] 遗留键 = `listOrphanKeys(reg)` 减去「存活技能声明的键」。
+ *
+ * 为什么不在 tools/scan.ts 里改：`tools/paths.ts` / `tools/scan.ts` 是零业务底座，
+ * 而 `skills/scan.ts` 反过来要 import `@/tools/scan`，让 tools 侧认 skill 键就成环（§1.2）。
+ * 减法放在 routes 层，两侧单例边界不变。
+ */
+function listOrphanKeysExcludingSkills(reg: Registry, sreg: SkillRegistry): string[] {
+  const declared = new Set(listSkillDeclaredKeys(sreg).map((k) => k.toLowerCase()));
+  return listOrphanKeys(reg).filter((k) => !declared.has(k.toLowerCase()));
 }
 
 function settingView(key: string, name: string, def: SettingDef, disabled: boolean): SettingView {
@@ -218,17 +285,110 @@ function buildToolTree(reg: Registry): ToolNode[] {
   };
 
   const root = reg.dirs.get("");
-  const rootGroups = (root?.groups ?? []).map((gid) => buildGroup(gid, true)); return [...(root?.children ?? []).map(buildDir), ...rootGroups]; // [§11] 根级入口文件（etc/tools/*.ts）的组同样要显示，否则它会和挂起组一样从页面上消失
+  const rootGroups = (root?.groups ?? []).map((gid) => buildGroup(gid, true)); return [...(root?.children ?? []).map(buildDir), ...rootGroups]; // [§11] 根级入口文件的组同样要显示
 }
 
 /* ============================================================
  * GET /api/config —— 读取前先重扫（§4.1 / §12）
  * ============================================================ */
 
+/* ============================================================
+ * [skill / §12.1] skillTree：与 toolTree 并列返回
+ * ============================================================ */
+
+interface SkillNode {
+  key: string;
+  segment: string;
+  dir: string;
+  isSkill: boolean;
+  on: boolean;
+  status: "ok" | "suspended";
+  reason: string | null;
+  hint: string | null;
+  title: string;
+  summary: string;
+  settings: SettingView[];
+  extraFiles: string[];
+  ignored: Array<{ name: string; reason: string }>;
+  children: SkillNode[];
+}
+
+function skillSettingsView(rec: SkillRecord, disabled: boolean): SettingView[] {
+  return [...rec.settings.entries()].map(([name, def]) =>
+    settingView(skillSettingKey(rec.dir, name), name, def, disabled),
+  );
+}
+
+function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
+  const buildSkill = (rec: SkillRecord): SkillNode => {
+    const dis = rec.status === "suspended";
+    return {
+      key: rec.toggleKey,
+      segment: rec.name,
+      dir: rec.dir,
+      isSkill: true,
+      on: isToggleOn(rec.toggleKey),
+      status: rec.status,
+      reason: rec.suspend ? SKILL_SUSPEND_LABEL[rec.suspend.code] : null,
+      hint: rec.suspend ? rec.suspend.hint : null,
+      title: rec.title,
+      summary: rec.summary,
+      settings: skillSettingsView(rec, dis),
+      extraFiles: rec.extraFiles,
+      ignored: [],
+      children: [],
+    };
+  };
+
+  const buildDirNode = (path: string): SkillNode => {
+    const d = sreg.dirs.get(path);
+    if (!d) {
+      return {
+        key: "", segment: path, dir: path, isSkill: false, on: false, status: "ok",
+        reason: null, hint: null, title: "", summary: "", settings: [],
+        extraFiles: [], ignored: [], children: [],
+      };
+    }
+    return {
+      key: "",
+      segment: d.name,
+      dir: path,
+      isSkill: false,
+      on: false,
+      status: "ok",
+      reason: null,
+      hint: null,
+      title: "",
+      summary: "",
+      settings: [],
+      extraFiles: d.extraFiles,
+      ignored: d.ignored,
+      children: [
+        ...d.children.map(buildDirNode),
+        ...d.skills
+          .map((dir) => sreg.skills.get(dir))
+          .filter((r): r is SkillRecord => r !== undefined)
+          .map(buildSkill),
+      ],
+    };
+  };
+
+  const root = sreg.dirs.get("");
+  return (root?.children ?? []).map(buildDirNode);
+}
+
 router.get("/", async (c) => {
   // §4.1 进入配置页即重扫；走门面以顺带完成一次性迁移
+  // [skill] 技能扫描要读工具注册表判断 unknown_tool，所以必须排在工具扫描之后
   await ensureToolRegistry({ force: true });
+  await ensureSkillRegistry({ force: true });
+
+
+
   const reg = getRegistry();
+  const sreg = getSkillRegistry();
+  // [skill / C-21] ensureLoaded() 只在进程内首次解析 .env；这里强制刷新取值缓存
+  refreshManagedValues(true);
   const items = buildConfigItems(
     allRestartKeys(),
     envShadowedBySystem,
@@ -250,8 +410,11 @@ router.get("/", async (c) => {
     scanVersion: reg.version,
     /** 工具区：按目录层级缩进的树（§11） */
     toolTree: buildToolTree(reg),
+    skillTree: buildSkillTree(sreg),
+    skillScanVersion: sreg.version,
+    skillWarnings: sreg.warnings,
     /** 底部遗留键区块的数据（§10.2） */
-    orphanKeys: listOrphanKeys(reg),
+    orphanKeys: listOrphanKeysExcludingSkills(reg, sreg),
   });
 });
 
@@ -260,13 +423,34 @@ router.get("/", async (c) => {
  * ============================================================ */
 
 router.post("/refresh", async (c) => {
+  // 先工具后技能（技能扫描要读工具注册表判断 unknown_tool）
   await ensureToolRegistry({ force: true });
+  await ensureSkillRegistry({ force: true });
+  const _s = getSkillRegistry();
   const reg = getRegistry();
-  return c.json({
+
+
+  // [skill / §6.5、C-9] 只清理「磁盘上已不存在 SKILL.md」的 skill 键；挂起但存在的 skill 键不删
+  const staleR = listStaleSkillKeys([...parseEnvText(readEnvFile().text).keys()], _s);
+  const cleanedR: string[] = [];
+  if (staleR.length > 0) {
+    const resR = applyConfigChanges({ changes: {}, deleteKeys: staleR, allowDeleteKeys: new Set(staleR) });
+    if (resR.ok) {
+      cleanedR.push(...resR.deleted);
+      refreshManagedValues(true);
+    } else {
+      console.warn("⚠️  [skill] 残留键清理失败：" + String(resR.error ?? ""));
+    }
+  }
+  return c.json({ // refresh-body 
     ok: true,
     scanVersion: reg.version,
-    toolTree: buildToolTree(reg),
-    orphanKeys: listOrphanKeys(reg),
+    toolTree: buildToolTree(reg), 
+    skillScanVersion: _s.version,
+    skillWarnings: _s.warnings,
+    cleanedSkillKeys: cleanedR,
+    skillTree: buildSkillTree(_s),
+    orphanKeys: listOrphanKeysExcludingSkills(reg, _s),
   });
 });
 
@@ -286,6 +470,12 @@ router.put("/", async (c) => {
   if (body.confirm !== true) {
     return c.json({ ok: false, code: "ERR_NO_CONFIRM", error: "修改配置需显式确认（confirm: true）" }, 400);
   }
+
+  // [skill / C-14] 先保证技能注册表就绪：PUT 可能先于任何 GET 到达（脚本 / 直接 curl）。
+  //   若不先扫描，skillKeys 为空 → SKILLON__ / SKILLSET__ 被判「未知配置项」→ 整单 400。
+  //   指纹未变时本调用只做一次 readdir 量级开销。⚠️ 必须在 ensureToolRegistry 之后。
+  await ensureToolRegistry();
+  await ensureSkillRegistry();
 
   // ② 扫描版本校验（§9.3）：不一致即拒绝，避免基于过期键集合写入
   const reg = getRegistry();
@@ -368,12 +558,28 @@ router.put("/", async (c) => {
     }
   }
 
+  /* [skill / §12.2、N-SK-5] 技能开关：键空间独立（SKILLON__），没有祖先继承（N-SK-6） */
+  if (body.skillToggles !== undefined) {
+    const mapS = asObject(body.skillToggles);
+    if (!mapS) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "skillToggles 必须为对象" }, 400);
+    const sregP = getSkillRegistry();
+    for (const [dir, v] of Object.entries(mapS)) {
+      const recS = sregP.skills.get(dir);
+      if (!recS) { pushInvalid(dir, "未知技能（不在本次扫描结果内，请点「刷新」后重试）"); continue; }
+      if (typeof v !== "boolean") { pushInvalid(dir, "开关值必须为布尔"); continue; }
+      // 挂起技能只允许「关」：关 = 删键（回到默认关闭），不涉及任何门禁放松
+      if (recS.status === "suspended" && v) { pushInvalid(dir, "该技能已挂起（声明不合法），不可开启"); continue; }
+      delta.set(recS.toggleKey, v);
+    }
+  }
+
   /* ④ 设置项取值（写入端校验：类型 / 范围 / 枚举 / 成对约束） */
   if (body.settings !== undefined) {
     const map = asObject(body.settings);
     if (!map) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "settings 必须为对象" }, 400);
     for (const [key, raw] of Object.entries(map)) {
-      const def = reg.settingDefs.get(key);
+      // [skill / N-2] 先工具、再 skill：SKILLSET__* 只在 skill 注册表里
+      const def = defOf(key);
       if (!def) { pushInvalid(key, "未知或未声明的设置项"); continue; }
 
       // §9.1「拒绝敏感名称」的写入期一道（R-11 定稿，纵深防御）：
@@ -398,7 +604,8 @@ router.put("/", async (c) => {
 
       // §7.2 成对约束：依赖项取值不在允许集合内时，不允许把本项写成非默认值
       if (def.dependsOn) {
-        const owner = reg.settingOwners.get(key);
+        // [skill / C-13] owner 也要兜底到 skill 注册表：settingOwners 只由工具扫描构建
+        const owner = reg.settingOwners.get(key) ?? skillSettingOwnerOf(key);
         const sibling = owner ? [...owner.entries()].find(([n]) => n === def.dependsOn?.name) : undefined;
         const siblingKey = sibling?.[1].key;
         const siblingDef = sibling?.[1].def;
@@ -429,7 +636,7 @@ router.put("/", async (c) => {
     }
     for (const key of body.restore as string[]) {
       // 设置项与开关都支持「恢复默认」：开关的默认值恒为 false（§8.2），删键即回到关闭
-      const isSetting = reg.settingDefs.has(key);
+      const isSetting = defOf(key) !== undefined;
       const isToggle = key.startsWith("TOOLON__") && reg.registeredKeys.has(key);
       if (!isSetting && !isToggle) { pushInvalid(key, "未知或未声明的设置项 / 开关"); continue; }
       delete writes[key];
@@ -460,11 +667,16 @@ router.put("/", async (c) => {
     return c.json({ ok: false, code: "ERR_EMPTY_CHANGES", error: "没有实际改动（密钥留空视为不修改）" }, 400);
   }
 
-  /* ⑦ 写盘（一次原子写入；白名单 = 系统项 ∪ 本次扫描注册键） */
+  /* ⑦ 写盘（一次原子写入；白名单 = 系统项 ∪ 本次扫描注册键 ∪ skill 键） */
+  const skillKeysW = new Set<string>();
+  for (const recW of getSkillRegistry().skills.values()) {
+    skillKeysW.add(recW.toggleKey);
+    for (const nameW of recW.settings.keys()) skillKeysW.add(skillSettingKey(recW.dir, nameW));
+  }
   const result = applyConfigChanges({
     changes: writes, clearKeys: clearList,
     deleteKeys: deletes,
-    allowedKeys: reg.registeredKeys,
+    allowedKeys: new Set([...reg.registeredKeys, ...skillKeysW]),
   });
   if (!result.ok) {
     if (result.invalid) {
@@ -522,6 +734,9 @@ router.delete("/orphans", async (c) => {
 
   const reg = getRegistry();
   const registered = new Set([...reg.registeredKeys].map((k) => k.toLowerCase()));
+  // [skill / C-22] 存活技能声明的键同样是「在用的键」，不能按遗留键删除
+  const sregD = getSkillRegistry();
+  for (const kd of listSkillDeclaredKeys(sregD)) registered.add(kd.toLowerCase());
   const targets: string[] = [];
   for (const raw of body.keys as string[]) {
     const key = raw.trim();
@@ -552,7 +767,11 @@ router.delete("/orphans", async (c) => {
     return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: res.error || "删除失败" }, 500);
   }
   refreshManagedValues(true);
-  return c.json({ ok: true, deleted: res.deleted, remaining: listOrphanKeys(getRegistry()) });
+  return c.json({
+    ok: true,
+    deleted: res.deleted,
+    remaining: listOrphanKeysExcludingSkills(getRegistry(), getSkillRegistry()),
+  });
 });
 
 export default router;

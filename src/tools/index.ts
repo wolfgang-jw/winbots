@@ -46,6 +46,12 @@ export interface ToolContext {
     signal?: AbortSignal;
     /** [T-03] 会话标识：供需要「会话内暂存」的工具定位（如联网抓取的偏移续读，R-30） */
     sessionId?: string;
+    /**
+     * [skill / §7.5、C-10] 本轮对话由哪个 skill 装配（skill 名，如 "log_triage"）。
+     * 只用于**展示与审计**：审批弹窗显示「此命令来自 skill X」，审计日志多一个来源字段。
+     * ⚠️ 不得据此放宽任何判定（N-SK-12：skill 没有免审批路径）。
+     */
+    skill?: string;
 }
 
 /** 工具契约：etc/ 下每个工具文件导出的单个工具结构 */
