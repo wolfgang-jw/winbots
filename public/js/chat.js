@@ -1768,6 +1768,16 @@
             $dom.historyList.querySelectorAll(".history-item__delete").forEach((btn) => {
                 btn.addEventListener("click", async (e) => {
                     e.stopPropagation();
+                    // [modal] 新增二次确认：会话删除不可恢复。取消则什么都不做（不发请求、不重绘）
+                    const ok = await WinbotsConfirm({
+                        source: "delete-session",
+                        title: "删除历史会话",
+                        message: "确认删除这个会话？删除后不可恢复。",
+                        okText: "删除",
+                        cancelText: "取消",
+                        danger: true
+                    });
+                    if (!ok) return;
                     try {
                         await fetch("/api/chat/sessions/" + encodeURIComponent(btn.dataset.id), {
                             method: "DELETE",
@@ -1775,7 +1785,7 @@
                     } catch (err) {
                         console.warn("[US-4.8] 删除会话失败:", err);
                     }
-                    renderSessionList();   // 刷新列表
+                    renderSessionList();   // 刷新列表（[modal] 必须留在 if (!ok) return 之后）
                 });
             });
         } catch (e) {
@@ -2058,8 +2068,17 @@
         }
         if (keys.length > 0) confirmParts.push(`修改：\n${keys.join("\n")}`);
         if (clearKeys.length > 0) confirmParts.push(`清空密钥（保存后写为空值）：\n${clearKeys.join("\n")}`);
-        const okConfirm = window.confirm(`确认应用以下变更？\n\n${confirmParts.join("\n\n")}\n\n修改前会自动备份 .env。`);
-        if (!okConfirm) return;
+        // [modal] 原生 confirm 改页面内确认框：必须 await（同步布尔 → Promise<boolean>）
+        const okConfirm = await WinbotsConfirm({
+            source: "save-config",
+            title: "确认应用变更",
+            message: `确认应用以下变更？\n\n${confirmParts.join("\n\n")}\n\n修改前会自动备份 .env。`,
+            okText: "应用变更",
+            cancelText: "取消",
+            danger: false
+        });
+        if (!okConfirm) return;   // [modal] 取消（含 Esc / 点遮罩）一律不写盘
+
 
         // 清空上一次的逐项错误
         document.querySelectorAll("[data-error-for],[data-node-error]").forEach((n) => { n.hidden = true; n.textContent = ""; });
@@ -2633,7 +2652,15 @@
 
     /** 重新扫描工具目录（§12 refresh）：只重画工具树，不动系统项已保存值 */
     async function refreshToolTree() {
-        if (configState.dirty && !window.confirm("重新扫描会丢弃当前未保存的更改，继续？")) return;
+        // [modal] 仅在 dirty 时确认：短路求值保证「不 dirty 不弹框」
+        if (configState.dirty && !(await WinbotsConfirm({
+            source: "refresh-tools",
+            title: "重新扫描工具目录",
+            message: "重新扫描会丢弃当前未保存的更改，继续？",
+            okText: "丢弃并重新扫描",
+            cancelText: "取消",
+            danger: true
+        }))) return;
         const resultEl = document.getElementById("config-result");
         try {
             const resp = await fetch("/api/config/refresh", { method: "POST" });
@@ -2662,7 +2689,15 @@
             if (errEl) { errEl.hidden = false; errEl.textContent = "❌ 请先勾选要删除的遗留键"; }
             return;
         }
-        if (!window.confirm("确认删除以下 " + keys.length + " 个遗留键？\n\n" + keys.join("\n") + "\n\n（删除不备份，可在 data/envbk 的最近备份中找回）")) return;
+        // [modal] 删除不备份，必须走危险色确认
+        if (!(await WinbotsConfirm({
+            source: "delete-orphans",
+            title: "删除遗留键",
+            message: "确认删除以下 " + keys.length + " 个遗留键？\n\n" + keys.join("\n") + "\n\n（删除不备份，可在 data/envbk 的最近备份中找回）",
+            okText: "删除",
+            cancelText: "取消",
+            danger: true
+        }))) return;
         try {
             const resp = await fetch("/api/config/orphans", {
                 method: "DELETE",

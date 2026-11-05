@@ -1908,3 +1908,61 @@ body.approval-open { overflow: hidden; }
     .approval-modal__command { max-height: 130px; }
     .approval-pending-bar { top: 56px; font-size: 0.76rem; }
 }
+
+/* ============================================
+   通用确认弹窗（modal.js）
+   —— 结构类复用 .approval-modal，此处只补差异项。
+   必须写在 .approval-modal 规则之后：z-index 靠「后声明者胜」生效，
+   若把本块移到 .approval-modal 之前，会静默退回 80，与审批弹窗同层。
+   ============================================ */
+.confirm-modal { z-index: 90; }                      /* 高于审批弹窗（80） */
+
+.confirm-modal__panel { width: min(520px, 94vw); }   /* 确认框不该和审批框一样宽 */
+
+.confirm-modal__message {
+    margin: 0 0 16px;
+    font-size: 0.84rem;
+    line-height: 1.65;
+    color: var(--gray-700);
+    white-space: pre-line;                           /* 保留换行，替代原生 confirm 的排版 */
+    word-break: break-word;
+    max-height: 46vh;
+    overflow-y: auto;                                /* 键清单很长时面板内滚动 */
+}
+
+.confirm-modal__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--gray-200);
+}
+
+.confirm-modal__btn {
+    padding: 8px 20px;
+    border-radius: 20px;
+    border: 1px solid var(--gray-200);
+    background: var(--white);
+    color: var(--gray-700);
+    font-size: 0.84rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.confirm-modal__btn--ok {
+    border: none;
+    background: var(--tomato-red);
+    color: var(--white);
+}
+
+.confirm-modal__btn--danger {
+    border: none;
+    background: #c0392b;                             /* 与审批「拒绝」按钮同色 */
+    color: var(--white);
+}
+
+.confirm-modal__btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.confirm-modal__btn:focus-visible { outline: 2px solid var(--tomato-red); outline-offset: 2px; }
+
+/* 说明：--primary 是纯粹的「JS 定位用标记类」，不产生任何样式，故意不在这里定义。
+   它必须与 --ok / --danger 同时存在，供 modal.js 稳定查到确认按钮（两者互斥切换）。 */

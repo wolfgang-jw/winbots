@@ -129,6 +129,25 @@
         <div class="approval-modal__panel"></div>
     </div>
 
+    <!-- 通用确认弹窗容器（modal.js 专用，单例）。
+         与审批弹窗共享结构类 .approval-modal / __backdrop / __panel，因此视觉一致；
+         但关闭策略相反：Esc / 点遮罩 / 取消均可关闭（见 docs/modal-需求与方案.md §5.4）。
+         注意：本容器子树内禁止出现 .approval-modal__error / __submit / __choice 等审批专属类名。 -->
+    <div class="approval-modal confirm-modal" id="confirm-modal" role="dialog" aria-modal="true"
+         aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-message" hidden>
+        <div class="approval-modal__backdrop"></div>
+        <div class="approval-modal__panel confirm-modal__panel">
+            <div class="approval-modal__title" id="confirm-modal-title"></div>
+            <div class="confirm-modal__message" id="confirm-modal-message"></div>
+            <div class="confirm-modal__footer">
+                <button type="button" class="confirm-modal__btn confirm-modal__btn--cancel"></button>
+                <!-- 确认按钮带一个稳定的 --primary 类，用于 JS 定位（不随 --ok / --danger 切换而失效）； -->
+                <!-- 初始给 --ok，render() 会按 opts.danger 在 --ok / --danger 之间互斥切换。 -->
+                <button type="button" class="confirm-modal__btn confirm-modal__btn--primary confirm-modal__btn--ok"></button>
+            </div>
+        </div>
+    </div>
+
     <!-- ==================== 历史视图（US-4.8） ==================== -->
     <section class="history-layout" id="view-history" hidden>
         <div class="history-header">
@@ -225,6 +244,9 @@
         </div>
     </footer>
 
+    <!-- 通用确认模块：暴露 window.WinbotsConfirm（无任何依赖，不依赖 jQuery / cue / approval）。
+         运行时只要求早于 chat.js 的首次调用；此处沿用「基础设施脚本排在业务脚本之前」的既有约定。 -->
+    <script src="js/modal.js"></script>
     <!-- [批次二 / NB-12] 提示音机制：必须在 chat.js 之前加载，
          chat.js 会在 SSE finish 分支调用 window.WinbotsCue.notifyFinish(...) -->
     <script src="js/cue.js"></script>
