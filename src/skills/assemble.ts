@@ -1,13 +1,25 @@
 /**
  * src/skills/assemble.ts
- * 请求边界装配（§8.3）。**纯计算 + 一次注册表读取**，不做 IO、不改全局状态。
+ * 请求边界装配（§8.3）。**纯计算 + 一次注册表读取**，不做 IO、不写 .env。
+ *
+ * [升级版 §3.2] 两套装配并存、互不替换：
+ *   · `assembleForRequest(requested)`      —— 旧路径：请求级激活 + 单技能 +（旧）工具收窄数据源。
+ *     保留以便回退与对照；行为与改造前**逐字一致**（含 L0 引导文案）。
+ *   · `assembleForRequestMulti()`          —— 新路径：多技能全量装配、L1 全注入、L2 由元工具按需取。
+ *     chat.ts 走这一条。
  */
 import { isToggleOn } from "@/infra/settings";
 import { applyBudget, layer } from "./markdown";
-import { SKILL_NAME_PATTERN } from "./paths";
+import { L1_MAX, L1_TOTAL_WARN, SKILL_NAME_PATTERN } from "./paths";
 import { getSkillRegistry, type SkillRecord, type SkillRegistry } from "./scan";
+import { checkRequiredTools } from "./availability";
+import { L2_TOOL_VISIBLE_NAME } from "./l2tool";
 
 export interface SkillL0Item {
+  /**
+   * L0 行里展示给模型的名字：正常情况下是短名（name）；
+   * **同名歧义**时改用完整目录路径（dir），保证模型调元工具时不会拿到 ambiguous_skill。
+   */
   name: string;
   title: string;
   summary: string;
@@ -82,30 +94,47 @@ function pickActive(requested: string | null, reg: SkillRegistry): SkillRecord |
   return null;
 }
 
-/** L0：所有**已开启且正常**的 skill 的 title + summary（§4.3；长度已由 frontmatter 校验保证） */
-function buildL0(reg: SkillRegistry, deps: AssembleDeps): SkillL0Item[] {
-  return [...reg.skills.values()]
+/**
+ * L0：所有**已开启且正常**的 skill 的 title + summary（§4.3；长度已由 frontmatter 校验保证）。
+ *
+ * @param onlyUsable [升级版 §3.3] true → 额外剔除「必须工具不可用」的技能（新装配用）；
+ *                   false（缺省）→ 旧行为，因此旧路径逐字不变。
+ */
+function buildL0(reg: SkillRegistry, deps: AssembleDeps, onlyUsable = false): SkillL0Item[] {
+  const usable = [...reg.skills.values()]
     .filter((r) => r.status === "ok" && deps.isToggleOn(r.toggleKey))
-    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
-    .map((r) => ({ name: r.name, title: r.title, summary: r.summary }));
+    .filter((r) => (onlyUsable ? (r.unavailable ?? []).length === 0 : true))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+
+  // [升级版 §4.5] 同名歧义：模型靠名字调元工具，短名会拿到 ambiguous_skill → 改用完整目录路径。
+  const count = new Map<string, number>();
+  for (const r of usable) count.set(r.name, (count.get(r.name) ?? 0) + 1);
+  return usable.map((r) => ({
+    name: (count.get(r.name) ?? 0) > 1 ? r.dir : r.name,
+    title: r.title,
+    summary: r.summary,
+  }));
 }
 
 /**
  * L0 清单文本：一行一个 skill，形如
  *   - 本地日志排查（log_triage）：从日志文件定位报错根因…
- * 只列已开启且正常的 skill；为空时返回 ""（不注入空段落）。
+ *
+ * @param withL2Hint [升级版 R6] true → 新版两句引导（一句清单引导 + 「先取 L2 再照做」的 ①② 两条规则）；
+ *                   false（缺省）→ **旧文案逐字保留**，供旧装配 `assembleForRequest` 使用。
  */
-function l0TextOf(l0: SkillL0Item[]): string {
-  return l0.length === 0
-    ? ""
-    : [
-      "【可用技能】以下技能已开启。需要用时请按名称显式激活；未激活时不要假定自己具备其能力：",
-      ...l0.map((s) => `- ${s.title}（${s.name}）：${s.summary}`),
-    ].join("\n");
+function l0TextOf(l0: SkillL0Item[], withL2Hint = false): string {
+  if (l0.length === 0) return "";
+  const guide = withL2Hint
+    ? "【可用技能】以下技能已开启，请按下列规则使用：\n" +
+      `① 遇到某技能「使用时机」描述的场景时，**必须先调用 ${L2_TOOL_VISIBLE_NAME}（参数 name 取技能名）取回它的 L2 正文，再严格按 L2 的步骤执行**；未取 L2 时不要假定自己掌握该技能的做法。\n` +
+      "② 多个技能同时适用时，按任务性质择优：**只用一个技能的步骤，不要混用不同技能的步骤**。"
+    : "【可用技能】以下技能已开启。需要用时请按名称显式激活；未激活时不要假定自己具备其能力：";
+  return [guide, ...l0.map((s) => `- ${s.title}（${s.name}）：${s.summary}`)].join("\n");
 }
 
 /**
- * 装配本次请求的 skill 内容。
+ * 装配本次请求的 skill 内容（**旧路径，保留不动**）。
  *
  * ⚠️ C-11 修订（v2）：L0「可用 skill 清单」**总是进 systemText**（无 skill 时为空串）。
  *
@@ -117,6 +146,9 @@ function l0TextOf(l0: SkillL0Item[]): string {
  *   修订理由：L0 只有 title + summary（合计 ≤ 60 字/skill，且仅列**已开启且正常**的），
  *     成本可控；而「知道自己有什么技能」是模型做选择的前提。
  *   L0 仍然**不替代**激活：激活才带 L1/L2 与工具收窄，清单只说明「有哪些、何时该用」。
+ *
+ * [升级版 §3.2] 本函数**保留原样**（含显式激活语义与旧 L0 文案），供回退与对照；
+ *   生产路径已改为 `assembleForRequestMulti()`。
  */
 export function assembleForRequest(
   requested: string | null,
@@ -180,6 +212,133 @@ export function assembleForRequest(
     systemText,
     diag: `${rec.dir}｜L1=${budget.l1Text.length}｜L2=${budget.l2Text.length}｜截断=${budget.truncated ? "是" : "否"}`,
     skipReason: null,
+  };
+}
+
+/* ============================================================
+ * [升级版 §3.2 / §4.4] 多技能装配（新路径）
+ * ============================================================ */
+
+/** 一个参与装配的技能块 */
+export interface SkillBlock {
+  /** 身份：examples/log_triage */
+  dir: string;
+  /** 末段名：log_triage */
+  name: string;
+  title: string;
+  /** 注入 system 的 L1 正文（不裁剪，仅受 L1_MAX 保护） */
+  l1: string;
+  /** 仅告警，不剔除 */
+  l1Truncated: boolean;
+  /** 仅日志/告警（L2 不进 system，由元工具按需取） */
+  l2Chars: number;
+  /** 必须工具（callName） */
+  mustTools: string[];
+  /** 「依赖工具」行展示用（visibleName） */
+  toolVisibleNames: string[];
+}
+
+export interface MultiAssembly {
+  /** 参与装配的技能，按 name（再按 dir）字典序 */
+  skills: SkillBlock[];
+  /** = skills.map(s => s.name)；供 finish 事件与 ToolContext */
+  skillNames: string[];
+  l0: SkillL0Item[];
+  /** 无任何已开启技能时 = "" */
+  systemText: string;
+  /** 逐条「不可用 / 挂起」说明（复数；未开启的技能不提示） */
+  notices: string[];
+  diag: string;
+}
+
+/** 「依赖工具」行：为空则整行不写（§6.2）—— 不写「零工具」 */
+function depsLine(s: SkillBlock): string {
+  return s.toolVisibleNames.length === 0 ? "" : `依赖工具：${s.toolVisibleNames.join("、")}`;
+}
+
+/**
+ * 装配本次请求的**多技能**内容（升级版主路径）。
+ *
+ * 三条件：已开启（SKILLON__）∧ 扫描状态 ok ∧ 必须工具全部可用。
+ *   「场景是否匹配」不在这里判定：由模型读 L1 的「使用时机」决定（§3.3）。
+ *
+ * ⚠️ 顺序不能乱：① 回填 unavailable → ② 算 usable → ③ 建技能块 → ④ buildL0(…, true)。
+ *    若把 buildL0 提前，过滤读到的还是上一轮的旧值。
+ */
+export function assembleForRequestMulti(deps: AssembleDeps = REAL_DEPS): MultiAssembly {
+  const reg = deps.getRegistry();
+
+  // ① 先把可用性回填到内存记录（不落盘、不改 status）
+  for (const rec of reg.skills.values()) {
+    rec.unavailable = rec.status === "ok" ? checkRequiredTools(rec.tools) : [];
+  }
+
+  // ② 三条件（「场景可匹配」不在此判定，由模型读 L1 决定 —— §3.3）
+  const all = [...reg.skills.values()];
+  const usable = all
+    .filter((r) => r.status === "ok" && deps.isToggleOn(r.toggleKey) && (r.unavailable ?? []).length === 0)
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.dir < b.dir ? -1 : 1));
+
+  // ③ 技能块：L1 只受 L1_MAX 保护（多技能传 totalMax: null，避免 L1 被 L2 挤出预算）
+  const skills: SkillBlock[] = usable.map((r) => {
+    const { l1, l2 } = layer(r.sections);
+    const b = applyBudget(l1, l2, { totalMax: null });
+    if (b.l1Text.length >= L1_MAX) {
+      console.warn(`⚠️  [skill] ${r.dir} 的 L1 达到/超过 ${L1_MAX} 字上限，已整段截断（建议精简「目标 / 使用时机」）`);
+    }
+    return {
+      dir: r.dir,
+      name: r.name,
+      title: r.title,
+      l1: b.l1Text,
+      l1Truncated: b.l1Text.length >= L1_MAX,
+      l2Chars: b.l2Text.length,
+      mustTools: r.tools,
+      toolVisibleNames: r.tools.map((c) => reg.tools.get(c)?.visibleName ?? c),
+    };
+  });
+
+  // ④ L0（已回填，可用性过滤生效）
+  const l0 = buildL0(reg, deps, true);
+
+  // ⑤ notices：已开启但不可用 / 已开启但挂起（未开启的不提示 —— 用户本来就没开）
+  const notices: string[] = [];
+  for (const r of all) {
+    if (!deps.isToggleOn(r.toggleKey)) continue;
+    if (r.status !== "ok") {
+      notices.push(`技能「${r.dir}」已挂起（${r.suspend?.code ?? "声明不合法"}），本次未参与装配；原因见配置页`);
+      continue;
+    }
+    if ((r.unavailable ?? []).length > 0) {
+      const miss = r.unavailable.map((u) => `${u.call}（${u.detail}）`).join("；");
+      notices.push(`技能「${r.dir}」未参与装配：必须工具不可用 —— ${miss}`);
+    }
+  }
+
+  // ⑥ systemText：先 L0 引导（两句：一句清单引导 + 一句「先取 L2 再执行」），再按技能名字典序逐个技能块
+  const parts: string[] = [];
+  const l0Text = l0TextOf(l0, true);
+  if (l0Text !== "") parts.push(l0Text);
+  for (const s of skills) {
+    parts.push([`### 技能：${s.title}（${s.dir}）`, s.l1, depsLine(s)].filter((x) => x !== "").join("\n\n"));
+  }
+  const systemText = parts.join("\n\n");
+
+  // ⑦ L1 合计告警（只告警、不截断 —— 风险 5）
+  const totalL1 = skills.reduce((n, s) => n + s.l1.length, 0);
+  if (totalL1 > L1_TOTAL_WARN) {
+    console.warn(
+      `⚠️  [skill] 已开启技能 L1 合计 ${totalL1} 字（阈值 ${L1_TOTAL_WARN}），system 偏长，建议精简技能`,
+    );
+  }
+
+  return {
+    skills,
+    skillNames: skills.map((s) => s.name),
+    l0,
+    systemText,
+    notices,
+    diag: `参与 ${skills.length}/${all.length}｜L1 合计=${totalL1}`,
   };
 }
 

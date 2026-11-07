@@ -21,6 +21,9 @@ import {
   parseFrontmatter, type FrontmatterCode, type SkillSettingDefLike,
 } from "./frontmatter";
 import { missingSections, splitSections, type Section } from "./markdown";
+// ⚠️ 必须是 **import type**（类型导入编译期擦除）：availability.ts 反过来引 @/tools/scan，
+//    用值导入会形成 scan ⇄ availability 的运行期环（升级版 R5）。
+import type { UnavailableTool } from "./availability";
 import {
   MAX_SKILL_DEPTH, SKILL_FILE, SKILLS_ROOT,
   isSkillManagedKey, skillSettingKey, skillToggleKey,
@@ -88,8 +91,17 @@ export interface SkillRecord {
   toggleKey: string;
   title: string;
   summary: string;
-  /** 已归一为 callName（点号）；空数组 = 不收紧白名单（§7.3 第 3 条） */
+  /**
+   * 已归一为 callName（点号）。
+   * ⚠️ [升级版 §5.4 / §7.2] 语义变更：**必须工具清单**（缺一即整个技能不参与装配）；
+   *    空数组 = 不依赖任何工具（恒可用）。
+   */
   tools: string[];
+  /**
+   * [升级版 §3.3] 装配期回填：必须工具中当前不可用的那些。
+   * 扫描期恒为 undefined（扫描层不判开关，只认「名字是否注册」）。
+   */
+  unavailable?: UnavailableTool[];
   settings: Map<string, SettingDef>;
   sections: Section[];
   status: "ok" | "suspended";
@@ -347,6 +359,8 @@ export function scanSkillsOnce(fingerprint: string, files: Stamp[]): SkillRegist
       title: "",
       summary: "",
       tools: [],
+      // 扫描层不判工具开关：这里显式复位，避免重扫后残留上一轮装配期回填的旧值
+      unavailable: undefined,
       settings: new Map(),
       sections: [],
       status: "ok",

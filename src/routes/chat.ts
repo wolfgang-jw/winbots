@@ -80,10 +80,8 @@ import { Hono } from "hono";
 import { env } from "@/infra/env";
 // [T-HOT / §4.1] 工具注册表不再有「一次性加载」入口，改为「指纹校验 + 可重入扫描」的门面
 import { ensureToolRegistry, getToolDefinitions, executeTool, toDisplayName } from "@/tools";
-// [skill / §8.3] skill 子系统：指纹校验 + 请求边界装配 + 工具白名单 + 名称口径
-import {
-    ensureSkillRegistry, assembleForRequest, applyToolWhitelist, SKILL_NAME_PATTERN,
-} from "@/skills";
+// [skill / 升级 §3.1、§3.2] skill 子系统：指纹校验 + 多技能装配（不再收窄工具面）
+import { ensureSkillRegistry, assembleForRequestMulti } from "@/skills";
 import {
     generateSessionId,
     isValidSessionId,
@@ -427,16 +425,9 @@ router.post("/stream", async (c) => {
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
         const { messages, sessionId, message, requestId } = body;
-        // [skill / C-5] 激活项是**请求级入参**：body.skill 优先，其次 X-Skill 头。
-        //   不落 .env、不做自动匹配（C-4）—— 「切换只影响下一轮」因此结构上不可能被违反。
-        //   形状校验用 @/skills 的 SKILL_NAME_PATTERN（与路由 / 注册表同一份口径）。
-        const skillParam: string | null = (() => {
-            const raw = typeof body?.skill === "string" && body.skill.trim() !== ""
-                ? body.skill.trim()
-                : (c.req.header("X-Skill") ?? "").trim();
-            if (raw === "") return null;
-            return SKILL_NAME_PATTERN.test(raw) ? raw : null;
-        })();
+        // ✅ [skill / 升级 §3.1] 请求级技能入参已删除：技能面完全由配置页开关（SKILLON__*）决定。
+        //    旧字段 body.skill / X-Skill 直接忽略（**不报 400**：老前端在灰度期仍可能发，
+        //    静默忽略比 400 更稳，且它们本来就只是「本轮激活」的残留）。
 
         // [Sprint 5.1 / US-LOG-3] 采集请求侧时间（旁路，仅开关开启时有效）
         const logStartedAt = Date.now();
@@ -540,22 +531,17 @@ router.post("/stream", async (c) => {
         };
 
         // 工具定义快照（每次请求实时取，见 T-01）
-        // [skill / §8.3] 先装配 skill（纯内存计算）。
-        //   ⚠️ 必须在这里算一次、后续整个请求复用（同一请求内不可切换 skill，C-5）。
-        const skillAssembly = assembleForRequest(skillParam);
-        // [skill / §7.3、N-SK-8] 白名单只在这里生效：
-        //   · 未激活 skill（skillName === null）→ tools 为空 → 不收窄（AC-10）；
-        //   · 激活了 skill → 只能收窄，不会放大（交集语义）。
-        const wl = applyToolWhitelist(getToolDefinitions(), skillAssembly.tools);
-        const toolDefs = wl.list;
-        if (skillAssembly.skillName) {
-            // §11「来源标识」的服务端依据：一行日志就能对上「这轮用了哪个 skill」
+        // [skill / 升级版 §3.2] 装配在**请求边界**算一次、全请求复用；技能不再收窄工具面。
+        // ✅ [skill / 升级 §1、§3.5] 工具面 = 全部可用工具 ∪ 元工具，**与开了哪些技能无关**；
+        //    getToolDefinitions() 内部已按「祖先目录 AND 组开关 AND 工具自身条件」过滤，并已追加元工具。
+        const toolDefs = getToolDefinitions();
+        // ✅ [skill / 升级 §3.2] 多技能装配：仍是请求边界算一次、全请求复用（同一请求内不切换）。
+        const skillAssembly = assembleForRequestMulti();
+        if (skillAssembly.skills.length > 0 || skillAssembly.notices.length > 0) {
             console.log(
-                `🧩 [skill] 本轮激活 ${skillAssembly.skillName}｜` +
-                `L1=${skillAssembly.l1.length} 字｜L2=${skillAssembly.l2.length} 字｜` +
-                `截断=${skillAssembly.truncated ? "是" : "否"}｜` +
-                `可见工具=${toolDefs.length} 个（声明 ${skillAssembly.tools.length}，` +
-                `不可用 ${wl.dropped.length}，自身条件不成立 ${wl.selfDisabled.length}）`,
+                `🧩 [skill] 本轮装配技能 ${skillAssembly.skills.length} 个` +
+                `（${skillAssembly.skillNames.join("、")}）｜${skillAssembly.diag}｜` +
+                `可见工具=${toolDefs.length} 个`,
             );
         }
         // [T-VIS / §8.7] 工具可见性日志已下沉到 getToolDefinitions()：它按「祖先目录 / 组开关 /
@@ -635,9 +621,9 @@ router.post("/stream", async (c) => {
                                 return out;
                             }
                         );
-                        // [skill / §4.3、§6.4、C-3] 三层统一用 role:"system"，只插**一次**（在 while 之前）：
-                        //   · 只放本次激活 skill 的 L1/L2（已在 assemble 里按预算截断）；
-                        //   · 循环体（含 buildBody）一行不改：它读的 workingMessages 已带 system。
+                        // [skill / 升级 §3.6] 注入内容换成多技能装配的 systemText；**位置不动**（仍在 while 外、只插一次，C-3）。
+                        //   · 只放已开启技能的 L1（已在 assemble 里按 L1_MAX 截断）；L2 不进 system，由元工具按需取；
+                        //   · 全关时 systemText === ""，与升级前一致（无 system、无 notice）。
                         //   ⚠️ 不要写进 while 里，否则每轮工具往返都会再插一条（C-3）。
                         //   ⚠️ 只注入内存，**不落库**（见 §6.2.8）。
                         if (skillAssembly.systemText !== "") {
@@ -646,11 +632,9 @@ router.post("/stream", async (c) => {
                                 ...workingMessages,
                             ];
                         }
-                        // [skill / C-33] 请求了激活但没能生效（未开启 / 挂起 / 名字错）→ 明确告知，
-                        //   否则用户点了「本轮激活」却看不到任何变化，只会以为功能坏了。
-                        //   ⚠️ 复用既有 notice 事件类型，不新增事件契约（B-05）。
-                        if (skillAssembly.skipReason) {
-                            send({ type: "notice", message: `🧩 ${skillAssembly.skipReason}` });
+                        // ✅ 不可用 / 挂起：逐条下发（§3.6「改为遍历复数」）；复用既有 notice 类型，不新增事件契约
+                        for (const n of skillAssembly.notices) {
+                            send({ type: "notice", message: `🧩 ${n}` });
                         }
                         // [A-03] 工具轮次的唯一判据：本轮流式聚合出的 tool_calls。
                         //   首轮必然为空 —— 探测请求已删除（A-02/A-04）。
@@ -796,9 +780,9 @@ router.post("/stream", async (c) => {
                                 const toolResult = await executeTool(wireName, args, {
                                     signal: upstreamController.signal,
                                     sessionId: useServerHistory ? (sessionId as string) : undefined,
-                                    // [skill / §7.5、C-10] 来源标识：只有**本轮确实由某个 skill 装配**时才带，
-                                    //   审批弹窗与审计日志据此显示「此命令来自 skill X」。无 skill 时保持 undefined。
-                                    skill: skillAssembly.skillName ?? undefined,
+                                    // ✅ [升级 §5.2] 来源标识改为数组：本轮参与装配的全部技能。
+                                    //    ⚠️ 仅展示与审计，**不参与任何权限判定**（N-SK-12 不变）。
+                                    skills: skillAssembly.skillNames.length > 0 ? skillAssembly.skillNames : undefined,
                                 });
 
                                 // 推送「工具结果」事件
@@ -854,9 +838,10 @@ router.post("/stream", async (c) => {
                             reason: hitMaxRounds ? "max_tool_rounds" : (finalFinishReason || "stop"),
                             usage: finalUsage,
                             raw: finalRaw || {},
-                            // [skill / §11] 来源标识：只在本轮真的装配了 skill 时才带该字段，
-                            //   不带时前端行为与改造前逐字一致（AC-14）
-                            ...(skillAssembly.skillName ? { skill: skillAssembly.skillName } : {}),
+                            // ✅ [升级 §5.1] skill 改为**数组**：本轮参与装配的全部技能；无技能时为 []（不再是「不带该字段」）。
+                            //    兼容期额外给 skillName（首个技能名），老前端改完 §7 后可删。
+                            skill: skillAssembly.skillNames,
+                            skillName: skillAssembly.skillNames[0] ?? null,
                         });
 
                         // [Sprint 5.2 / US-STAB-3] 达上限截断：追加 notice 事件显式告知用户

@@ -83,3 +83,9 @@ export function skillSettingKey(dir: string, name: string): string {
 export function isSkillManagedKey(key: string): boolean {
   return key.startsWith(`${TOGGLE_NS}__`) || key.startsWith(`${SETTING_NS}__`);
 }
+
+/**
+ * [升级版 风险 5] 已开启技能 L1 合计告警阈值（只告警，不截断）。
+ * 多技能装配时 L1 每轮都进 system；超过该值说明技能数 / 技能篇幅需要运营侧收敛。
+ */
+export const L1_TOTAL_WARN = 8000;

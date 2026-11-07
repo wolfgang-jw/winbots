@@ -205,10 +205,9 @@ export function createRunTool(deps: Partial<RunDeps> = {}): Tool {
                             permission,
                             destructiveHint: notices.destructiveHint,
                             allowAllOption: notices.allowAllOption,
-                            // [skill / §7.5、C-23] 审批弹窗「来源技能」标注的唯一数据来源：
-                            //   由 chat.ts 经 ToolContext 一路透传；无 skill 时为 undefined（不渲染该行）。
+                            // [skill / 升级 §5.2] 审批弹窗「来源技能」标注的唯一数据来源：数组，无技能时 undefined。
                             //   ⚠️ 仅展示与审计，不参与任何判定（N-SK-12）。
-                            skill: ctx?.skill,
+                            skills: ctx?.skills,
                         },
                         // 等待上限由平台侧统一钳制（approvalWaitMs），避免两处各自取配置产生漂移（SH-46）
                         { waitMs: approvalWaitMs(), signal: ctx?.signal },

@@ -37,7 +37,11 @@ export interface SkillFrontmatter {
   name: string;
   title: string;
   summary: string;
-  /** 已归一为 callName（点号）；空数组 = 不收窄白名单（§7.3 第 3 条） */
+  /**
+   * 已归一为 callName（点号）。
+   * ⚠️ [升级版 §5.4 / §7.2] 语义变更：**必须工具清单**（缺一即整个技能不参与装配）；
+   *    空数组 = 不依赖任何工具。
+   */
   tools: string[];
   settings: Record<string, SkillSettingDefLike>;
   version?: number;

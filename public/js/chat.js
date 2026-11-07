@@ -131,8 +131,8 @@
         currentToolEl: null,
         /** @type {string} [US-3.6] 本次回答的模型名（暂存） */
         currentModel: "",
-        /** @type {string} [skill / §11] 本次回答由哪个 skill 装配（无则空串） */
-        currentSkill: "",
+        /** @type {string[]} [skill / 升级 §5.1] 本次回答由哪些 skill 装配（数组；无则空数组） */
+        currentSkills: [],
         /** @type {boolean} [US-3.7] 本次回答是否已收尾（幂等标记） */
         completed: false,
         /** @type {number} 本次回答开始时间（performance.now()） */
@@ -223,11 +223,6 @@
      * 获取当前时间字符串
      * @returns {string}
      */
-    /** [skill / C-5] 本轮激活的技能 dir（sessionStorage，不落 .env）；空串 = 不激活 */
-    function getActiveSkill() {
-        try { return sessionStorage.getItem("winbots.activeSkill") || ""; } catch { return ""; }
-    }
-
     function getTimeStr() {
         return new Date().toLocaleTimeString("zh-CN");
     }
@@ -279,8 +274,10 @@
         const summary = document.createElement("div");
         summary.className = "message__info-summary";
         // [US-3.6] 中断态：显示"已中断"标识 + token 记 0；正常态：保持原样。
-        // [skill / §11] 有值才拼；无 skill 时字符串与改造前逐字一致（AC-14）
-        const skillPart = info.skill ? ` · 🧩 技能：${escapeHtml(info.skill)}` : "";
+        // [skill / 升级 §5.1] 来源技能改为数组：逐项 escape 再 join（不要先 join 再整体 escape，否则分隔符会被转义错）
+        const skillPart = Array.isArray(info.skills) && info.skills.length > 0
+            ? ` · 🧩 技能：${info.skills.map((s) => escapeHtml(s)).join("、")}`
+            : "";
         if (info.interrupted) {
             summary.innerHTML =
                 `<span class="message__info-icon">⏹️</span> 已中断`
@@ -351,7 +348,7 @@
             usage: zeroUsage,
             raw: { interrupted: true, usage: zeroUsage },
             interrupted: true,   // [US-3.6] 中断标记：renderInfoBar 据此显示"已中断"
-            skill: state.currentSkill,   // [skill / §11] 中断态同样要显示来源
+            skills: state.currentSkills,   // [skill / 升级 §5.1] 中断态同样显示来源（数组）
         });
 
         return state.currentInfoEl;
@@ -1167,8 +1164,8 @@
                     sessionId: state.sessionId,
                     message,
                     requestId: state.currentRequestId,
-                    // [skill / C-5] 激活项走请求级入参（不落 .env）；空串 = 不激活任何 skill
-                    skill: getActiveSkill(),
+                    // ✅ [skill / 升级 §3.1] 请求级技能入参已删除：技能面完全由配置页开关决定，
+                    //    服务端也不再读 body.skill / X-Skill。
                 }),
                 signal,
             });
@@ -1230,7 +1227,9 @@
                             case "finish":
                                 // [skill / §11] 记录来源技能：必须在 finalizeOnce 之前赋值（它立刻渲染信息栏），
                                 //   也必须在 state.draining 判断之前（排空路径同样要显示来源）。
-                                state.currentSkill = data.skill || "";
+                                state.currentSkills = Array.isArray(data.skill)
+                                    ? data.skill.filter((s) => typeof s === "string")
+                                    : (typeof data.skill === "string" && data.skill ? [data.skill] : []);
                                 // [US-3.2] 排空态下：用户已打断，本次回答不应按"正常完成"处理。
                                 if (state.draining) {
                                     finishStream();
@@ -1439,12 +1438,10 @@
             state.currentInfoEl = null;
             state.currentStartTime = 0;
             state.currentAssistantContent = "";   // [US-3.5] 一并复位累积缓冲
-            state.currentModel = "";
-        state.currentModel = "";              // [US-3.6] 复位本次回答模型名
-        // [C-31] ⚠️ 此处**不得**复位 state.currentSkill：
-        //   finish 事件的处理顺序是「set currentSkill → finalizeOnce() → finishStream() → 渲染信息栏」，
-        //   若在这里清空，随后渲染信息栏时读到空串，「🧩 技能：X」永远不会显示（实测就是这个 bug）。
-        //   来源技能由「新一轮开始」(sendMessage 开头) 复位，生命周期刚好覆盖整轮渲染。
+            state.currentModel = "";              // [US-3.6] 复位本次回答模型名
+        // [C-31] 此处不得复位 state.currentSkills：finish 的处理顺序是
+        //   「set currentSkills → finalizeOnce() → finishStream() → 渲染信息栏」，
+        //   在这里清空会让「🧩 技能」永远不显示。复位放在新一轮开始时（sendMessage 开头）。
             state.completed = false;              // [US-3.7] 兜底复位收尾标记
 
             clearDrainTimeout();
@@ -1501,7 +1498,7 @@
         state.currentStartTime = 0;
         state.currentAssistantContent = "";   // [US-3.5] 一并复位累积缓冲
         state.currentModel = "";              // [US-3.6] 复位本次回答模型名
-        state.currentSkill = "";              // [skill / §11] 复位来源技能（防上一轮串到本轮）
+        state.currentSkills = [];              // [skill / 升级 §5.1] 复位来源技能（防上一轮串到本轮）
         state.completed = false;              // [US-3.7] 新一轮复位收尾标记
 
         setStopBtnVisible(true);          // [US-3.1] 显示「停止」入口
@@ -1637,7 +1634,7 @@
         state.currentStartTime = 0;
         state.currentAssistantContent = "";
         state.currentModel = "";
-        state.currentSkill = "";
+        state.currentSkills = [];
         state.completed = false;
 
         // 5. 分配全新会话 ID（D1 绕过缓存）：直接调服务端分配接口，
@@ -1853,8 +1850,7 @@
         skillWarnings: [],
         /** @type {string} 技能扫描版本（仅展示与排查；PUT 只校验工具的 scanVersion） */
         skillScanVersion: "",
-        /** @type {string} 本轮激活的技能 dir（**不落 .env**，存 sessionStorage，C-5） */
-        activeSkill: "",
+        // ✅ [skill / 升级 §3.1] 已删除 activeSkill（「本轮激活」入口）：技能开关即生效，无请求级激活项。
     };
 
     /** 拉取并渲染配置视图（进入视图 / 保存成功后调用） */
@@ -1875,8 +1871,7 @@
             configState.skillTree = data.skillTree || [];
             configState.skillWarnings = data.skillWarnings || [];
             configState.skillScanVersion = data.skillScanVersion || "";
-            // 激活项从 sessionStorage 恢复（它不落 .env，刷新页面后仍需保持用户选择）
-            try { configState.activeSkill = sessionStorage.getItem("winbots.activeSkill") || ""; } catch { /* 忽略 */ }
+            // ✅ [skill / 升级 §3.1] 不再从 sessionStorage 恢复「本轮激活」（该入口已删除）。
             // 重新拉取后，先前待提交的工具变更全部作废（服务端已是权威状态）
             configState.dirToggles = {};
             configState.groupToggles = {};
@@ -2642,7 +2637,9 @@
             ? `<div class="tool-node__warn">怎么改：${escapeHtml(node.hint)}</div>` : "";
         const extraLine = (node.extraFiles || []).length > 0
             ? `<div class="tool-node__warn">目录内多余文件（已忽略）：${escapeHtml(node.extraFiles.join("、"))}</div>` : "";
-        const active = configState.activeSkill === node.dir;
+        // ✅ [skill / 升级 §3.3] 必须工具当前不可用 → 明确告知（否则用户以为「开了就生效」）
+        const unavailLine = (!suspended && node.unavailableHint)
+            ? `<div class="tool-node__warn">未参与装配：${escapeHtml(node.unavailableHint)}</div>` : "";
 
         return `
           <div class="tool-node tool-node--skill${suspended ? " tool-node--disabled" : ""}"
@@ -2654,13 +2651,10 @@
               <code class="tool-node__id">${escapeHtml(node.dir)}</code>
               <span class="tool-node__badges">${badge}</span>
               <button type="button" class="config-btn config-btn--inline" data-skill-preview="${escapeHtml(node.dir)}">预览</button>
-              ${suspended ? "" : `<label class="config-item__desc">
-                  <input type="radio" name="active-skill" value="${escapeHtml(node.dir)}"${active ? " checked" : ""}>
-                  本轮激活
-              </label>`}
             </div>
             <div class="config-item__desc">${escapeHtml(node.summary || "")}</div>
             ${hintLine}
+            ${unavailLine}
             ${extraLine}
             <div class="config-item__error" data-skill-error="${escapeHtml(node.dir)}" hidden></div>
           </div>`;
@@ -2673,7 +2667,7 @@
         const warns = configState.skillWarnings || [];
         const head = `
           <h3 class="config-section__title">
-            技能配置（默认关闭；开启后还要勾选「本轮激活」才生效）
+            技能配置（默认关闭；开启后<b>立即对下一次请求生效</b>，无需额外激活；多个技能可同时开启）
           </h3>`;
         const warnBlock = warns.length > 0
             ? `<div class="tool-node__warn">${warns.map((w) => escapeHtml(w)).join("<br>")}</div>` : "";
@@ -2687,7 +2681,7 @@
         }
         return `<section class="config-section" id="config-skill-section">${head}
           <div class="config-item__desc">
-            共 ${skillCount} 个技能。开关默认关闭；切换后<b>下一次请求</b>生效（当前回复不受影响）。
+            共 ${skillCount} 个技能。开关默认关闭；切换后<b>下一次请求</b>生效（当前回复不受影响），可同时开启多个。
             技能只能通过已注册工具做事，涉及写文件 / 执行命令 / 联网的调用一律走审批。
           </div>
           ${warnBlock}
@@ -2696,7 +2690,7 @@
         </section>`;
     }
 
-    /** 绑定技能区交互：开关 / 激活单选 / 预览 */
+    /** 绑定技能区交互：开关 / 预览（「本轮激活」单选已随 §3.1 删除） */
     function bindSkillTreeEvents(box) {
         // ① 开关：只改草稿，保存时统一提交（与工具开关同一心智模型）
         box.querySelectorAll("[data-skill-toggle]").forEach((el) => {
@@ -2723,19 +2717,7 @@
             });
         });
 
-        // ② 激活项：单选，同一时刻只有一个；写 sessionStorage（不落 .env，C-5）
-        box.querySelectorAll('input[name="active-skill"]').forEach((el) => {
-            el.addEventListener("change", () => {
-                if (!el.checked) return;
-                configState.activeSkill = el.value;
-                try { sessionStorage.setItem("winbots.activeSkill", el.value); } catch { /* 忽略 */ }
-                // §11：切换必须提示「下一轮生效」，不得暗示立即改变当前回复
-                //   ⚠️ 激活项**不进 .env** → 不要触碰 setConfigDirty：
-                //      否则会把用户刚改的系统项 / 工具开关一并标成「无未保存更改」，保存按钮变灰。
-                const out = document.getElementById("config-result");
-                if (out) out.textContent = `✅ 已把「${el.value}」设为本轮激活技能：下一次请求生效（当前回复不受影响）。`;
-            });
-        });
+        // ✅ [skill / 升级 §3.1] 「本轮激活」单选已删除：技能开关即生效，没有请求级激活项。
 
         // ③ 预览：独立只读接口（§12.5 要求服务端实际拼装后的文本）
         box.querySelectorAll("[data-skill-preview]").forEach((btn) => {
@@ -2788,20 +2770,27 @@
 
         if (data) {
             addBlock("L0（配置页列表里的一句话）", data.l0);
-            addBlock("L1（## 目标 / ## 使用时机 → 注入 system）", data.l1);
-            addBlock("L2（## 方法 / ## 输出格式 / ## 自检 等 → 注入 system）", data.l2);
-            addBlock("最终工具白名单（模型实际能看到的）",
-                (data.tools || []).join("\n") || "（未收窄：给全量）");
-            if (data.toolsDropped && data.toolsDropped.length > 0) {
-                addBlock("被过滤掉的声明（注册表里没有：组被关 / 组挂起 / 名字写错）",
-                    data.toolsDropped.join("\n"));
-            }
-            /* [C-30] 声明了、注册表里也有，但被工具自身 enabled() 挡掉（典型：permission=forbid）。
-               必须与 toolsDropped 分开显示，否则用户会误以为「我写了三个工具，怎么只生效两个」。 */
-            if (data.toolsSelfDisabled && data.toolsSelfDisabled.length > 0) {
-                addBlock("声明了但工具自身条件不成立（如 permission=forbid，需先放开工具权限）",
-                    data.toolsSelfDisabled.join("\n"));
-            }
+            addBlock("L1（## 目标 / ## 使用时机 → 按需注入 system）", data.l1);
+            addBlock("L2（## 方法 / ## 输出格式 / ## 自检 等 → 模型调用 skill__get_l2 时取回）", data.l2);
+            /* ✅ [升级版 §3.5] 两栏必须分开，语义完全不同：
+               · tools        = 本技能 frontmatter **真正声明**的必须工具（可为空 → 不依赖任何工具）
+               · visibleTools = 模型**实际可见**的工具（全量 ∪ 元工具，与开了哪些技能无关）
+               ⚠️ 早期实现把 visibleTools 塞进 tools 栏：技能没声明工具时（如 hello）
+                  会显示全部 20 个工具，被误读成「本技能声明了这 20 个」，与事实相反。 */
+            const req = data.tools || [];
+            const reqText = req.length === 0
+                ? "（该技能未声明必须工具：不依赖任何工具，装配时不校验工具可用性）"
+                : req.map((t) => {
+                    const name = t.visibleName ? `${t.call}  →  ${t.visibleName}` : t.call;
+                    return t.available
+                        ? `✅ ${name}`
+                        : `❌ ${name}\n   ${t.detail || "当前不可用"}`;
+                }).join("\n");
+            addBlock("本技能声明的必须工具（frontmatter tools：不可用只告警、不影响装配）", reqText);
+
+            /* 模型实际可见工具：全量清单，与技能无关 —— 单列一栏，避免与「必须工具」混淆 */
+            addBlock("模型实际可见工具（= 全部可用工具 ∪ 元工具 skill__get_l2，不受技能限制）",
+                (data.visibleTools || []).join("\n") || "（当前没有任何可用工具）");
             if (data.truncated) {
                 const w = document.createElement("div");
                 w.className = "skill-preview__warn";

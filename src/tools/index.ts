@@ -34,6 +34,10 @@ import { MAX_TOOL_ENTRIES } from "./paths";
 import { ensureRegistry, getRegistry, type Registry } from "./scan";
 import { groupState, refreshManagedValues } from "@/infra/settings";
 import { runLegacyMigration } from "@/infra/migrate";
+// [skill / 升级 §3.4] 元工具 skill__get_l2：代码内置、配置页看不见、开关关不掉。
+//   ⚠️ 环依赖（R5）：skills/l2tool.ts 对本文件**只**有 `import type { Tool }`，
+//      本文件对它是唯一的**值**导入方向，因此不成环。改动任一侧前先看 l2tool.ts 头注释。
+import { l2Tool, L2_TOOL_VISIBLE_NAME, L2_TOOL_DESCRIPTION } from "@/skills/l2tool";
 
 /**
  * [需求域 T / T-03] 工具处理函数的可选上下文。
@@ -47,11 +51,11 @@ export interface ToolContext {
     /** [T-03] 会话标识：供需要「会话内暂存」的工具定位（如联网抓取的偏移续读，R-30） */
     sessionId?: string;
     /**
-     * [skill / §7.5、C-10] 本轮对话由哪个 skill 装配（skill 名，如 "log_triage"）。
-     * 只用于**展示与审计**：审批弹窗显示「此命令来自 skill X」，审计日志多一个来源字段。
+     * [skill / 升级 §5.2] 本轮参与装配的技能名数组（如 ["log_triage"]）；无技能时缺省。
+     * 只用于**展示与审计**：审批弹窗「来源技能」、审计日志来源字段。
      * ⚠️ 不得据此放宽任何判定（N-SK-12：skill 没有免审批路径）。
      */
-    skill?: string;
+    skills?: string[];
 }
 
 /** 工具契约：etc/ 下每个工具文件导出的单个工具结构 */
@@ -95,6 +99,9 @@ export interface ToolDef {
 /**
  * 组装「本次请求的模型可见工具清单」（规范 §8.3 / §8.5 / §8.7）。
  * 调用方（chat.ts）在**请求边界**调用一次，后续工具轮次复用同一份（§8.5 快照粒度）。
+ *
+ * [skill / 升级 §3.5] 清单与「开了哪些技能」**无关**：技能不再收窄工具面，
+ *   末尾额外追加 1 条元工具 skill__get_l2（不计入 MAX_TOOL_ENTRIES）。
  */
 export function getToolDefinitions(): ToolDef[] {
     const reg = getRegistry();
@@ -141,6 +148,21 @@ export function getToolDefinitions(): ToolDef[] {
         list = list.slice(0, MAX_TOOL_ENTRIES);
         console.warn(`⚠️  [T-VIS] 可见工具超过上限 ${MAX_TOOL_ENTRIES} 条，已按可见名字典序截掉 ${dropped} 条`);
     }
+    const userToolCount = list.length;
+
+    // ✅ [skill / 升级 §3.4] 元工具在**截断之后**追加。
+    //    顺序颠倒 → 条目满时元工具被截掉 → L2 加载直接失效（本次最容易漏的一处）。
+    //    它不计入 MAX_TOOL_ENTRIES：平台能力，不是用户可配工具。
+    //    每次调用都新建 list，因此不存在「多次调用重复追加」的累积问题。
+    const metaDef: ToolDef = {
+        type: "function",
+        function: {
+            name: L2_TOOL_VISIBLE_NAME,
+            description: L2_TOOL_DESCRIPTION,
+            parameters: l2Tool.parameters,
+        },
+    };
+    list = [...list, metaDef];
 
     // §8.7 一行可诊断日志：可见数量 + 被排除的组与原因（三种原因互相可区分）；不含任何取值
     const detail = excluded.length === 0
@@ -149,7 +171,10 @@ export function getToolDefinitions(): ToolDef[] {
     const selfOff = selfDisabled.length === 0
         ? ""
         : `｜组可用但工具自身条件不成立：${selfDisabled.join("、")}`;
-    console.log(`🧰 [T-VIS] 模型可见工具 ${list.length} 个｜排除 ${excluded.length} 组：${detail}${selfOff}`);
+    console.log(
+        `🧰 [T-VIS] 模型可见工具 ${list.length} 个（用户工具 ${userToolCount} + 元工具 1）` +
+        `｜排除 ${excluded.length} 组：${detail}${selfOff}`,
+    );
 
     return list;
 }
@@ -214,6 +239,25 @@ export async function executeTool(
     args: Record<string, unknown>,
     ctx?: ToolContext,
 ): Promise<string> {
+    // ✅ [skill / 升级 §3.4] 元工具：代码内置、无工具组、不受组开关与门禁约束。
+    //    ⚠️ 必须放在 getRegistry() / 名称解析之前（它不在注册表里，查表会得到 tool_not_found）。
+    //    ⚠️ 结果仍走 capToolResult：长度兜底是 executeTool 的统一职责（T-06「不动」）。
+    if (rawName === L2_TOOL_VISIBLE_NAME || rawName === L2_TOOL_CALL_NAME) {
+        if (ctx?.signal?.aborted) {
+            return toolError("cancelled", "已取消：本次工具未执行。");
+        }
+        try {
+            const out = await l2Tool.handler(args ?? {}, ctx);
+            return capToolResult(
+                typeof out === "string" ? out : JSON.stringify(out),
+                env.TOOL_RESULT_MAX_CHARS,
+            );
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return JSON.stringify({ error: `工具执行失败: ${msg}` });
+        }
+    }
+
     const reg = getRegistry();
 
     // ① 名称解析：wireName（local__shell__run）与 callName（local.shell.run）都接受。

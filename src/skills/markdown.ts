@@ -127,8 +127,23 @@ export function truncationMarker(original: number, limit: number): string {
  *
  * ⚠️ 标注**不计入**预算（见文件头说明）。
  * ⚠️ 标注只加在 L2 之后，L1 之后不加（否则模型会看到两条重复标注）。
+ *
+ * [升级版 R4] 第三上限（合计）可由 opts.totalMax 覆盖：多技能装配传 null（不设合计上限），
+ *   缺省时仍为 BUDGET_MAX，因此 /preview 与旧装配的输出逐字不变。
  */
-export function applyBudget(l1: Section[], l2: Section[]): BudgetResult {
+export interface BudgetOptions {
+  /**
+   * L1+L2 合计上限；null = 不设合计上限（L1 仍受 L1_MAX、L2 仍受 L2_MAX）。
+   * 缺省（undefined）→ BUDGET_MAX，即**旧行为逐字不变**。
+   *
+   * [升级版 §3.2 / R4] 多技能装配时 L1 要每轮注入 system，若仍走 4500 合计上限，
+   *   L1 会被 L2 挤掉；因此多技能路径传 `null`，单技能预览与旧装配不传。
+   */
+  totalMax?: number | null;
+}
+
+export function applyBudget(l1: Section[], l2: Section[], opts: BudgetOptions = {}): BudgetResult {
+  const totalMax = opts.totalMax === undefined ? BUDGET_MAX : opts.totalMax;
   const original = joinSections([...l1, ...l2]).length;
 
   const keepL1: Section[] = [];
@@ -145,7 +160,7 @@ export function applyBudget(l1: Section[], l2: Section[]): BudgetResult {
   for (const s of l2) {
     const next = l2Len + s.text.length + (keepL2.length > 0 ? 2 : 0);
     if (next > L2_MAX) break;
-    if (l1Len + next > BUDGET_MAX) break;
+    if (totalMax !== null && l1Len + next > totalMax) break;   // ← 只有这一句受 totalMax 影响
     keepL2.push(s);
     l2Len = next;
   }
@@ -156,7 +171,7 @@ export function applyBudget(l1: Section[], l2: Section[]): BudgetResult {
 
   return {
     l1Text: joinSections(keepL1),
-    l2Text: joinSections(keepL2) + (truncated ? truncationMarker(original, BUDGET_MAX) : ""),
+    l2Text: joinSections(keepL2) + (truncated ? truncationMarker(original, totalMax === null ? L2_MAX : totalMax) : ""),
     truncated,
     originalChars: original,
     omitted,

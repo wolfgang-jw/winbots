@@ -42,10 +42,10 @@ export interface PendingApproval {
     allowAllOption: boolean;
     createdAt: number;
     /**
-     * [skill / §7.5、C-23] 本轮命令由哪个 skill 触发（skill 名；无 skill 时缺省）。
+     * [skill / 升级 §5.2] 本轮命令涉及的技能集合（本轮参与装配的全部技能；无技能时缺省）。
      * 仅用于界面「来源技能」标注与审计日志；**不参与任何权限判定**（N-SK-12）。
      */
-    skill?: string;
+    skills?: string[];
 }
 
 export interface ApprovalResult {
@@ -104,7 +104,8 @@ function audit(kind: "approval_request" | "approval_decision", p: PendingApprova
             cwd: p.cwd,
             permission: p.permission,
             noticeVersion: p.noticeVersion,
-            skill: p.skill,
+            // [skill / 升级 §5.2] 来源技能改为数组；审计日志只记一行文本，故在此 join
+            skills: p.skills && p.skills.length > 0 ? p.skills.join("、") : undefined,
             ...extra,
         }),
     );

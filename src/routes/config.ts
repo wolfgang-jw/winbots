@@ -40,7 +40,7 @@ import type { SettingEntry } from "@/tools/scan";
 // [skill / §12.1] 技能注册表：只走门面（§1.2「只 import 门面」），不直连 skills/scan.ts
 import {
   ensureSkillRegistry, getSkillRegistry, listStaleSkillKeys, listSkillDeclaredKeys,
-  skillSettingKey, SKILL_SUSPEND_LABEL,
+  skillSettingKey, SKILL_SUSPEND_LABEL, checkRequiredTools,
   type SkillDirNode, type SkillRecord, type SkillRegistry,
 } from "@/skills";
 
@@ -310,6 +310,10 @@ interface SkillNode {
   settings: SettingView[];
   extraFiles: string[];
   ignored: Array<{ name: string; reason: string }>;
+  /** [升级版 §3.3] 必须工具中当前不可用的 callName 列表（空 = 全部可用） */
+  unavailableTools: string[];
+  /** [升级版 §3.3] 一行「怎么改」提示；无不可用项时为 null */
+  unavailableHint: string | null;
   children: SkillNode[];
 }
 
@@ -322,6 +326,9 @@ function skillSettingsView(rec: SkillRecord, disabled: boolean): SettingView[] {
 function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
   const buildSkill = (rec: SkillRecord): SkillNode => {
     const dis = rec.status === "suspended";
+    // [升级版 §4.4 风险 3] 这里**只读**、不回填：回填留给装配路径（assembleForRequestMulti），
+    //   配置页不能顺手改注册表状态（否则「打开配置页」会改运行时可见性）。
+    const unavail = rec.status === "ok" ? checkRequiredTools(rec.tools) : [];
     return {
       key: rec.toggleKey,
       segment: rec.name,
@@ -336,6 +343,12 @@ function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
       settings: skillSettingsView(rec, dis),
       extraFiles: rec.extraFiles,
       ignored: [],
+      // [升级版 §3.3] 装配期的同一套判定（checkRequiredTools）在此复用：口径一致，
+      //   让「配置页为什么这个技能没生效」与「运行时 notice」说得是同一件事。
+      unavailableTools: unavail.map((u) => u.call),
+      unavailableHint: unavail.length > 0
+        ? `必须工具不可用：${unavail.map((u) => `${u.call}（${u.detail}）`).join("；")}`
+        : null,
       children: [],
     };
   };
@@ -346,7 +359,7 @@ function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
       return {
         key: "", segment: path, dir: path, isSkill: false, on: false, status: "ok",
         reason: null, hint: null, title: "", summary: "", settings: [],
-        extraFiles: [], ignored: [], children: [],
+        extraFiles: [], ignored: [], unavailableTools: [], unavailableHint: null, children: [],
       };
     }
     return {
@@ -363,6 +376,8 @@ function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
       settings: [],
       extraFiles: d.extraFiles,
       ignored: d.ignored,
+      unavailableTools: [],
+      unavailableHint: null,
       children: [
         ...d.children.map(buildDirNode),
         ...d.skills
