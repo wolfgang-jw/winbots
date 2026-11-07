@@ -2,12 +2,16 @@
  * src/skills/l2tool.ts
  * 元工具：按技能名取回其 L2 正文。**代码内置，不进 etc/tools**（升级版 §3.4）。
  *
- * ⚠️ 只读注册表内存：不做 IO、不触发扫描、不执行任何用户内容。
- * ⚠️ 断环（升级版 R5）：本文件**不得** import `@/tools/index`
- *    （`tools/index.ts` 要引本文件的 l2Tool 合并清单，互相值导入即成环）。
- *    因此 `toolError` 在此内联（与 tools/index.ts 的实现逐字一致），类型用 `import type`。
+ * ⚠️ 只读注册表内存：不做 IO、不触发扫描、不执行用户内容。
+ * ⚠️ 断环（升级版 R5）：本文件**不得** import `@/tools/index`——连 `import type` 也不行。
+ *    `tools/index.ts` 要引本文件的 l2Tool 合并清单；Bun 直接运行 .ts 时不保证擦除
+ *    type-only import（tsconfig 又开了 `verbatimModuleSyntax`），一旦保留即成环，
+ *    启动时报 `L2_TOOL_CALL_NAME is not defined`。
+ *    因此：① 工具形状用下方的本地 `L2ToolSpec` 结构化类型（TS 结构化子类型，
+ *    赋给 tools/index.ts 的 `Tool` 无需转换）；② 错误信封用 `l2error`（与
+ *    tools/index.ts 的 `toolError` 形状逐字一致，但**故意不复用其名字**，
+ *    避免 `grep toolError` 时误以为这里导入了它）。
  */
-import type { Tool } from "@/tools/index";
 import { isToggleOn } from "@/infra/settings";
 import { getSkillRegistry, type SkillRecord } from "./scan";
 import { SKILL_NAME_PATTERN } from "./paths";
@@ -25,14 +29,37 @@ export const L2_TOOL_DESCRIPTION =
   "多个技能同时适用时按任务性质择优，一次只取一个。参数 name 用系统提示里列出的技能名或完整目录路径。";
 
 /**
- * 结构化工具错误信封。
- * ⚠️ 与 src/tools/index.ts 的 toolError **逐字一致**；内联是为了断开 tools/index ⇄ skills/l2tool 的环。
+ * 元工具的工具形状（与 `src/tools/index.ts` 的 `Tool` 结构一致）。
+ *
+ * ⚠️ [断环 R5] 这里是**本地结构化声明**，不是从 `@/tools/index` 导入的类型。
+ * 依赖 TS 的结构化子类型：`l2Tool` 将来若被塞进 `Tool` 数组也无需转换（编译期自动兼容）。
+ * 代价：`ToolContext` 若新增字段，本文件**不会**自动跟进——新增字段均为可选，
+ * 本文件只读 `ctx.signal`，因此不影响正确性。
  */
-function toolError(code: string, message: string): string {
+export interface L2ToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  /**
+   * 第二参与 `ToolContext` 保持结构兼容（`signal` 是唯一用到的字段）。
+   * 用结构化声明而非导入类型，正是为了不断环。
+   */
+  handler: (
+    args: Record<string, unknown>,
+    ctx?: { signal?: AbortSignal },
+  ) => Promise<unknown>;
+}
+
+/**
+ * 结构化工具错误信封（元工具专用）。
+ * ⚠️ 形状与 `src/tools/index.ts` 的 `toolError` **逐字一致**（`{ ok:false, error:{ code, message } }`），
+ * 但刻意不复用该函数/同名标识符：l2tool 不许 import tools/index（R5）。
+ */
+function l2error(code: string, message: string): string {
   return JSON.stringify({ ok: false, error: { code, message } });
 }
 
-export const l2Tool: Tool = {
+export const l2Tool: L2ToolSpec = {
   name: L2_TOOL_CALL_NAME,
   description: L2_TOOL_DESCRIPTION,
   parameters: {
@@ -60,9 +87,9 @@ export const l2Tool: Tool = {
  */
 export function resolveL2(rawName: string): string {
   const raw = rawName.trim();
-  if (raw === "") return toolError("invalid_args", "缺少参数 name：请传入技能名或完整目录路径");
+  if (raw === "") return l2error("invalid_args", "缺少参数 name：请传入技能名或完整目录路径");
   if (!SKILL_NAME_PATTERN.test(raw)) {
-    return toolError("invalid_args", `技能名形状不合法：${raw}（应形如 log_triage 或 examples/log_triage）`);
+    return l2error("invalid_args", `技能名形状不合法：${raw}（应形如 log_triage 或 examples/log_triage）`);
   }
 
   const reg = getSkillRegistry();
@@ -70,7 +97,7 @@ export function resolveL2(rawName: string): string {
   if (!rec) {
     const hits = [...reg.skills.values()].filter((r) => r.name === raw);
     if (hits.length > 1) {
-      return toolError(
+      return l2error(
         "ambiguous_skill",
         `技能名「${raw}」存在歧义（${hits.map((h) => h.dir).join("、")}），请改用完整目录路径`,
       );
@@ -78,27 +105,27 @@ export function resolveL2(rawName: string): string {
     rec = hits[0];
   }
   if (!rec) {
-    return toolError(
+    return l2error(
       "unknown_skill",
       `未知技能：${raw}。请使用系统提示「可用技能」里列出的名字，或完整目录路径`,
     );
   }
 
   if (!isToggleOn(rec.toggleKey)) {
-    return toolError(
+    return l2error(
       "skill_disabled",
       `技能「${rec.dir}」未开启（${rec.toggleKey}=false），不返回 L2。请到配置页开启该技能`,
     );
   }
   if (rec.status !== "ok") {
-    return toolError(
+    return l2error(
       "skill_unavailable",
       `技能「${rec.dir}」已挂起（${rec.suspend?.code ?? "声明不合法"}），不返回 L2。原因与改法见配置页`,
     );
   }
   const un = checkRequiredTools(rec.tools);
   if (un.length > 0) {
-    return toolError(
+    return l2error(
       "skill_unavailable",
       `技能「${rec.dir}」依赖的工具不可用，不返回 L2：${un.map((u) => `${u.call}（${u.detail}）`).join("；")}`,
     );

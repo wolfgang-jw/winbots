@@ -35,9 +35,19 @@ import { ensureRegistry, getRegistry, type Registry } from "./scan";
 import { groupState, refreshManagedValues } from "@/infra/settings";
 import { runLegacyMigration } from "@/infra/migrate";
 // [skill / 升级 §3.4] 元工具 skill__get_l2：代码内置、配置页看不见、开关关不掉。
-//   ⚠️ 环依赖（R5）：skills/l2tool.ts 对本文件**只**有 `import type { Tool }`，
-//      本文件对它是唯一的**值**导入方向，因此不成环。改动任一侧前先看 l2tool.ts 头注释。
-import { l2Tool, L2_TOOL_VISIBLE_NAME, L2_TOOL_DESCRIPTION } from "@/skills/l2tool";
+//   ⚠️ 环依赖（R5）：skills/l2tool.ts **不得** import 本文件（连 `import type` 也不行，
+//      Bun 直跑 .ts 不保证擦除 type-only import，会成环并在启动时报
+//      `L2_TOOL_CALL_NAME is not defined`）。本文件对它是唯一的**值**导入方向。
+//      改动任一侧前先看 l2tool.ts 头注释。
+//   ⚠️ 导入清单必须与实际使用对齐：executeTool() 里比较 `L2_TOOL_CALL_NAME`，
+//      漏 import 会在 Bun 直跑（不做类型检查）时报 `L2_TOOL_CALL_NAME is not defined`。
+//      tsc --noEmit 能抓到这类漏，因此合并前务必跑一遍（§9.1）。
+import {
+    l2Tool,
+    L2_TOOL_VISIBLE_NAME,
+    L2_TOOL_CALL_NAME,
+    L2_TOOL_DESCRIPTION,
+} from "@/skills/l2tool";
 
 /**
  * [需求域 T / T-03] 工具处理函数的可选上下文。

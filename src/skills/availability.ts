@@ -9,7 +9,10 @@
  *   · 只用 @/tools/scan 的 getRegistry() 与 @/infra/settings 的 groupState()（与
  *     skills/tools.ts 的判定**同一份口径**），**不引 @/tools/index** ——
  *     否则与 tools/index.ts → @/skills/l2tool 形成环。
- *   · scan.ts 反向引本文件的类型必须用 `import type`（类型导入编译期擦除，不成环）。
+ *   · scan.ts 反向引本文件的类型必须用 `import type`——**这条只在 `skills` 内部成立**：
+ *     scan.ts 与 availability.ts 之间没有值依赖，`import type` 由 tsc 擦除即可。
+ *     ⚠️ 但**跨 `skills ⇄ tools/index` 的环不能靠 `import type` 断**（Bun 直跑 .ts
+ *     不保证擦除，见 l2tool.ts 头注释与升级版文档 §2.1「断环口径」）。
  */
 import { getRegistry, SUSPEND_LABEL } from "@/tools/scan";
 import { groupState } from "@/infra/settings";
