@@ -1,6 +1,6 @@
 .bun/
 .vscode/
 node_modules/
-.env
+env.json
 BotsAI-Portable-v*.zip
 data/

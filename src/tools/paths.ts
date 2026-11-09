@@ -100,6 +100,36 @@ const DIR_SUB_NS = "tools";
 const SKILL_TOGGLE_NS = "SKILLON";
 const SKILL_SETTING_NS = "SKILLSET";
 
+/* ============================================================
+ * 托管键值的持久化文本（迁移文档 4.4 / 第零章 P4）
+ * ============================================================ */
+
+/**
+ * 托管键值的「持久化文本」格式（env.json 的 tools 块只存字符串，见方案 3.1 + 第零章 P4）。
+ *
+ * 为什么集中在这里：写入端（configFile.ts）与读取端（settings.ts 的 formatSettingValue）
+ * 必须对「布尔 / 数组」的写法完全一致，否则会出现「写进去读不出」。
+ *   · 布尔 → "true" / "false"（与 isToggleOn 的 trim().toLowerCase() 比较口径一致）
+ *   · 数组 → JSON 文本（与 settings.ts 的 parseSettingValue string_array 分支一致）
+ *   · 其它 → String(v)
+ */
+export function formatManagedValue(v: string | number | boolean | readonly string[]): string {
+  if (typeof v === "boolean") return v ? "true" : "false";
+  if (Array.isArray(v)) return JSON.stringify(v);
+  return String(v);
+}
+
+/**
+ * 是否保留名（大小写不敏感）。
+ *
+ * 用途（迁移文档第零章 P3）：env.json 的 `llm[].name` 不走 `checkName`，
+ *   但「保留名被用作业务名字」会给 agent 阶段埋坑 —— 因此单独给一个判定函数，
+ *   由 `envJson.ts` 的 `LLM_NAME_RE` + 本函数共同校验。
+ */
+export function isReservedName(name: string): boolean {
+  return RESERVED_NAMES.has(name.toLowerCase());
+}
+
 /** 目录路径 → 路径段数组（根目录 "" → []） */
 export function pathSegments(dirPath: string): string[] {
   return dirPath === "" ? [] : dirPath.split("/").filter((s) => s.length > 0);

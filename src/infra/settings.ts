@@ -2,21 +2,20 @@
  * src/infra/settings.ts
  * 动态取值层 + 工具配置门禁（规范 §7 / §8.3）。
  *
- * 取值顺序：环境配置覆盖值（.env 中的托管键） → 声明处默认值
+ * 取值顺序：env.json 的 tools 块（托管键） → 声明处默认值
  * 校验：写入端（routes/config.ts）与读取端（本文件）各校验一次（§3.4 双重校验）
  * 告警：同一键只告警一次，且**不打印取值原文**（§8.7）
  *
- * 为什么不用 `Bun.env` 读：`reloadEnvExcluding()` 只会写 `Bun.env[key]`、**从不删除**键；
- *   而 §9.1 / §7.4 要求「值等于默认值时删除该键（恢复默认即删除）」。
- *   若从 `Bun.env` 读，用户点了「恢复默认」后进程里仍是旧值 —— 典型的「改了不生效」（见 R-3）。
+ * 为什么不用 `Bun.env` 读：托管键**从不进进程环境**（§7.4），且「值等于默认值即删键」要求
+ *   读到的是文件里的真实状态，而不是进程里累积的历史值。
+ *   ⚠️ 迁移后这一条更强：env.json 根本不经过 Bun.env（方案 4.4）。
  */
 
-import { statSync } from "fs";
 import { relative } from "path";
 import { fileURLToPath } from "url";
-import { ENV_PATH, parseEnvText, readEnvFile } from "./configFile";
+import { managedValues } from "./envJson";
 import {
-  DIR_SETTINGS_FILE, TOOLS_ROOT, dirSettingKey, groupSettingKey, hasManagedPrefix, pathSegments,
+  DIR_SETTINGS_FILE, TOOLS_ROOT, dirSettingKey, groupSettingKey, pathSegments,
 } from "@/tools/paths";
 import { getRegistry } from "@/tools/scan";
 
@@ -104,39 +103,32 @@ export function defaultValueText(def: SettingDef): string {
 }
 
 /* ============================================================
- * 托管值缓存（来源 = .env 文件，不进进程环境）
+ * 托管值缓存（来源 = env.json 的 tools 块，不进进程环境）
  * ============================================================ */
 
-/** `.env` 的托管键缓存（只有三类托管前缀的键；它们不进进程环境） */
-const managed = new Map<string, string>();
-let envStamp: string | null = null;
+/**
+ * 托管键缓存（工具配置的唯一取值来源）。
+ *
+ * ⚠️ 迁移后**不再自己维护**缓存与 stamp：全部委托给 envJson.managedValues()
+ *    （它按 mtime+size 缓存 tools 块，与迁移前 statStamp 的语义逐字相同）。
+ *    这里保留 `managed` 这个名字，是为了让下面所有读取点（currentSettingText / readSetting /
+ *    isToggleOn / secretSettingValues）**一行都不用改**。
+ */
+let managed: ReadonlyMap<string, string> = new Map();
+let loaded = false;
 const warned = new Set<string>();
 
-function statStamp(): string {
-  try {
-    const st = statSync(ENV_PATH);
-    return `${Math.floor(st.mtimeMs)}:${st.size}`;
-  } catch {
-    return "absent";
-  }
-}
-
 /**
- * 重新读取 .env 中的托管键（工具配置的唯一取值来源）。
+ * 重新读取 env.json 的 tools 块（工具配置的唯一取值来源）。
  * @param force true = 忽略 mtime 缓存重新解析（保存配置后必须用 true，见 R-3）
  * @returns 是否真的重新解析了
  */
 export function refreshManagedValues(force = false): boolean {
-  const stamp = statStamp();
-  if (!force && stamp === envStamp) return false;
-  const snap = readEnvFile();
-  const map = parseEnvText(snap.text);
-  managed.clear();
-  for (const [k, v] of map) {
-    if (hasManagedPrefix(k)) managed.set(k, v);
-  }
-  envStamp = stamp;
-  return true;
+  const before = managed;
+  managed = managedValues(force);
+  const reloaded = force || !loaded || before !== managed;
+  loaded = true;
+  return reloaded;
 }
 
 /**
@@ -145,7 +137,7 @@ export function refreshManagedValues(force = false): boolean {
  *    的路径上（例如用例直接调 readSetting），取值会静默落到默认值。
  */
 function ensureLoaded(): void {
-  if (envStamp === null) refreshManagedValues();
+  if (!loaded) refreshManagedValues();
 }
 
 /** 当前文件中的原始文本（未解析）；配置页回显用 */
@@ -230,13 +222,13 @@ export function secretSettingValues(): string[] {
 
 /* ============================================================
  * 开关与门禁（§8.2 / §8.3）
- *   取值顺序：`.env` 里的显式值 → 初始默认 false（§8.2）。
+ *   取值顺序：`env.json` 的 `tools` 块里的显式值 → 初始默认 false（§8.2）。
  *   ⚠️ 没有「继承旧配置」这一层：旧启用开关在迁移时已被删除（§9.2），升级后的初始态与
  *      全新安装完全一致。这是规范的要求，理由与取舍见 §7.2。
  * ============================================================ */
 
 /**
- * 单个开关的生效值：`.env` 里的显式值 → 初始默认 false（§8.2）。
+ * 单个开关的生效值：`env.json` 的 `tools` 块里的显式值 → 初始默认 false（§8.2）。
  * 目录根（key === ""）没有开关，恒为可用。
  */
 export function isToggleOn(key: string): boolean {

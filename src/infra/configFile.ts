@@ -1,40 +1,51 @@
 /**
  * src/infra/configFile.ts
- * .env 配置文件的读写 / 备份 / 校验 / 掩码（配置页专用，需求 §4.5）
+ * 配置项**元数据 + 校验 + 掩码 + GET/PUT 语义**（配置页专用，需求 §4.5）。
  *
- * 设计要点：
- * 1. 路径基准与 src/infra/env.ts 完全一致（import.meta.dir 而非 process.cwd()）；
- * 2. 逐键替换 / 逐键删除、保留注释与行序，不重生成文件；
- * 3. 原子写（tmp + rename），失败回退 copy；
- * 4. 独立于 etc/tools/local 文件沙箱，不受工具开关影响（需求 §4.7 S5）。
+ * 设计要点（迁移后，见 docs/ENV-JSON-代码修改文档.md 4.6）：
+ * 1. 文件读写**全部**下沉到 src/infra/envJson.ts（JSON 序列化 / 原子写 / 备份）；
+ *    本文件只负责「键名 ↔ JSON 路径」的业务语义与校验。
+ * 2. 不再有「逐键替换、保留注释与行序」——JSON 整体重写（方案 2.3 C2）；
+ *    用户的备注请用 `_` 开头的顶层键承载（方案 3.5）。
+ * 3. 独立于 etc/tools/local 文件沙箱，不受工具开关影响（需求 §4.7 S5）。
  *
  * ⚠️ 工具配置**不再**在这里声明：类型、默认值、范围、说明的唯一来源是 etc/tools/** 的
  *    `settings` 声明（规范 §3.2 默认值单一来源 / §9.2 存量分流）。本文件只保留系统项，
  *    工具键通过参数注入的白名单与声明校验（§9.1 写入白名单 = 系统项 ∪ 本次扫描注册键）。
  */
+import { existsSync } from "fs";
 import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-  renameSync,
-  copyFileSync,
-  unlinkSync,
-  readdirSync,
-} from "fs";
-import { resolve, join } from "path";
+  CONFIG_KEY_TO_JSON, envJsonFilePath, envJsonBackupDir, loadEnvJson,
+  registerEnvJsonDefaults, readEnvJsonRaw, writeEnvJson,
+  backupEnvJson, envJsonDefaultsOrNull,
+  type EnvJson, type FieldSpec,
+} from "./envJson";
+import { parseThinkingMode } from "./thinkingMode";
+import { formatManagedValue } from "@/tools/paths";
 
-/** 项目根目录：<项目根>/src/infra/ 上溯两级 */
-const PROJECT_ROOT = resolve(import.meta.dir, "../..");
+/**
+ * 兼容别名：路由层原来读 `ENV_PATH` / `BACKUP_DIR`（GET /api/config 的 envPath / backupDir）。
+ * ⚠️ 迁移后改为函数 `envPath()` / `backupDirPath()`：只有这样才能让测试钩子
+ *    __setEnvJsonPathForTest 生效，同时让 routes/config.ts 的响应字段名保持不变。
+ */
+export function envPath(): string { return envJsonFilePath(); }
+export function backupDirPath(): string { return envJsonBackupDir(); }
 
-/** .env 绝对路径（与 src/infra/env.ts 的 loadDotenv 保持一致，勿改基准） */
-export const ENV_PATH = resolve(PROJECT_ROOT, ".env");
-
-/** 备份目录：<项目根>/data/envbk（data/ 已被 .gitignore 忽略） */
-export const BACKUP_DIR = resolve(PROJECT_ROOT, "data/envbk");
-
-/** 备份保留份数（需求 §4.5.3 / AC-CFG-6） */
-const KEEP_BACKUPS = 20;
+/**
+ * 配置页容错读取：**永不抛错**，读不到就回落到默认值。
+ *
+ * 为什么必须有（附录 A-10）：配置页是用户修配置的唯一入口。若 env.json 缺失/损坏时
+ * GET /api/config 直接 500，用户就失去了自救途径。启动路径仍用严格版（loadEnvJson）。
+ */
+export function loadEnvJsonSafely(): EnvJson {
+  try {
+    return loadEnvJson();
+  } catch (e) {
+    const def = envJsonDefaultsOrNull();
+    if (def) return def;
+    throw e;                                  // 连默认值都没注册：这是代码问题，不该被吞掉
+  }
+}
 
 // ============================================
 // 配置项清单（白名单 + 校验元数据）
@@ -60,13 +71,13 @@ export interface ConfigKeyMeta {
   /** [R-04] 允许写空值：仅用于「留空 = 未配置」这类语义。 */
   allowEmpty?: boolean;
   enumValues?: readonly string[];
-  /** 枚举项的**中文显示名**（值仍写 .env / 仍走 enumValues 校验） */
+  /** 枚举项的**中文显示名**（值仍写原始 token / 仍走 enumValues 校验） */
   enumLabels?: Record<string, string>;
   min?: number;
   max?: number;
-  /** 分组标题（与 .env.example 注释块一致） */
+  /** 分组标题（与 env.example.json 的分组一致） */
   groupTitle: string;
-  /** 说明文字（取自 .env.example 注释） */
+  /** 说明文字（迁到 docs/配置说明.md，此处保留一行摘要） */
   desc: string;
 }
 
@@ -76,7 +87,7 @@ export interface ConfigKeyMeta {
  * 它们的类型、默认值、范围、说明的唯一来源是 etc/tools/** 的声明（规范 §3.2 / §9.2）。
  *
  * ⚠️ `TOOL_RESULT_MAX_CHARS` 仍是系统项，但沿用「不进配置页、手工维护」，
- *    故不在本表内 → 经配置接口**不可写**（只能手工改 .env 后重启）。
+ *    故不在本表内 → 经配置接口**不可写**（只能手工改 env.json 后重启）。
  *    若日后要让它可写，必须**同时**做三件事（进 CONFIG_KEYS / 进页面 / 确认热更路径），
  *    否则会出现「接口能写、页面看不到、热更不生效」的三方不一致。
  */
@@ -153,6 +164,51 @@ export const CONFIG_KEY_SET: ReadonlySet<string> = new Set(CONFIG_KEYS.map((m) =
 /** 分组顺序（前端渲染顺序） */
 export const CONFIG_GROUPS: readonly ConfigGroup[] = ["app", "llm", "log", "stab"];
 
+/**
+ * [需求域 T / T-06] 工具结果总长度上限的**唯一**默认值。
+ *
+ * 为什么定义在这里：它不在 CONFIG_KEYS（方案 2.1「不进配置页」），但 EnvConfig 与
+ * envJson 的默认值注册都需要它；迁移前 env.ts 里重复写了三处 `|| 32000`，本次收口。
+ */
+export const TOOL_RESULT_MAX_CHARS_DEFAULT = 32000;
+
+/** 取某个系统项的默认值文本（默认值单一来源） */
+function defaultOf(key: string): string {
+  const meta = CONFIG_KEYS.find((m) => m.key === key);
+  if (!meta) throw new Error(`ERR_CONFIG_META: ${key} 不在 CONFIG_KEYS 中，无法取得默认值`);
+  return meta.defaultValue;
+}
+
+/**
+ * 把 CONFIG_KEYS 的默认值注册给 envJson（envJson 不 import 本文件，避免成环）。
+ * ⚠️ 必须在**任何** loadEnvJson() / managedValues() 调用之前执行 —— 放在模块顶层即可：
+ *    env.ts 与 routes 都会先完成 configFile.ts 的 import 求值。
+ * 默认值来源唯一：CONFIG_KEYS[].defaultValue（方案 2.2-1）；此处只做「字符串 → 强类型」搬运。
+ */
+registerEnvJsonDefaults({
+  app: { port: Number(defaultOf("APP_PORT")) },
+  llm: [{
+    name: "main",                                    // 第零章 P3：不用保留名 default
+    base: defaultOf("LLM_API_BASE"),
+    key: defaultOf("LLM_API_KEY"),
+    model: defaultOf("LLM_MODEL"),
+    thinkingMode: parseThinkingMode(defaultOf("LLM_THINKING_MODE")),
+    thinking: defaultOf("LLM_THINKING") === "true",
+    reasoningEffort: defaultOf("LLM_REASONING_EFFORT"),
+  }],
+  log: {
+    enabled: defaultOf("LLM_LOG_ENABLED") === "true",
+    file: defaultOf("LLM_LOG_FILE"),
+    maxRows: Number(defaultOf("LLM_LOG_MAX_ROWS")),
+  },
+  stab: {
+    maxToolRounds: Number(defaultOf("MAX_TOOL_ROUNDS")),
+    sseHeartbeatMs: Number(defaultOf("SSE_HEARTBEAT_MS")),
+    toolResultMaxChars: TOOL_RESULT_MAX_CHARS_DEFAULT,
+  },
+  tools: {},
+});
+
 // ============================================
 // 校验
 // ============================================
@@ -188,180 +244,117 @@ export function validateValue(meta: ConfigKeyMeta, raw: string): string | null {
 }
 
 // ============================================
-// .env 逐键替换（保留注释与行序）
+// 系统项 JSON 路径读写（保持 CONFIG_KEY_TO_JSON 是唯一路径知识）
 // ============================================
 
-export interface EnvFileSnapshot {
-  exists: boolean;
-  /** 文件全文（不存在时为空串） */
-  text: string;
-  /** 文件使用的换行符（写回时沿用，避免整文件行尾被改写） */
-  eol: "\n" | "\r\n";
-}
-
-/** 读取 .env 快照（不存在视为空文件，不抛错） */
-export function readEnvFile(): EnvFileSnapshot {
-  if (!existsSync(ENV_PATH)) return { exists: false, text: "", eol: "\n" };
-  const text = readFileSync(ENV_PATH, "utf-8");
-  const m = text.match(/\r?\n/);
-  const eol: "\n" | "\r\n" = m && m[0] === "\r\n" ? "\r\n" : "\n";
-  return { exists: true, text, eol };
-}
-
-/** 解析 .env 为 key→value 映射（与 env.ts 的 trim/跳注释行为一致） */
-export function parseEnvText(text: string): Map<string, string> {
-  const map = new Map<string, string>();
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    map.set(trimmed.slice(0, eq).trim(), trimmed.slice(eq + 1).trim());
+/** 取 spec 指向的分组对象（llm 取 [0]） */
+function boxOf(raw: Record<string, unknown>, spec: FieldSpec): Record<string, unknown> {
+  if (spec.group === "llm") {
+    const arr = raw.llm;
+    const first = Array.isArray(arr) ? arr[0] : undefined;
+    if (!first || typeof first !== "object" || Array.isArray(first)) {
+      const created: Record<string, unknown> = {};
+      if (!Array.isArray(arr)) raw.llm = [created];
+      else (raw.llm as unknown[])[0] = created;
+      return created;
+    }
+    return first as Record<string, unknown>;
   }
-  return map;
+  const g = raw[spec.group];
+  if (!g || typeof g !== "object" || Array.isArray(g)) {
+    const created: Record<string, unknown> = {};
+    raw[spec.group] = created;
+    return created;
+  }
+  return g as Record<string, unknown>;
+}
+
+/** 从原始对象里读出某个系统项的值（未设置返回 undefined） */
+function readSystemFromRaw(raw: Record<string, unknown> | null, spec: FieldSpec): unknown {
+  if (!raw) return undefined;
+  if (spec.group === "llm") {
+    const arr = raw.llm;
+    const first = Array.isArray(arr) ? arr[0] : undefined;
+    if (!first || typeof first !== "object" || Array.isArray(first)) return undefined;
+    return (first as Record<string, unknown>)[spec.field];
+  }
+  const g = raw[spec.group];
+  if (!g || typeof g !== "object" || Array.isArray(g)) return undefined;
+  return (g as Record<string, unknown>)[spec.field];
 }
 
 /**
- * 逐键改写 + 追加 + 删除：
- *   - changes 里的键：**同名多处全部改写**（FIX-DUP-01 结论不变），文件里没有则追加
- *   - deleteKeys 里的键：**同名多处全部删除**，其余行（含注释、空行、无法解析的行）原样保留
- *   - 不重排文件、不改换行风格
+ * 把「持久化文本」写进原始 JSON 对象的对应路径（**最小改动**，不重排、不补默认值）。
  *
- * [FIX-DUP-01] 同名键出现多次时必须**全部改写**：旧实现命中第一处后即从待改集合移除，
- *   于是「配置页保存只改第一行、末尾那行仍旧值」，而运行时按「后者覆盖前者」取值 ——
- *   表现为「页面回执已保存并热更，开关却毫无变化」。
+ * ⚠️ 为什么不经过 loadEnvJson() 再序列化（附录 A-2）：那样会把 13 个缺失项全部回填
+ *    默认值写进文件，直接违反「值等于默认值即不落盘」（方案 2.2-1）。
  */
-export function mergeEnvText(
-  snapshot: EnvFileSnapshot,
-  changes: Record<string, string>,
-  deleteKeys: readonly string[] = [],
-): string {
-  const pending = new Map<string, string>(
-    Object.entries(changes).map(([k, v]) => [k, String(v).trim()] as [string, string]),
-  );
-  const del = new Set(deleteKeys.map((k) => k.trim()));
-  const lines = snapshot.exists ? snapshot.text.split(/\r?\n/) : [];
-  /** 文件中确实存在过的键（用于区分「需追加的新键」/「同名多处」） */
-  const found = new Set<string>();
-
-  const out: string[] = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    // 注释行 / 空行 / 无法解析的行 → 原样保留（不丢用户内容）
-    if (!trimmed || trimmed.startsWith("#")) {
-      out.push(line);
-      continue;
-    }
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) {
-      out.push(line);
-      continue;
-    }
-    const key = trimmed.slice(0, eq).trim();
-
-    if (del.has(key) && !pending.has(key)) continue;    // 删除（同名多处全部删除）
-    if (!pending.has(key)) {
-      out.push(line);
-      continue;
-    }
-
-    // 保留原行「= 之前的一切」，只替换 = 之后的内容（不改动缩进与行尾空白风格）
-    found.add(key);
-    const eqIdxInLine = line.indexOf("=");
-    out.push(line.slice(0, eqIdxInLine + 1) + (pending.get(key) as string));
+export function writeSystemIntoRaw(raw: Record<string, unknown>, key: string, text: string): boolean {
+  const spec = CONFIG_KEY_TO_JSON[key];
+  if (!spec) return false;
+  const meta = CONFIG_KEYS.find((m) => m.key === key);
+  const box = boxOf(raw, spec);
+  const t = String(text ?? "").trim();
+  switch (meta?.type) {
+    case "int":
+      box[spec.field] = parseInt(t, 10);
+      return true;
+    case "bool":
+      box[spec.field] = t === "true";
+      return true;
+    case "enum":
+      box[spec.field] = spec.group === "llm" && spec.field === "thinkingMode" ? parseThinkingMode(t) : t;
+      return true;
+    default:
+      box[spec.field] = t;
+      return true;
   }
-
-  // 仅「文件中完全没有出现」的键 → 追加（单独成行）
-  for (const [k, v] of pending) {
-    if (found.has(k)) continue;
-    out.push(`${k}=${v}`);
-  }
-
-  return out.join(snapshot.eol);
 }
 
 /**
- * [FIX-DUP-01] 统计文本中同名键的出现次数（>1 即重复键）。
- * 供保存路径显式告警：重复键是「改了却不生效」最常见的原因，必须喊出来。
+ * 删除原始 JSON 对象里的某个系统项路径（「恢复默认」= 让该字段从文件里消失）。
+ * 删完后若分组对象为空，整组一起去掉 —— 否则会留下 `"log": {}` 这种空壳。
  */
-export function countDuplicateKeys(text: string): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq === -1) continue;
-    const key = trimmed.slice(0, eq).trim();
-    counts.set(key, (counts.get(key) ?? 0) + 1);
+export function deleteSystemPath(raw: Record<string, unknown>, key: string): boolean {
+  const spec = CONFIG_KEY_TO_JSON[key];
+  if (!spec) return false;
+  if (spec.group === "llm") {
+    const arr = raw.llm;
+    const first = Array.isArray(arr) ? arr[0] : undefined;
+    if (!first || typeof first !== "object" || Array.isArray(first)) return false;
+    delete (first as Record<string, unknown>)[spec.field];
+    return true;
   }
-  for (const [k, n] of [...counts]) if (n < 2) counts.delete(k);
-  return counts;
+  const g = raw[spec.group];
+  if (!g || typeof g !== "object" || Array.isArray(g)) return false;
+  const box = g as Record<string, unknown>;
+  delete box[spec.field];
+  if (Object.keys(box).length === 0) delete raw[spec.group];
+  return true;
 }
 
-// ============================================
-// 原子写 + 失败回退
-// ============================================
-
-export interface WriteResult {
-  ok: boolean;
-  /** 原子 rename 失败、回退 copy 成功时置 true（前端可提示"已写入但非原子"） */
-  degraded?: boolean;
-  error?: string;
-}
-
-/** 原子写入 .env：先写同目录 .env.tmp → rename；失败回退 copyFile */
-export function writeEnvAtomic(text: string): WriteResult {
-  const tmp = resolve(PROJECT_ROOT, ".env.tmp");
+/**
+ * 把系统项从 env.json 里取出来，转成「持久化文本」的映射（key → 文本）。
+ *
+ * 与迁移前 parseEnvText 的关系：那个返回「文件里写了什么」，这个返回「JSON 里的值写成文本后是什么」。
+ * 唯一语义差异（必须知道）：**值等于默认值的字段在 JSON 里根本不存在**（「读默认即删键」）→
+ *   这里用 `?? meta.defaultValue` 回填，与 AC-CFG-9 一致。
+ */
+export function readSystemValues(): Map<string, string> {
+  let raw: Record<string, unknown> | null = null;
   try {
-    writeFileSync(tmp, text, "utf-8");
-    try {
-      renameSync(tmp, ENV_PATH);
-      return { ok: true };
-    } catch {
-      // Windows 下目标被占用等 → 回退为覆盖写（非原子，但保证内容完整）
-      copyFileSync(tmp, ENV_PATH);
-      try { unlinkSync(tmp); } catch { /* 清理失败不致命 */ }
-      return { ok: true, degraded: true };
-    }
+    raw = readEnvJsonRaw();
   } catch (e) {
-    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* ignore */ }
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    // 配置页必须能打开（否则用户没法修）：读失败时全部按默认值展示，原因交给路由层提示。
+    console.warn(`⚠️  [config] 读取 env.json 失败，配置页将按默认值展示：${String(e)}`);
   }
-}
-
-// ============================================
-// 备份 + 保留最近 20 份
-// ============================================
-
-/** 生成 yyyyMMddHHmmss 本地时间戳 */
-function timestamp(): string {
-  const d = new Date();
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`
-    + `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-}
-
-/** 备份当前 .env；.env 不存在时返回 null（跳过备份，AC-CFG-9） */
-export function backupEnv(): string | null {
-  if (!existsSync(ENV_PATH)) return null;
-  mkdirSync(BACKUP_DIR, { recursive: true });
-  const name = `env.${timestamp()}.bak`;
-  copyFileSync(ENV_PATH, join(BACKUP_DIR, name));
-  pruneBackups();
-  return name;   // 相对 BACKUP_DIR 的文件名，回执给前端
-}
-
-/** 只保留最近 KEEP_BACKUPS 份（文件名时间戳为定长 14 位，字典序 = 时间序） */
-function pruneBackups(): void {
-  const files = readdirSync(BACKUP_DIR)
-    .filter((f) => /^env\.\d{14}\.bak$/.test(f))
-    .sort();                                  // 升序：最旧在前
-  const excess = files.length - KEEP_BACKUPS;
-  for (let i = 0; i < excess; i++) {
-    const f = files[i];
-    if (!f) continue;                         // noUncheckedIndexedAccess
-    try { unlinkSync(join(BACKUP_DIR, f)); } catch { /* 删除失败不阻断保存 */ }
+  const m = new Map<string, string>();
+  for (const meta of CONFIG_KEYS) {
+    const spec = CONFIG_KEY_TO_JSON[meta.key];
+    const v = spec ? readSystemFromRaw(raw, spec) : undefined;
+    m.set(meta.key, v === undefined || v === null ? meta.defaultValue : formatManagedValue(v as never));
   }
+  return m;
 }
 
 // ============================================
@@ -390,7 +383,7 @@ export interface ConfigItem {
   enumLabels?: Record<string, string>;
   min?: number;
   max?: number;
-  /** 被系统环境变量遮蔽（AC-CFG-8） */
+  /** 被系统环境变量遮蔽（AC-CFG-8）—— 迁移后恒 false */
   shadowed: boolean;
   /** 该键改动后是否需要重启 */
   restartRequired: boolean;
@@ -409,7 +402,8 @@ export function maskSecret(value: string): string {
 /**
  * 装配 GET /api/config 的系统项 items。
  * @param restartOnly  需重启的键集合
- * @param shadowed     被系统环境变量遮蔽的键集合（来自 env.ts 的 envShadowedBySystem）
+ * @param shadowed     被系统环境变量遮蔽的键集合 —— **迁移后恒为空集**（第零章 P7 / 方案 2.3 C1）
+ *                     ⚠️ 参数保留不删：删了 routes/config.ts 的调用点要跟着改（方案 3.7「接口契约不动」）
  * @param effectiveOf  可选：运行时实际生效值（阶段 B 回填）
  */
 export function buildConfigItems(
@@ -417,19 +411,20 @@ export function buildConfigItems(
   shadowed: ReadonlySet<string>,
   effectiveOf?: (key: string) => unknown,
 ): ConfigItem[] {
-  const snap = readEnvFile();
-  const fileMap = parseEnvText(snap.text);
+  const fileMap = readSystemValues();
+  void shadowed;   // 迁移后恒为空集，保留参数只为不改调用方
 
   return CONFIG_KEYS.map((meta) => {
-    // 文件中缺失该键 → 回填默认值（AC-CFG-9）
-    const raw = fileMap.has(meta.key) ? (fileMap.get(meta.key) as string) : meta.defaultValue;
+    const raw = fileMap.get(meta.key) ?? meta.defaultValue;   // 缺失 → 回填默认值（AC-CFG-9）
     const base: ConfigItem = {
       key: meta.key, group: meta.group, groupTitle: meta.groupTitle,
       type: meta.type, label: meta.label, desc: meta.desc,
       value: raw, secret: !!meta.secret, required: meta.required === true,
       allowEmpty: meta.allowEmpty === true,
       enumValues: meta.enumValues, enumLabels: meta.enumLabels, min: meta.min, max: meta.max,
-      shadowed: shadowed.has(meta.key),
+      // ⚠️ 恒 false：JSON 不经过 Bun.env，遮蔽概念消失（方案 2.3 C1）。
+      //    保留字段是为了让前端 items[].shadowed 的形状不变（方案 3.7「零改动」）。
+      shadowed: false,
       restartRequired: restartOnly.has(meta.key),
     };
     if (meta.secret) {
@@ -451,7 +446,7 @@ export interface ApplyRequest {
   changes?: Record<string, string>;
   /** 系统密文项清空（沿用 R-17：写空串，不是删行） */
   clearKeys?: readonly string[];
-  /** 需要删除的键（恢复默认 / 存量迁移 / 遗留键清理）：同名多处全部删除 */
+  /** 需要删除的键（恢复默认 / 遗留键清理） */
   deleteKeys?: readonly string[];
   /** 本次扫描注册的键（**写入**白名单的并集，§9.1） */
   allowedKeys?: ReadonlySet<string>;
@@ -459,10 +454,8 @@ export interface ApplyRequest {
    * **删除**侧的额外白名单（旧键 / 遗留键）。缺省 = 空集。
    *
    * ⚠️ 为什么必须与 `allowedKeys` 分开（R-24）：**「可写」与「可删」是两个不同的集合**。
-   *   · 迁移要删的是**已被移出 `CONFIG_KEYS` 的旧键**（`FILE_READ_ENABLED` 等）——
-   *     它们按定义不在任何白名单里；
-   *   · 遗留键接口要删的是**未被本次扫描注册的托管键**——按定义也不在 `allowedKeys` 里。
-   *   用一个白名单同时校验写入与删除，会让这两个功能 **100% 失败**（落入 unknown → `ok:false`）。
+   *   · 遗留键接口要删的是**未被本次扫描注册的托管键**——按定义不在 `allowedKeys` 里。
+   *   用一个白名单同时校验写入与删除，会让该功能 100% 失败（落入 unknown → `ok:false`）。
    */
   allowDeleteKeys?: ReadonlySet<string>;
   /** 不备份（遗留键独立接口：§10.2「删除不备份」） */
@@ -473,7 +466,7 @@ export interface ApplyResult {
   ok: boolean;
   /** 实际写入的键 */
   written: string[];
-  /** 实际删除的键（= 恢复默认 / 迁移 / 遗留键清理） */
+  /** 实际删除的键（= 恢复默认 / 遗留键清理） */
   deleted: string[];
   backupFile: string | null;
   envCreated: boolean;
@@ -486,9 +479,10 @@ export interface ApplyResult {
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * 应用一批改动：白名单 → 键名硬校验 → 写删互斥 → 密文清空约束 → 系统值校验 → 备份 → 合并 → 原子写
+ * 应用一批改动：白名单 → 键名硬校验 → 写删互斥 → 密文清空约束 → 系统值校验 → 备份 → 写盘
  *
  * [R-24] 写入与删除**分别**校验白名单（见 ApplyRequest.allowDeleteKeys 的注释）。
+ * [A-2] 写盘以**原始 JSON 对象**为基准做最小改动：不重排、不补默认值。
  */
 export function applyConfigChanges(req: ApplyRequest): ApplyResult {
   const changes = req.changes ?? {};
@@ -524,7 +518,7 @@ export function applyConfigChanges(req: ApplyRequest): ApplyResult {
   const badKey = [...written, ...deleted].filter((k) => !ENV_KEY_RE.test(k));
   if (badKey.length > 0) {
     return fail([...new Set(badKey)].map((k) => ({
-      key: k, reason: "键名不符合环境变量格式（^[A-Za-z_][A-Za-z0-9_]*$）",
+      key: k, reason: "键名不符合托管键格式（^[A-Za-z_][A-Za-z0-9_]*$）",
     })));
   }
 
@@ -556,23 +550,50 @@ export function applyConfigChanges(req: ApplyRequest): ApplyResult {
   }
   if (invalid.length > 0) return fail(invalid);
 
-  // ⑥ 备份（可跳过；.env 不存在则跳过，AC-CFG-9）
-  const snap = readEnvFile();
-  const backupFile = req.skipBackup ? null : backupEnv();
+  // ⑥ 读现状 + 备份（env.json 不存在 → backupEnvJson() 内部返回 null，AC-CFG-9）
+  const existedBefore = existsSync(envPath());
+  const backupFile = req.skipBackup ? null : backupEnvJson();
 
-  // ⑦ 合并 + 原子写
+  // ⑦ 在**原始对象**上做最小改动（不经过强类型规整，避免把默认值全写进文件）
+  let raw: Record<string, unknown>;
+  try {
+    raw = readEnvJsonRaw() ?? {};
+  } catch (e) {
+    // 现状文件本身坏了：不让保存把它「顺手修好」，明确报错让用户先修文件
+    return { ok: false, written: [], deleted: [], backupFile: null, envCreated: false, error: `env.json 当前不可解析：${String(e)}` };
+  }
+  if (!Array.isArray(raw.llm) || raw.llm.length === 0) raw.llm = [{ name: "main", base: "", key: "", model: "" }];
+
   const writeMap: Record<string, string> = { ...changes };
   for (const k of clearKeys) writeMap[k] = "";
-  const dupInFile = countDuplicateKeys(snap.text);
-  const dupTouched = [...dupInFile.entries()].filter(([k]) => k in writeMap);
-  if (dupTouched.length > 0) {
-    console.warn(
-      `⚠️  [.env] 以下键在文件中重复出现，本次已把全部同名行改成同一值：` +
-      dupTouched.map(([k, n]) => `${k}×${n}`).join(", ") + `；建议删掉多余行。`,
-    );
+
+  const systemDeleted: string[] = [];
+  const managedChanges: Record<string, string> = {};
+  for (const [k, v] of Object.entries(writeMap)) {
+    if (CONFIG_KEY_TO_JSON[k]) { writeSystemIntoRaw(raw, k, v); continue; }
+    managedChanges[k] = formatManagedValue(v);           // 非系统项 → 托管键（值一律字符串）
   }
-  const next = mergeEnvText(snap, writeMap, deleted);
-  const w = writeEnvAtomic(next);
+  for (const k of deleted) {
+    if (k in writeMap) continue;                          // ③ 已保证二者不并存，这里只防御
+    if (CONFIG_KEY_TO_JSON[k]) { deleteSystemPath(raw, k); systemDeleted.push(k); continue; }
+  }
+
+  //   ⑦-b 托管键：写 = 覆盖；删 = 从 tools 移除
+  const rawTools = raw.tools;
+  const tools: Record<string, unknown> =
+    rawTools && typeof rawTools === "object" && !Array.isArray(rawTools)
+      ? { ...(rawTools as Record<string, unknown>) }
+      : {};
+  for (const [k, v] of Object.entries(managedChanges)) tools[k] = v;
+  for (const k of deleted) if (!CONFIG_KEY_TO_JSON[k]) delete tools[k];
+  raw.tools = tools;
+
+  //   ⑦-c 顶层 _unmapped：保留（不在这里改动；删除未识别键走 deleteUnmappedKeys，见 routes/config.ts）
+
+  //   ⑦-d 序列化 + 原子写
+  //     ⚠️ 这里**不**用 serializeEnvJson：它会重排整棵树并按默认值瘦身，
+  //        而配置页保存的语义是「在用户当前文件上做最小改动」。
+  const w = writeEnvJson(`${JSON.stringify(raw, null, 2)}\n`);
   if (!w.ok) {
     return { ok: false, written: [], deleted: [], backupFile: null, envCreated: false, error: w.error };
   }
@@ -580,9 +601,12 @@ export function applyConfigChanges(req: ApplyRequest): ApplyResult {
   return {
     ok: true,
     written,
-    deleted,
+    deleted: [...new Set([...deleted, ...systemDeleted])],
     backupFile,
-    envCreated: !snap.exists,
+    envCreated: !existedBefore,
     degraded: w.degraded,
   };
 }
+
+/** 删除顶层 `_unmapped` 里的遗留键（转出 envJson 的实现，路由层只认这里） */
+export { deleteUnmappedKeys } from "./envJson";

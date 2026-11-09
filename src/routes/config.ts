@@ -9,25 +9,27 @@
  *
  * 安全：写入白名单 = 系统项 ∪ 本次扫描注册的键；值禁换行；不回显/不记录密钥明文。
  * 后端不信任前端：门禁在写入端独立复查（§3.5），前端灰显只是提示。
+ *
+ * [迁移文档 4.9] 迁移后本文件的对外契约**一字不变**（envPath / envExists / backupDir /
+ *   items[].shadowed 全部保留），只有「取值从 .env 文本 → env.json 对象」这一层换了实现。
  */
 import { Hono } from "hono";
 import { existsSync } from "fs";
 import { env, envShadowedBySystem, reloadEnvExcluding } from "@/infra/env";
 import {
-  CONFIG_KEYS, CONFIG_KEY_SET, ENV_PATH, BACKUP_DIR,
-  buildConfigItems, applyConfigChanges, maskSecret,
-  // [skill / §9.3、C-18] refresh 的残留键清理要读 .env 原始文本。
-  //   ⚠️ 原文件**没有**导入这两个符号（只导入了 applyConfigChanges 等），
-  //      文档 §9.4 早先写的「不需要新增 import」是错的 —— 照抄会编译失败。
-  readEnvFile, parseEnvText,
+  CONFIG_KEYS, CONFIG_KEY_SET, buildConfigItems, applyConfigChanges, maskSecret,
+  envPath, backupDirPath, deleteUnmappedKeys,
 } from "@/infra/configFile";
+// [迁移文档 4.9.3 / 第零章 P1] refresh 的残留键清理要读「env.json 的 tools 块 ∪ 顶层 _unmapped」，
+//   不再有 .env 文本可解析（readEnvFile / parseEnvText 已在 4.6.2 删除）。
+import { listJsonCandidateKeys, readUnmapped } from "@/infra/envJson";
 import {
   getRegistry, listOrphanKeys, SUSPEND_LABEL,
   type DirRecord, type GroupRecord, type Registry,
 } from "@/tools/scan";
 /**
  * ⚠️ 用门面（src/tools/index.ts）而不是直接用 scan.ensureRegistry：
- *  门面里含「首次成功扫描后触发存量迁移」，否则「先开配置页、后发对话」的进程会跳过迁移。
+ *  门面里含「托管键缓存刷新」，保证配置页看到的开关状态是最新的。
  */
 import { ensureToolRegistry } from "@/tools";
 import {
@@ -105,12 +107,9 @@ interface ToolNode {
   /**
    * 自身是否挂起（加载失败 / 声明非法）。
    * ⚠️ 前端在勾选父节点后必须**就地重算**子孙门禁（不再请求接口），
-   *    若拿不到「自身是否挂起」，就分不清「因为上级关闭而灰显」与「自身挂起」，
-   *    重算时会把挂起节点错误解禁 —— 于是页面允许勾选、保存却被后端 §3.5 拒绝
-   *    （表现为「勾了父级后子级仍不可用 / 保存报 ERR_INVALID_VALUE」）。
+   *    若拿不到「自身是否挂起」，就分不清「因为上级关闭而灰显」与「自身挂起」。
    */
   suspended: boolean;
-  /** 挂起原因（仅 suspended 为真时给出，与 reason 同源） */
   suspendReason?: string;
   settings: SettingView[];
   tools: Array<{ visibleName: string; name: string }>;
@@ -139,10 +138,7 @@ function defOf(key: string): SettingDef | undefined {
 
 /**
  * [skill / C-13] `dependsOn` 的 owner（同级设置项表）。
- *
- * `reg.settingOwners` 只由**工具**扫描构建，`SKILLSET__*` 在里面永远查不到 →
- * 只要某个 skill 的设置项写了 dependsOn，就会走进「成对约束指向的设置项不存在」→ 整单 400。
- * 「从长到短试目录前缀」与 listStaleSkillKeys 同口径：目录名不允许含 `__`（checkName 已挡）。
+ * `reg.settingOwners` 只由**工具**扫描构建，`SKILLSET__*` 在里面永远查不到。
  */
 function skillSettingOwnerOf(key: string): Map<string, SettingEntry> | undefined {
   if (!key.startsWith("SKILLSET__")) return undefined;
@@ -167,11 +163,20 @@ function skillSettingOwnerOf(key: string): Map<string, SettingEntry> | undefined
  *
  * 为什么不在 tools/scan.ts 里改：`tools/paths.ts` / `tools/scan.ts` 是零业务底座，
  * 而 `skills/scan.ts` 反过来要 import `@/tools/scan`，让 tools 侧认 skill 键就成环（§1.2）。
- * 减法放在 routes 层，两侧单例边界不变。
+ *
+ * [C-3.1 实测缺陷] 还要再减去「本次扫描已注册的工具键」：
+ *   `listOrphanKeys` 会把顶层 `_unmapped` 的键一并列出（这是对的，它们是候选残留），
+ *   但用户可能手工把某个**合法工具键**写进了 `_unmapped`。这类键：
+ *     · 出现在待删除列表里 → 用户勾得上；
+ *     · DELETE /orphans 又会以 ERR_NOT_ORPHAN 整批拒绝 → 点了必失败，其余可删键也被连坐。
+ *   列表即真相：这里直接不列出来，避免「列出但删不掉」。
  */
 function listOrphanKeysExcludingSkills(reg: Registry, sreg: SkillRegistry): string[] {
   const declared = new Set(listSkillDeclaredKeys(sreg).map((k) => k.toLowerCase()));
-  return listOrphanKeys(reg).filter((k) => !declared.has(k.toLowerCase()));
+  const registered = new Set([...reg.registeredKeys].map((k) => k.toLowerCase()));
+  return listOrphanKeys(reg).filter(
+    (k) => !declared.has(k.toLowerCase()) && !registered.has(k.toLowerCase()),
+  );
 }
 
 function settingView(key: string, name: string, def: SettingDef, disabled: boolean): SettingView {
@@ -263,7 +268,7 @@ function buildToolTree(reg: Registry): ToolNode[] {
     const suspendText = d.suspend
       ? `加载失败：${SUSPEND_LABEL[d.suspend.code]}${d.suspend.reason ? `（${d.suspend.reason}）` : ""}`
       : undefined;
-    const node: ToolNode = {
+    return {
       id: path,
       type: "dir",
       name: d.name,
@@ -281,16 +286,13 @@ function buildToolTree(reg: Registry): ToolNode[] {
       ignored: d.ignored,
       children: d.children.map(buildDir).concat(d.groups.map((gid) => buildGroup(gid, !disabled && selfOn))),
     };
-    return node;
   };
 
   const root = reg.dirs.get("");
-  const rootGroups = (root?.groups ?? []).map((gid) => buildGroup(gid, true)); return [...(root?.children ?? []).map(buildDir), ...rootGroups]; // [§11] 根级入口文件的组同样要显示
+  const rootGroups = (root?.groups ?? []).map((gid) => buildGroup(gid, true));
+  // [§11] 根级入口文件的组同样要显示
+  return [...(root?.children ?? []).map(buildDir), ...rootGroups];
 }
-
-/* ============================================================
- * GET /api/config —— 读取前先重扫（§4.1 / §12）
- * ============================================================ */
 
 /* ============================================================
  * [skill / §12.1] skillTree：与 toolTree 并列返回
@@ -392,17 +394,19 @@ function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
   return (root?.children ?? []).map(buildDirNode);
 }
 
+/* ============================================================
+ * GET /api/config —— 读取前先重扫（§4.1 / §12）
+ * ============================================================ */
+
 router.get("/", async (c) => {
-  // §4.1 进入配置页即重扫；走门面以顺带完成一次性迁移
+  // §4.1 进入配置页即重扫
   // [skill] 技能扫描要读工具注册表判断 unknown_tool，所以必须排在工具扫描之后
   await ensureToolRegistry({ force: true });
   await ensureSkillRegistry({ force: true });
 
-
-
   const reg = getRegistry();
   const sreg = getSkillRegistry();
-  // [skill / C-21] ensureLoaded() 只在进程内首次解析 .env；这里强制刷新取值缓存
+  // [skill / C-21] 强制刷新取值缓存，避免「保存后仍显示旧值」
   refreshManagedValues(true);
   const items = buildConfigItems(
     allRestartKeys(),
@@ -414,9 +418,9 @@ router.get("/", async (c) => {
   c.header("Cache-Control", "no-store");   // 防浏览器缓存导致「保存后仍显示旧值」
   return c.json({
     ok: true,
-    envPath: ENV_PATH,
-    envExists: existsSync(ENV_PATH),
-    backupDir: BACKUP_DIR,
+    envPath: envPath(),
+    envExists: existsSync(envPath()),
+    backupDir: backupDirPath(),
     restartRequiredKeys: [...allRestartKeys()],
     hotReloadEnabled: HOT_RELOAD_ENABLED,
     /** 系统配置项（保持不变的表单语义） */
@@ -444,9 +448,10 @@ router.post("/refresh", async (c) => {
   const _s = getSkillRegistry();
   const reg = getRegistry();
 
-
   // [skill / §6.5、C-9] 只清理「磁盘上已不存在 SKILL.md」的 skill 键；挂起但存在的 skill 键不删
-  const staleR = listStaleSkillKeys([...parseEnvText(readEnvFile().text).keys()], _s);
+  //   ⚠️ 迁移后（4.9.3）「文件里的全部键」= env.json 的 tools 块 ∪ 顶层 _unmapped
+  const allKeys = new Set<string>(listJsonCandidateKeys());
+  const staleR = listStaleSkillKeys([...allKeys], _s);
   const cleanedR: string[] = [];
   if (staleR.length > 0) {
     const resR = applyConfigChanges({ changes: {}, deleteKeys: staleR, allowDeleteKeys: new Set(staleR) });
@@ -457,10 +462,10 @@ router.post("/refresh", async (c) => {
       console.warn("⚠️  [skill] 残留键清理失败：" + String(resR.error ?? ""));
     }
   }
-  return c.json({ // refresh-body 
+  return c.json({
     ok: true,
     scanVersion: reg.version,
-    toolTree: buildToolTree(reg), 
+    toolTree: buildToolTree(reg),
     skillScanVersion: _s.version,
     skillWarnings: _s.warnings,
     cleanedSkillKeys: cleanedR,
@@ -488,7 +493,6 @@ router.put("/", async (c) => {
 
   // [skill / C-14] 先保证技能注册表就绪：PUT 可能先于任何 GET 到达（脚本 / 直接 curl）。
   //   若不先扫描，skillKeys 为空 → SKILLON__ / SKILLSET__ 被判「未知配置项」→ 整单 400。
-  //   指纹未变时本调用只做一次 readdir 量级开销。⚠️ 必须在 ensureToolRegistry 之后。
   await ensureToolRegistry();
   await ensureSkillRegistry();
 
@@ -525,13 +529,16 @@ router.put("/", async (c) => {
     }
   }
 
-  const clearList: string[] = []; // ② 系统密文清空项：必须走 applyConfigChanges 的 clearKeys 通道（R-17）。不能塞进 changes 写空串——changes 会先过 validateValue，密文空串被判「不能为空」导致整个保存 400，且会绕过「必需项不支持清空」的保护（AC-CFG-4）
+  // ② 系统密文清空项：必须走 applyConfigChanges 的 clearKeys 通道（R-17）。
+  //    不能塞进 changes 写空串——changes 会先过 validateValue，密文空串被判「不能为空」导致整个保存 400。
+  const clearList: string[] = [];
   if (body.clear !== undefined) {
     if (!Array.isArray(body.clear) || body.clear.some((x) => typeof x !== "string")) {
       return c.json({ ok: false, code: "ERR_INVALID_CLEAR", error: "clear 必须为字符串数组" }, 400);
     }
     for (const k of new Set((body.clear as string[]).map((x) => x.trim()).filter((x) => x !== ""))) {
-      if (!CONFIG_KEY_SET.has(k)) { pushInvalid(k, "只有系统密文项支持清空（工具设置项请用「恢复默认」）"); continue; } clearList.push(k); // 白名单与「仅密文项可清空」在写入端独立复查（§3.5）
+      if (!CONFIG_KEY_SET.has(k)) { pushInvalid(k, "只有系统密文项支持清空（工具设置项请用「恢复默认」）"); continue; }
+      clearList.push(k); // 白名单与「仅密文项可清空」在写入端独立复查（§3.5）
     }
   }
 
@@ -599,10 +606,7 @@ router.put("/", async (c) => {
 
       // §9.1「拒绝敏感名称」的写入期一道（R-11 定稿，纵深防御）：
       //   扫描期已就该拦的拦过一次；这里防「声明被绕过 / 新增键忘了标 secret」。
-      //   只作用于工具设置项：唯一的系统密钥项 LLM_API_KEY 由 CONFIG_KEYS 的 type:"secret" 管，
-      //   不受此条约束（否则会拒绝保存，造成功能回归）。
-      //   ⚠️ INTERNET_DEEPSEEK_API_KEY **不是**系统项：它随本次改造迁为
-      //      TOOLSET__internet__web__deepseek_api_key（migrate.ts 的 DOWN_SINK），因此**受**此条约束。
+      //   只作用于工具设置项：唯一的系统密钥项 LLM_API_KEY 由 CONFIG_KEYS 的 type:"secret" 管。
       if (isSensitiveName(key) && def.secret !== true) {
         pushInvalid(key, "键名形似密钥，但该设置项未声明 secret: true；请在代码声明处补 secret（或改名）");
         continue;
@@ -699,12 +703,12 @@ router.put("/", async (c) => {
       for (const it of result.invalid) fields[it.key] = it.reason;
       return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "存在不合法配置值", fields }, 400);
     }
-    return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: result.error || "写入 .env 失败" }, 500);
+    return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: result.error || "写入 env.json 失败" }, 500);
   }
 
-  /* ⑧ 生效：先刷工具取值缓存（含「删键即恢复默认」），再热更进程环境（白名单=系统项） */
+  /* ⑧ 生效：先刷工具取值缓存（含「删键即恢复默认」），再热更进程内配置（白名单=系统项） */
   refreshManagedValues(true);
-  // [§9.1] 白名单 = 系统项 ∪ 本次扫描注册键；托管键不进进程环境（由取值层读 .env）
+  // [§9.1] 白名单 = 系统项 ∪ 本次扫描注册键；托管键不进进程环境（由取值层读 env.json 的 tools 块）
   const reload = HOT_RELOAD_ENABLED
     ? reloadEnvExcluding(["APP_PORT"], reg.registeredKeys)
     : { applied: [] as string[], skipped: [] as string[], managed: [] as string[] };
@@ -717,10 +721,11 @@ router.put("/", async (c) => {
     written: result.written,
     /** 已恢复默认（键已删除）（§11 保存结果提示第二类） */
     restored: result.deleted,
-    hotApplied: reload.applied, cleared: clearList.filter((k) => result.written.includes(k)), // hotApplied = 已热更的系统项；cleared = 已清空的系统密文项（R-17，前端据此显示「🧹 已清空」）
-    /** 名单外（用户手写、非托管前缀）的键：未注入进程环境 */
+    hotApplied: reload.applied,
+    cleared: clearList.filter((k) => result.written.includes(k)), // cleared = 已清空的系统密文项（R-17）
+    /** 名单外（用户手写、非托管前缀）的键：未进入进程配置 */
     skippedByWhitelist: reload.skipped,
-    /** 托管键（工具开关 / 设置项）：不进进程环境，由取值层读 .env 生效 */
+    /** 托管键（工具开关 / 设置项）：不进进程环境，由取值层读 env.json 的 tools 块生效 */
     managedByValues: reload.managed,
     restartRequired: restartKeysFor(writtenSystem),
     backupFile: result.backupFile,
@@ -752,41 +757,76 @@ router.delete("/orphans", async (c) => {
   // [skill / C-22] 存活技能声明的键同样是「在用的键」，不能按遗留键删除
   const sregD = getSkillRegistry();
   for (const kd of listSkillDeclaredKeys(sregD)) registered.add(kd.toLowerCase());
+
+  // [第零章 P1] `_unmapped` 里的键**刻意不命中** hasManagedPrefix，也不在任何白名单里，
+  //   因此不能走 applyConfigChanges（会 100% 被判「不允许删除」），走 deleteUnmappedKeys。
+  const unmappedSet = new Set(Object.keys(unmappedKeysSafe()));
+
   const targets: string[] = [];
+  const unmappedTargets: string[] = [];
+  // [C-3.1] 「已被本次扫描注册」的键不删，但要**跳过而不是整批 400**：
+  //   否则用户一次勾了 N 个残留键，只要其中混进 1 个合法键，其余 N-1 个也一起删不掉。
+  const skipped: string[] = [];
   for (const raw of body.keys as string[]) {
     const key = raw.trim();
     if (key === "") continue;
+    if (registered.has(key.toLowerCase())) {
+      skipped.push(key);
+      continue;
+    }
+    if (unmappedSet.has(key)) {
+      // 顶层 _unmapped：走到这里说明它未被本次扫描注册（已注册的上面已 skipped）
+      unmappedTargets.push(key);
+      continue;
+    }
     if (!hasManagedPrefix(key)) {
       return c.json({ ok: false, code: "ERR_NOT_MANAGED_KEY", error: `不是托管键，拒绝删除：${key}` }, 400);
     }
-    if (registered.has(key.toLowerCase())) {
-      return c.json({ ok: false, code: "ERR_NOT_ORPHAN", error: `该键已被本次扫描注册，不能按遗留键删除：${key}` }, 400);
-    }
     targets.push(key);
   }
-  if (targets.length === 0) {
+  if (targets.length === 0 && unmappedTargets.length === 0) {
+    // 全部键都被判定为「已注册」时，给出可读原因（而不是笼统的「未提供要删除的遗留键」）
+    if (skipped.length > 0) {
+      return c.json({ ok: false, code: "ERR_NOT_ORPHAN", error: `该键已被本次扫描注册，不能按遗留键删除：${skipped.join(", ")}` }, 400);
+    }
     return c.json({ ok: false, code: "ERR_EMPTY_CHANGES", error: "未提供要删除的遗留键" }, 400);
   }
 
   // §10.2：删除不备份、走独立接口、不参与保存流程
   // 白名单（R-24）：遗留键按定义**不在** registeredKeys 里，只能放进 allowDeleteKeys。
-  //   它们已在上面逐条校验过「命中托管前缀 且 未被注册」，这里无需再用写入白名单兜底
-  //   （用 registeredKeys 去校验未注册键，等于把「本接口」变成永远失败的 500）。
-  const res = applyConfigChanges({
-    changes: {},
-    deleteKeys: targets,
-    allowDeleteKeys: new Set(targets),
-    skipBackup: true,
-  });
-  if (!res.ok) {
-    return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: res.error || "删除失败" }, 500);
+  const deleted: string[] = [];
+  if (targets.length > 0) {
+    const res = applyConfigChanges({
+      changes: {},
+      deleteKeys: targets,
+      allowDeleteKeys: new Set(targets),
+      skipBackup: true,
+    });
+    if (!res.ok) {
+      return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: res.error || "删除失败" }, 500);
+    }
+    deleted.push(...res.deleted);
+  }
+  if (unmappedTargets.length > 0) {
+    deleted.push(...deleteUnmappedKeys(unmappedTargets));
   }
   refreshManagedValues(true);
   return c.json({
     ok: true,
-    deleted: res.deleted,
+    deleted,
+    // [C-3.1] 被判定「已注册」而跳过的键：前端据此提示用户，而不是让整批失败
+    skipped,
     remaining: listOrphanKeysExcludingSkills(getRegistry(), getSkillRegistry()),
   });
 });
+
+/** 顶层 `_unmapped` 的键名（读不到就返回空表：删除接口不该因为文件坏而 500，先让它能删别的） */
+function unmappedKeysSafe(): Record<string, unknown> {
+  try {
+    return readUnmapped();
+  } catch {
+    return {};
+  }
+}
 
 export default router;

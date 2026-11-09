@@ -106,9 +106,9 @@ REM NOTE: .vscode, docs, .git are NOT copied (ignored / not for distribution)
 REM ---------- Copy files ----------
 echo   - Copying files ...
 
-REM Copy .env.example (renamed to .env later in the intermediate folder)
-echo     .env.example ...
-copy /y ".env.example" "%OUTPUT_DIR%\.env.example" >nul
+REM Copy env.example.json (renamed to env.json later in the intermediate folder)
+echo     env.example.json ...
+copy /y "env.example.json" "%OUTPUT_DIR%\env.example.json" >nul
 
 REM Copy config files
 echo     package.json ...
@@ -124,15 +124,15 @@ REM Copy start.bat (preserved from project root)
 echo     start.bat ...
 copy /y "start.bat" "%OUTPUT_DIR%\start.bat" >nul
 
-REM NOTE: .env, .gitignore, packageZip.bat are NOT copied (ignored / script itself)
+REM NOTE: env.json, .env, .gitignore, packageZip.bat are NOT copied (secrets / ignored / script itself)
 
-REM ---------- Handle .env in intermediate folder ----------
-echo   - Setting up .env in intermediate folder ...
-REM Delete .env if present (should not be copied, safety)
-if exist "%OUTPUT_DIR%\.env" del /q "%OUTPUT_DIR%\.env"
-REM Rename .env.example to .env
-if exist "%OUTPUT_DIR%\.env.example" (
-    ren "%OUTPUT_DIR%\.env.example" ".env"
+REM ---------- Handle env.json in intermediate folder ----------
+echo   - Setting up env.json in intermediate folder ...
+REM Delete env.json if present (must not ship user secrets, safety)
+if exist "%OUTPUT_DIR%\env.json" del /q "%OUTPUT_DIR%\env.json"
+REM Rename env.example.json to env.json
+if exist "%OUTPUT_DIR%\env.example.json" (
+    ren "%OUTPUT_DIR%\env.example.json" "env.json"
 )
 
 echo   [OK] Bots-Portable folder built.

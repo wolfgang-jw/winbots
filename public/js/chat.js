@@ -1933,7 +1933,7 @@
                 <option value="false"${it.value === "false" ? " selected" : ""}>false</option>
               </select>`;
         } else if (it.type === "enum") {
-            // [批次三 / SH-47 ①] 有 enumLabels 时显示中文（值仍是原始 token，写回 .env 不变），
+            // [批次三 / SH-47 ①] 有 enumLabels 时显示中文（值仍是原始 token，写回 env.json 不变），
             //   否则回退显示原始值（既有枚举项行为完全不变）
             const labels = it.enumLabels || {};
             control = `<select class="config-input" id="${id}" data-config-key="${it.key}">
@@ -1978,7 +1978,7 @@
             ${secretActions}
             <div class="config-item__desc">${escapeHtml(it.desc || "")}</div>
             ${it.shadowed
-              ? '<div class="config-item__warn">⚠️ 该系统环境变量已存在，改 <code>.env</code> 需先清除系统环境变量方可生效（只读提示）。</div>'
+              ? '<div class="config-item__warn">⚠️ 该系统环境变量已存在，改 <code>env.json</code> 需先清除系统环境变量方可生效（只读提示）。</div>'
               : ""}
             <div class="config-item__error" data-error-for="${it.key}" hidden></div>
           </div>`;
@@ -2042,13 +2042,15 @@
         if (note) note.hidden = !marked;
     }
 
-    /** 顶部提示：.env 不存在时告知将自动创建（F-CFG-6 / AC-CFG-9） */
+    /** 顶部提示：env.json 不存在时告知路径与修复方式（F-CFG-6 / AC-CFG-9）
+     *  ⚠️ 迁移后配置文件名是 env.json；data.envPath 由服务端给出，文案不再写死 .env。
+     *  也【不能】再说「保存时将自动创建」——llm[0].key 是必需项，自动创建出来也起不来。 */
     function renderConfigEnvNotice(data) {
         const el = document.getElementById("config-notice");
         if (!el) return;
         if (data.envExists === false) {
             el.hidden = false;
-            el.textContent = `未找到 .env（${data.envPath}），保存时将自动创建。`;
+            el.textContent = `未找到配置文件 env.json（${data.envPath}），请复制 env.example.json 为 env.json 后重启。`;
         } else {
             el.hidden = true;
             el.textContent = "";
@@ -2120,7 +2122,7 @@
         const okConfirm = await WinbotsConfirm({
             source: "save-config",
             title: "确认应用变更",
-            message: `确认应用以下变更？\n\n${confirmParts.join("\n\n")}\n\n修改前会自动备份 .env。`,
+            message: `确认应用以下变更？\n\n${confirmParts.join("\n\n")}\n\n修改前会自动备份 env.json。`,
             okText: "应用变更",
             cancelText: "取消",
             danger: false
@@ -2202,14 +2204,15 @@
             const lines = [`✅ 已写入 ${written.length} 项、恢复默认 ${restored.length} 项。`];
             if (restored.length) lines.push(`↩️ 已恢复默认（键已删除）：${restored.join(", ")}`);
             if (Array.isArray(data.managedByValues) && data.managedByValues.length) {
-                lines.push(`⚡ 工具配置即时生效（取值层读 .env）：${data.managedByValues.length} 项`);
+                lines.push(`⚡ 工具配置即时生效（取值层读 env.json）：${data.managedByValues.length} 项`);
             }
             if (Array.isArray(data.skippedByWhitelist) && data.skippedByWhitelist.length) {
                 lines.push(`⚠️ 未注入进程环境（不在热重载白名单）：${data.skippedByWhitelist.join(", ")}`);
             }
             if (data.backupFile) lines.push(`🗂 备份：data/envbk/${data.backupFile}`);
             if (Array.isArray(data.cleared) && data.cleared.length > 0) lines.push(`🧹 已清空：${data.cleared.join(", ")}`);
-            if (data.envCreated) lines.push("🆕 已创建 .env（首次保存）。");
+            // [env.json] 首次保存会新建 env.json（此前不存在时）；文件名不再是 .env。
+            if (data.envCreated) lines.push("🆕 已新建 env.json（首次保存）。");
             if (hot.length) lines.push(`⚡ 已立即生效：${hot.join(", ")}`);
             if (need.length) lines.push(`🔁 需重启服务后生效：${need.join(", ")}`);
             if (data.degraded) lines.push(`⚠️ ${data.degraded}`);
@@ -3027,7 +3030,13 @@
             const box = document.getElementById("config-form");
             if (box) renderConfigForm(box);
             const resultEl = document.getElementById("config-result");
-            if (resultEl) resultEl.textContent = "🧹 已删除 " + keys.length + " 个遗留键。";
+            if (resultEl) {
+                // [C-3.1] 服务端可能跳过「仍被扫描注册」的键（不再整批 400），这里如实回报
+                const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+                let msg = "🧹 已删除 " + (Array.isArray(data.deleted) ? data.deleted.length : keys.length) + " 个遗留键。";
+                if (skipped.length) msg += "\n⚠️ 已跳过 " + skipped.length + " 个仍被扫描注册的键（不能按遗留键删除）：" + skipped.join(", ");
+                resultEl.textContent = msg;
+            }
         } catch (e) {
             if (errEl) { errEl.hidden = false; errEl.textContent = "❌ 删除失败：" + String(e.message || e); }
         }

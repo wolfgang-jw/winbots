@@ -4,7 +4,7 @@
  *
  * 职责（规范 §8 / §13）：
  *   1. 定义 Tool / ToolContext 契约（供 etc/tools 下的工具文件实现）
- *   2. ensureToolRegistry()：目录指纹校验 + 可重入扫描 + 一次性存量迁移
+ *   2. ensureToolRegistry()：目录指纹校验 + 可重入扫描
  *   3. getToolDefinitions()：按「祖先目录 AND 组开关 AND 工具自身条件」组装清单，
  *      打一行可见性日志；全部关闭时返回空数组（调用方据此不下发 tools 字段）
  *   4. executeTool()：唯一执行出口，按「不存在 / 已停用 / 暂不可用」分级回应
@@ -33,7 +33,9 @@ import { env } from "@/infra/env";
 import { MAX_TOOL_ENTRIES } from "./paths";
 import { ensureRegistry, getRegistry, type Registry } from "./scan";
 import { groupState, refreshManagedValues } from "@/infra/settings";
-import { runLegacyMigration } from "@/infra/migrate";
+// ⚠️ 迁移后不再 import @/infra/migrate（迁移文档 4.2 / 4.8）：
+//    存量迁移（.env → env.json）已并入启动链的 envJson.migrateFromDotenv()，早于任何请求；
+//    本文件跑在请求边界，太晚，且旧的 parseEnvText 已随 .env 支持一并删除。
 // [skill / 升级 §3.4] 元工具 skill__get_l2：代码内置、配置页看不见、开关关不掉。
 //   ⚠️ 环依赖（R5）：skills/l2tool.ts **不得** import 本文件（连 `import type` 也不行，
 //      Bun 直跑 .ts 不保证擦除 type-only import，会成环并在启动时报
@@ -85,19 +87,16 @@ export interface Tool {
     enabled?: () => boolean;
 }
 
-/** 存量迁移是否已完成（失败时保持 false，下次请求重试） */
-let migrationDone = false;
-
 /**
- * 对话请求 / 配置页的统一入口：指纹校验 + 可重入扫描 + 首次成功扫描后的存量迁移。
+ * 对话请求 / 配置页的统一入口：指纹校验 + 可重入扫描。
  * 幂等、可并发调用（重入去重由 scan.ts 的 in-flight 保证）。
+ *
+ * ⚠️ 迁移后**只做两件事**：托管键缓存刷新 + 扫描。
+ *    存量迁移已上移到启动链（env.ts 模块顶层，见迁移文档 4.3.4），不再由请求边界触发。
  */
 export async function ensureToolRegistry(opts: { force?: boolean } = {}): Promise<void> {
-    refreshManagedValues();                        // .env mtime 变了就重读托管键（§7.4 取值源）
-    const reg = await ensureRegistry(opts);
-    if (!migrationDone && reg.registeredKeys.size > 0) {
-        migrationDone = await runLegacyMigration(); // 幂等；失败返回 false → 下次请求重试
-    }
+    refreshManagedValues();                        // env.json 变了就重读 tools 块（§7.4 取值源）
+    await ensureRegistry(opts);
 }
 
 /** OpenAI Chat Completions 的 tools 条目形状 */

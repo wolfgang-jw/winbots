@@ -20,7 +20,7 @@ import { extname, join, relative } from "path";
 import { pathToFileURL } from "url";
 import type { Tool } from "./index";
 import type { SettingDef, SettingKind } from "@/infra/settings";
-import { parseEnvText, readEnvFile } from "@/infra/configFile";
+import { listJsonCandidateKeys, listUnmappedKeys } from "@/infra/envJson";
 import {
   DIR_SETTINGS_FILE, MAX_DIR_DEPTH, MAX_KEY_LEN, MAX_VISIBLE_NAME_LEN,
   TOOLS_ROOT, checkName, computeVersion, dirSettingKey, dirToggleKey,
@@ -704,18 +704,26 @@ export async function ensureRegistry(opts: { force?: boolean } = {}): Promise<Re
  * ============================================================ */
 
 /**
- * 遗留键：命中三类保留前缀 + 未被本次扫描注册。
- * 用户手写的、不命中前缀的行一概不列入、不删除、不提示。
+ * 遗留键（§10.1）：本应被托管、但当前无人认领的键。
+ *
+ * 两个来源（迁移文档第零章 P1 / 4.6.5）：
+ *   ① `env.json` 的 `tools` 块里、**命中托管前缀但未被本次扫描注册**的键 —— 与迁移前同口径；
+ *   ② `env.json` 顶层的 `_unmapped` —— 从 `.env` 迁移时未识别的键（**不按前缀过滤**：
+ *      它们本来就是「没被任何规则认领」的键，正是最需要用户核对的那批）。
+ *
+ * ⚠️ 顶层 `_comment` 之类的备注**不算**遗留键（方案 3.5）。
  */
 export function listOrphanKeys(reg: Registry = registry): string[] {
-  const snap = readEnvFile();
-  const fileMap = parseEnvText(snap.text);
   const registeredLower = new Set([...reg.registeredKeys].map((k) => k.toLowerCase()));
+  const unmapped = new Set(listUnmappedKeys());
   const out: string[] = [];
-  for (const key of fileMap.keys()) {
+  for (const key of listJsonCandidateKeys()) {
+    // ② _unmapped：全部算遗留键（不按前缀过滤）
+    if (unmapped.has(key)) { out.push(key); continue; }
+    // ① tools 块：只认命中托管前缀的（用户手写的不相干键不算遗留键）
     if (!hasManagedPrefix(key)) continue;
     if (registeredLower.has(key.toLowerCase())) continue;
     out.push(key);
   }
-  return out.sort();
+  return [...new Set(out)].sort();
 }
