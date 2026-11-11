@@ -91,6 +91,19 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_seq
 
 CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
     ON sessions(updated_at DESC);
+
+-- [agent / 第 8 步 模块 6b] 记忆摘要：游标 + 事实，单表设计。
+-- 一个 agent 在一处作用域内只有一行：scope = 'global' 或 'session:<sid>'。
+-- summarized_seq 是「已消化到 messages.seq 的哪一条」，游标推进与 facts 写入必须同事务。
+-- 刻意不设外键：删会话不应静默级联删掉长期记忆（方案 §3.7.1）。
+CREATE TABLE IF NOT EXISTS agent_memory (
+    agent_uid      TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    summarized_seq INTEGER NOT NULL DEFAULT 0,
+    facts          TEXT,
+    updated_at     INTEGER NOT NULL,
+    PRIMARY KEY (agent_uid, scope)
+);
 `;
 
 /**

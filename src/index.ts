@@ -20,6 +20,8 @@ import logRoute from "@/routes/log";   // [Sprint 5.1 / US-LOG-4]
 import configRoute from "@/routes/config";   // [配置页 / US-CFG-PAGE-1]
 import approvalRoute from "@/routes/approval";   // [批次三 / NH-02 ②③] 审批通道
 import skillsRoute from "@/routes/skills";   // [skill] 技能只读查询（清单 / 预览）
+// [agent / 第 8 步 模块 6b] 记忆摘要：独立路由，完全脱离对话主循环（A11）
+import { memoryRoute } from "@/routes/memory";
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
@@ -47,6 +49,8 @@ app.route("/api/config", configRoute);   // [配置页 / US-CFG-PAGE-1]
 app.route("/api/approvals", approvalRoute);
 // [skill] 技能只读接口：配置页「预览」与清单的数据源（必须在 serveStatic 之前注册）
 app.route("/api/skills", skillsRoute);
+// [agent / 第 8 步 模块 6b] 记忆摘要（必须在 serveStatic 之前，否则会返回 HTML）
+app.route("/api/memory", memoryRoute);
 
 // ============================================
 // 静态文件服务（前端页面）

@@ -77,3 +77,12 @@ export {
   resolveLlm, DEFAULT_LLM_NAME,
   type ResolvedLlm,
 } from "./llmResolve";
+
+// ── 第 8 步（模块 6b：记忆摘要）────────────────────────────────────────
+// 只转发「纯逻辑」（拼提示词 / 解析 / 单次 LLM 调用）；
+// 数据读写仍在 @/infra/memory，游标推进由 routes/memory.ts 编排 ——
+// agents/ 不依赖存储层，这与 binding.ts 的约束一致。
+export {
+  buildSummarizePrompt, parseSummarizeOutput, callSummarizeLlm,
+  type SummarizeMessage, type SummarizeParams, type SummarizeResult,
+} from "./memorySummarize";
