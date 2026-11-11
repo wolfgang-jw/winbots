@@ -2090,3 +2090,44 @@ body.approval-open { overflow: hidden; }
     .agent-editor__cols { flex-direction: column; }
     .agent-editor__text { min-height: 180px; }
 }
+
+/* ============================================
+   [agent / 补充需求 R-1 方案 A] 对话页智能体选择器
+   位置：输入框上方一行，与 .chat-usage 视觉同族。
+   语义：仅控制随请求体发出的 agentUid；不改变布局主结构。
+   ============================================ */
+.chat-agent-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--text-secondary, #666);
+}
+
+.chat-agent-bar__label {
+    flex: 0 0 auto;
+    color: var(--text-secondary, #666);
+}
+
+.chat-agent-bar__select {
+    flex: 0 1 260px;
+    min-width: 0;
+    padding: 4px 8px;
+    font-size: 12px;
+    border: 1px solid var(--border-color, #d0d0d0);
+    border-radius: 4px;
+    background: var(--bg-elevated, #fff);
+    color: inherit;
+}
+
+.chat-agent-bar__select:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.chat-agent-bar__hint {
+    flex: 1 1 auto;
+    color: var(--text-secondary, #888);
+    font-size: 11px;
+}

@@ -100,6 +100,14 @@
         <div class="chat-usage" id="chat-usage"></div>
 
         <!-- 输入区域 -->
+        <div class="chat-agent-bar" id="chat-agent-bar">
+            <label class="chat-agent-bar__label" for="chat-agent-select">智能体</label>
+            <select class="chat-agent-bar__select" id="chat-agent-select" disabled>
+                <option value="">（默认 · 不绑定智能体）</option>
+            </select>
+            <span class="chat-agent-bar__hint" id="chat-agent-hint"></span>
+        </div>
+
         <div class="chat-input-area">
             <div class="chat-input-wrapper">
                 <textarea class="chat-input" id="chat-input" rows="1"

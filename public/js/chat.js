@@ -80,6 +80,8 @@
         stopBtn: document.getElementById("chat-stop-btn"),   // [US-3.1] 打断入口
         status: document.getElementById("chat-status"),
         usage: document.getElementById("chat-usage"),
+        chatAgentSelect: document.getElementById("chat-agent-select"),
+        chatAgentHint: document.getElementById("chat-agent-hint"),
         // R2-1：已删除默认问题行（#chat-suggestions），此处不再缓存其引用
         // [US-4.8] 顶部菜单与多视图元素
         menuItems: document.querySelectorAll(".top-menu__item"),
@@ -151,6 +153,11 @@
         dsmlBlocked: false,
         /** @type {string} [批次二 / NB-06、AC-CUE-02] 本轮已收到的 notice 文案（"" 表示本轮没有 notice） */
         currentNoticeText: "",
+        chatAgentUid: "",
+        chatAgentOptions: [],
+        chatAgentLoaded: false,
+        chatAgentLocked: false,
+        chatAgentBoundUid: "",
     };
 
     // ============================================
@@ -938,6 +945,10 @@
     function setInputEnabled(enabled) {
         $dom.input.disabled = !enabled;
         $dom.sendBtn.disabled = !enabled;
+        // [agent / R-1] 流式期间锁定选择器：绑定必须在首轮确定，中途改了也没有意义
+        if ($dom.chatAgentSelect) {
+            $dom.chatAgentSelect.disabled = !enabled || state.chatAgentOptions.length === 0;
+        }
         if (enabled) {
             $dom.input.focus();
         }
@@ -1161,6 +1172,7 @@
                 },
                 // [US-3.3] 请求体新增 requestId
                 body: JSON.stringify({
+                    ...(state.chatAgentUid ? { agentUid: state.chatAgentUid } : {}),
                     sessionId: state.sessionId,
                     message,
                     requestId: state.currentRequestId,
@@ -1176,11 +1188,25 @@
                 try {
                     const errData = await response.json();
                     errorMsg = errData.error || errorMsg;
+                    // [agent / R-1] 服务端 A14 锁定语义：已绑定会话收到不同 uid 返回 409
+                    if (errData.error === "agent_locked" || response.status === 409) {
+                        errorMsg = "本会话已绑定其他智能体，无法切换（请新建会话）";
+                        state.chatAgentLocked = true;
+                        // 回滚到服务端实际绑定的 uid，避免下拉停在一个未生效的值上
+                        if (state.chatAgentBoundUid) {
+                            state.chatAgentUid = state.chatAgentBoundUid;
+                        }
+                        renderChatAgentOptions();
+                    }
                 } catch {
                     // 忽略 JSON 解析错误
                 }
                 throw new Error(errorMsg);
             }
+
+            // [agent / R-1] 本轮请求已被服务端接受（未 409）→ 该 uid 即为本会话的绑定值，
+            // 后续若用户切换候选，409 时用它回滚下拉显示。
+            state.chatAgentBoundUid = state.chatAgentUid || "";
 
             // 获取可读流
             const reader = response.body.getReader();
@@ -1571,6 +1597,9 @@
 
             // 3. 更新当前会话 ID（续接该会话）
             state.sessionId = id;
+            // [agent / R-1 方案 A] 按该会话已绑定的 agent 恢复选择器；
+            // 已绑定则置 locked，避免用户误以为可以切换（服务端 A14 会 409）。
+            applyChatAgentBinding(data.session && data.session.agentUid ? data.session.agentUid : "", !!(data.session && data.session.agentUid));
             persistSessionId(id);
 
             // 4. 滚动到底部
@@ -1635,6 +1664,8 @@
         state.currentAssistantContent = "";
         state.currentModel = "";
         state.currentSkills = [];
+        // [agent / R-1 方案 A] 新会话解除 agent 绑定，选择器可重新选择
+        applyChatAgentBinding("", false);
         state.completed = false;
 
         // 5. 分配全新会话 ID（D1 绕过缓存）：直接调服务端分配接口，
@@ -1720,6 +1751,11 @@
             renderSessionList();
         }
 
+        // 3.5 [agent / R-1 方案 A] 切到会话视图时确保选择器已加载
+        if (view === "chat") {
+            loadChatAgentOptions();
+        }
+
         // 4. [配置页 / US-CFG-PAGE-1] 切到配置视图时拉取配置（AC-CFG-1）
         if (view === "config") {
             loadConfigView();
@@ -1736,15 +1772,87 @@
     }
 
     /**
-     * [US-4.8] 渲染历史会话列表（F2-3）。
+     * [agent / R-1 方案 A] 加载对话页智能体候选列表（GET /api/agents）。
      *
-     * 数据来源：GET /api/chat/sessions（US-4.3），已按最后活动时间倒序。
-     * 交互：
-     *   - 点击列表项 → openSession(id) 打开并切回会话视图；
-     *   - 点击删除按钮 → DELETE /api/chat/sessions/:id（US-4.6）后刷新列表。
+     * 只收录 status === "ok" 的 agent（invalid 不出现，避免绑定空人格会话）。
+     * 交互说明已移至 renderSessionList 自身注释。
+     * 成功后置 chatAgentLoaded，避免重复请求。
+     * 无副作用：仅填充 state.chatAgentOptions 并触发重绘。
      *
-     * 安全：标题/时间经 escapeHtml 转义，防止 XSS。
+     * 注意：本函数不做 XSS 拼接，option 一律用 textContent 构造。
      *
+     * @returns {Promise<void>}
+     */
+    async function loadChatAgentOptions() {
+        if (!$dom.chatAgentSelect) return;
+        if (state.chatAgentLoaded) return;
+        try {
+            const resp = await fetch("/api/agents");
+            if (!resp.ok) {
+                console.warn("[agent / R-1] 加载智能体列表失败:", resp.status);
+                return;
+            }
+            const data = await resp.json();
+            // /api/agents 返回 {"ok":true,"items":[...]}，字段名是 items 而非 agents。
+            const list = (data && Array.isArray(data.items)) ? data.items : [];
+            // 只放 status === "ok" 的 agent：invalid（如正文为空）绝不能被选中，
+            // 否则会绑出“绑定成功但人格为空且被锁定”的会话（R-2 与 R-1 的串联风险）。
+            state.chatAgentOptions = list
+                .filter((a) => a && a.status === "ok")
+                .map((a) => ({ uid: a.uid, path: a.path, status: a.status }));
+            state.chatAgentLoaded = true;
+            renderChatAgentOptions();
+        } catch (e) {
+            console.warn("[agent / R-1] 加载智能体列表异常:", e);
+        }
+    }
+
+    function renderChatAgentOptions() {
+        const sel = $dom.chatAgentSelect;
+        if (!sel) return;
+        const keep = state.chatAgentUid;
+        // 用 DOM API 构造 option：路径是不可信文本，绝不拼 innerHTML。
+        sel.innerHTML = "";
+        const optDefault = document.createElement("option");
+        optDefault.value = "";
+        optDefault.textContent = "（默认 · 不绑定智能体）";
+        sel.appendChild(optDefault);
+        for (const a of state.chatAgentOptions) {
+            const o = document.createElement("option");
+            o.value = a.uid;
+            o.textContent = a.path;
+            sel.appendChild(o);
+        }
+        sel.value = state.chatAgentOptions.some((a) => a.uid === keep) ? keep : "";
+        // 已绑定但列表尚未加载（或该 agent 已变 invalid）时，补一个占位项显示其 uid，
+        // 避免下拉显示为「不绑定」而误导出错误认知。
+        if (keep && !state.chatAgentOptions.some((a) => a.uid === keep)) {
+            const o = document.createElement("option");
+            o.value = keep;
+            o.textContent = keep + "（已绑定）";
+            sel.appendChild(o);
+            sel.value = keep;
+        }
+        // 注意：不在此处回写 state.chatAgentUid —— 列表尚未加载时 keep 可能不在候选中，
+        // 回写会静默丢掉 applyChatAgentBinding 传入的已绑定 uid。
+        sel.disabled = state.chatAgentOptions.length === 0 || state.isStreaming || state.chatAgentLocked;
+        if ($dom.chatAgentHint) {
+            $dom.chatAgentHint.textContent = state.chatAgentLocked
+                ? "本会话已绑定，不可切换"
+                : (state.chatAgentOptions.length === 0 ? "暂无可用智能体" : "");
+        }
+    }
+
+    function applyChatAgentBinding(uid, locked) {
+        state.chatAgentUid = uid || "";
+        state.chatAgentLocked = !!locked;
+        // locked 表示服务端已确认绑定，此时的 uid 就是回滚基准
+        state.chatAgentBoundUid = locked ? (uid || "") : "";
+        renderChatAgentOptions();
+    }
+
+    /**
+     * [US-4.8] 渲染历史会话列表（F2-3）。数据源 GET /api/chat/sessions；标题经 escapeHtml 转义。
      * @returns {Promise<void>}
      */
     async function renderSessionList() {
@@ -3078,6 +3186,18 @@
 
         // 发送按钮点击
         $dom.sendBtn.addEventListener("click", sendMessage);
+
+        // [agent / R-1] 智能体选择器变更：只更新本地状态；已绑定会话禁止切换（服务端会 409）
+        if ($dom.chatAgentSelect) {
+            $dom.chatAgentSelect.addEventListener("change", (e) => {
+                if (state.chatAgentLocked) {
+                    e.target.value = state.chatAgentBoundUid || state.chatAgentUid;
+                    setStatus("⚠️ 本会话已绑定智能体，不可切换（请新建会话）", "chat-status--error");
+                    return;
+                }
+                state.chatAgentUid = e.target.value || "";
+            });
+        }
 
         // [US-3.1] 停止按钮点击（打断入口）
         if ($dom.stopBtn) {

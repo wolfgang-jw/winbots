@@ -118,13 +118,20 @@ export function emptyAgentRegistry(fingerprint = ""): AgentRegistry {
   };
 }
 
-/** 读取 AGENT.md；不存在返回空串（正文是可选的，判据是 setup.json） */
-function readBody(dir: string): { text: string; bytes: number } {
+/**
+ * 读取 AGENT.md；不存在返回空串（正文是可选的，判据是 setup.json）
+ *
+ * 返回 exists 用于区分「文件不存在」与「文件存在但为 0 字节」：
+ *   前者合法（正文可选，只靠 setup.json 也能建 agent）
+ *   后者是 R-2 要判 invalid 的空壳（正文空 → 无任何人设可注入）
+ * 二者 bytes 都是 0，仅靠体积无法区分，故必须显式带出。
+ */
+function readBody(dir: string): { text: string; bytes: number; exists: boolean } {
   try {
     const text = readFileSync(join(dir, AGENT_FILE), "utf-8");
-    return { text, bytes: Buffer.byteLength(text, "utf-8") };
+    return { text, bytes: Buffer.byteLength(text, "utf-8"), exists: true };
   } catch {
-    return { text: "", bytes: 0 };
+    return { text: "", bytes: 0, exists: false };
   }
 }
 
@@ -289,6 +296,33 @@ export function scanAgentsOnce(
       systemBudget: s.systemBudget,
       status: "ok",
     });
+
+    /* ④' 正文空判定（R-2）：AGENT.md 存在但内容为空/纯空白 → invalid。
+     *
+     * 为什么放在这里、而不是改上面的 status: "ok"：
+     *   "ok" 的语义是「通过 setup.json 校验」，这一步它确实通过了，标记本身没错。
+     *   本段是在其之上按「正文可用性」追加降级，职责分离。
+     *
+     * 为什么必须放在 ⑤ 之前：
+     *   ⑤ 只遍历 status === "ok" 的记录做 uid 去重。若放在 ⑤ 之后，
+     *   一个空正文 agent 会先参与去重、可能把同 uid 的合法记录一起判 invalid，
+     *   且最终 invalidReason 会被去重文案覆盖，丢失 "invalid_body:" 前缀。
+     *
+     * 阈值口径（不可放宽为「过短」）：
+     *   只判「空 / 纯空白」。AGENT.md 内容为 "x"（1 字节）仍须判 ok——
+     *   长度是作者的自由，本规则只拦「完全没有人设」这一种情况，
+     *   否则会误伤刻意精简的合法 agent。
+     *
+     * 与 32KB warn 的关系：
+     *   上方 >32KB 只 warn 不 invalid（正文长了仍能注入，只是费 token）；
+     *   这里是空了不能注入，性质不同，故判 invalid。
+     */
+    const added = raw[raw.length - 1];
+    if (body.exists && body.text.trim() === "") {
+      added.status = "invalid";
+      added.invalidReason = "invalid_body: AGENT.md 存在但正文为空（0 字节或纯空白），无任何人设可注入";
+      warn(`agent ${dir} 的 AGENT.md 为空，标记 invalid`);
+    }
   }
 
   /* ⑤ uid 重复检测（R-18）：两个目录同 uid → **两个都 invalid** */
