@@ -42,6 +42,12 @@ export type BindingResolution =
       systemBudget: number;
       maxRounds: number | null;
       memoryEnabled: boolean;
+      /**
+       * agent 指定的 LLM 名字（setup.json 的 llm）；null = 未指定，走 env 的默认组。
+       * ⚠️ 本字段**只转手**，不在此处查表：llmResolve.resolveLlm 负责按 name 解析，
+       *    原因是 binding.ts 不得 import @/infra/*（见文件头依赖铁律 + D-7-1）。
+       */
+      llmRef: string | null;
     }
   /** 降级：目录被删 / setup 损坏 / uid 重复 → 按未绑定装配，但工具全拒（元工具除外，A17） */
   | { kind: "degraded"; reason: string; personaText: string };
@@ -98,6 +104,8 @@ export function resolveBinding(
     personaText: personaSnapshot ?? "",
     toolFilter: toolFilterOf(rec),
     skillPolicy: resolveSkillPolicy(rec.skillsMode, rec.skillsAllow),
+    // [第 7 步 A3] 只转手 llmRef，不查表（查表在 llmResolve.ts，避免 binding 依赖 infra）
+    llmRef: rec.llmRef,
     systemBudget: rec.systemBudget,
     maxRounds: rec.maxRounds,
     memoryEnabled: rec.memoryEnabled,

@@ -70,6 +70,8 @@ describe("resolveBinding · 判据顺序", () => {
         expect(r.agent.uid).toBe("ag_00000001");
         expect(r.memoryEnabled).toBe(true);
         expect(r.systemBudget).toBe(9000);
+        // [第 7 步 A3] bound 分支必须转手 llmRef（不查表，只透传）
+        expect(r.llmRef).toBe(r.agent.llmRef);
     });
 
     test("T-B3 目录被删：uid 不在表 → degraded，reason 含 uid", () => {

@@ -70,3 +70,10 @@ export {
   resolveBinding,
   type BindingResolution,
 } from "./binding";
+
+// ── 第 7 步（模块 6a：LLM 解析）────────────────────────────────────────
+// 只转发查表纯函数；llm[] 由调用方注入（本文件不 import @/infra/envJson）。
+export {
+  resolveLlm, DEFAULT_LLM_NAME,
+  type ResolvedLlm,
+} from "./llmResolve";

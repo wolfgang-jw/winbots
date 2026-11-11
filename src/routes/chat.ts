@@ -88,8 +88,11 @@ import {
     buildSystemText, fitSystemBudget,
     ensureAgentRegistry, getAgentRegistry, resolveBinding,
     isSkillAllowedByPolicy, denyAllToolFilter,
+    // [agent / 第 7 步 模块 6a] LLM 查表纯函数 + 结果类型（llm[] 由本文件从 env.json 注入）
+    resolveLlm, type ResolvedLlm,
 } from "@/agents";
 // [agent / 第 6 步 F3] env 不暴露 llm[]，合法 llm 名字集合必须从 env.json 直接取。
+// [agent / 第 7 步] 同一份 llm[] 也用于 agent 的 LLM 解析 —— 见 C2。
 import { loadEnvJson } from "@/infra/envJson";
 import {
     generateSessionId,
@@ -605,38 +608,12 @@ router.post("/stream", async (c) => {
             }
         }
 
-        // ── 2. 构建 Chat Completions API 请求 ──────────────────────
-        const base = env.LLM_API_BASE.replace(/\/+$/, "");
-        const apiUrl = base.endsWith("/v1")
-            ? `${base}/chat/completions`
-            : `${base}/v1/chat/completions`;
-
-        const headers = {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${env.LLM_API_KEY}`,
-        };
-
-        // 公共请求体（不含 stream / tools / messages，按轮拼装）
-        // [需求域 C / C-01、C-02、C-04] 思考相关字段按「下发方式」拼装，不再无条件写入：
-        //   取值来源仍是 LLM_THINKING / LLM_REASONING_EFFORT，
-        //   但「是否下发」只由 LLM_THINKING_MODE（none/effort/thinking/both）决定。
-        //   none（默认）时请求体不含这两个字段（C-02），保证非 DeepSeek 服务商不被拒（C-05）。
-        const baseBody = {
-            model: env.LLM_MODEL,
-            ...buildThinkingFields(
-                env.LLM_THINKING_MODE,
-                env.LLM_THINKING,
-                env.LLM_REASONING_EFFORT,
-            ),
-        };
-
-        // 工具定义快照（每次请求实时取，见 T-01）
-        // [skill / 升级版 §3.2] 装配在**请求边界**算一次、全请求复用；技能不再收窄工具面。
-        // ✅ [skill / 升级 §1、§3.5] 工具面 = 全部可用工具 ∪ 元工具，**与开了哪些技能无关**；
-        //    getToolDefinitions() 内部已按「祖先目录 AND 组开关 AND 工具自身条件」过滤，并已追加元工具。
+        // ── 2. 绑定解析 + LLM 解析（必须先于请求构造：base/headers/baseBody 都要用） ──
         // ── [agent / 第 6 步] 绑定解析：一次算清「人设 / 技能策略 / 工具判据 / 预算」 ──
         //   ⚠️ 顺序：必须先 resolveBinding，再算 toolDefs / skillAssembly ——
         //      工具判据是 getToolDefinitions 的入参，技能白名单是装配的入参，顺序反了拿不到。
+        //   ⚠️ 第 7 步：binding 还产出 llmRef，而 base/headers/baseBody 都要用它，
+        //      故本块整体上移到「请求构造」之前（仍在请求边界算一次，与 while 循环无关）。
         const binding = resolveBinding(boundAgentUid, boundPersonaSnapshot, getAgentRegistry());
         if (binding.kind === "degraded") {
             // A17：降级**不报错、不中断**，只告警一次
@@ -651,6 +628,81 @@ router.post("/stream", async (c) => {
         const agentSkillFilter = binding.kind === "bound"
             ? (c: { dir: string; name: string }) => isSkillAllowedByPolicy(binding.skillPolicy, c)
             : undefined;
+
+        // ── [agent / 第 7 步 模块 6a A3] LLM 解析：一次算清，全请求复用 ──
+        //   A3：agent 按 setup.json 的 llm（name）选 LLM；
+        //   unbound / degraded → llmRef 为 null → 取 llm[0]，与 env.LLM_* 逐字节一致（A8）。
+        //   ⚠️ F3：env 不暴露 llm[]，必须走 loadEnvJson()；此处已在 B2 读过一次，
+        //      但那是 try 块内的局部变量，这里再读一次（loadEnvJson 内部有 stamp 缓存，开销可忽略）。
+        //   ⚠️ 解析失败（env.json 损坏抛错）不能让请求 500（A17 精神）：
+        //      兜底为「用 env 的扁平字段」，即改造前的行为。
+        const llmRefOfBinding = binding.kind === "bound" ? binding.llmRef : null;
+        // ⚠️ 必须显式标注 ResolvedLlm：否则 `let` 从初值推断出的类型是
+        //    { thinkingMode: ThinkingMode, ... }，而下面 {...r} 展开出的
+        //    thinkingMode 是 string，赋值会触发 TS2322（strict=true）。
+        let agentLlm: ResolvedLlm = {
+            name: null,
+            base: env.LLM_API_BASE,
+            key: env.LLM_API_KEY,
+            model: env.LLM_MODEL,
+            thinking: env.LLM_THINKING,
+            reasoningEffort: env.LLM_REASONING_EFFORT,
+            thinkingMode: env.LLM_THINKING_MODE,
+            fallback: false,
+        };
+        try {
+            const r = resolveLlm(loadEnvJson().llm, llmRefOfBinding);
+            if (r) {
+                agentLlm = {
+                    ...r,
+                    // 缺省值单一来源（env.ts §3.2）：resolved 未给出时用 env 兜
+                    thinkingMode: r.thinkingMode || env.LLM_THINKING_MODE,
+                };
+            }
+        } catch (e) {
+            console.warn(
+                `⚠️  [llm] 解析失败，本轮沿用 env 的默认 LLM：` +
+                `${e instanceof Error ? e.message : String(e)}`,
+            );
+        }
+        if (agentLlm.fallback) {
+            console.warn(
+                `⚠️  [llm] 本轮已回退到「${agentLlm.name ?? "(未命名)"}」（agent 指定的名字未找到）`,
+            );
+        }
+
+        // ── 3. 构建 Chat Completions API 请求 ──────────────────────
+        // [agent / 第 7 步 A3] 连接参数按 agent 解析结果取；unbound 时与 env 完全相同（A8）。
+        const base = agentLlm.base.replace(/\/+$/, "");
+        const apiUrl = base.endsWith("/v1")
+            ? `${base}/chat/completions`
+            : `${base}/v1/chat/completions`;
+
+        const headers = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${agentLlm.key}`,
+        };
+
+        // 公共请求体（不含 stream / tools / messages，按轮拼装）
+        // [需求域 C / C-01、C-02、C-04] 思考相关字段按「下发方式」拼装，不再无条件写入：
+        //   取值来源仍是 LLM_THINKING / LLM_REASONING_EFFORT，
+        //   但「是否下发」只由 LLM_THINKING_MODE（none/effort/thinking/both）决定。
+        //   none（默认）时请求体不含这两个字段（C-02），保证非 DeepSeek 服务商不被拒（C-05）。
+        // [agent / 第 7 步 A3] model 跟随该 agent 的 LLM
+        const baseBody = {
+            model: agentLlm.model,
+            ...buildThinkingFields(
+                agentLlm.thinkingMode,
+                agentLlm.thinking,
+                agentLlm.reasoningEffort,
+            ),
+        };
+
+        // 工具定义快照（每次请求实时取，见 T-01）
+        // [skill / 升级版 §3.2] 装配在**请求边界**算一次、全请求复用；技能不再收窄工具面。
+        // ✅ [skill / 升级 §1、§3.5] 工具面 = 全部可用工具 ∪ 元工具，**与开了哪些技能无关**；
+        //    getToolDefinitions() 内部已按「祖先目录 AND 组开关 AND 工具自身条件」过滤，并已追加元工具。
+        // [agent / 第 6 步] binding / agentToolFilter / agentSkillFilter 已在上方统一解析（第 7 步上移）。
 
         const toolDefs = getToolDefinitions(agentToolFilter);
         // ✅ [skill / 升级 §3.2] 多技能装配：仍是请求边界算一次、全请求复用（同一请求内不切换）。
@@ -1022,7 +1074,8 @@ router.post("/stream", async (c) => {
                                 thinking: finalThinking || undefined,
                                 toolCalls: collectedToolCalls.length > 0 ? collectedToolCalls : undefined,
                                 usage: finalUsage ?? undefined,
-                                model: env.LLM_MODEL,
+                                // [agent / 第 7 步 A3] 历史记录必须标**实际使用的**模型（F4 最易漏点）
+                                model: agentLlm.model,
                                 elapsedMs: Date.now() - startedAt,
                                 startedAt,
                                 interrupted: upstreamController.signal.aborted || undefined,
@@ -1039,7 +1092,7 @@ router.post("/stream", async (c) => {
                         appendLlmLog({
                             sessionId: (sessionId as string) ?? null,
                             requestId: hasRequestId ? (requestId as string) : null,
-                            model: env.LLM_MODEL,
+                            model: agentLlm.model,
                             userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
                             assistantText: finalText || null,
                             thinking: finalThinking || null,
@@ -1067,7 +1120,7 @@ router.post("/stream", async (c) => {
                             appendLlmLog({
                                 sessionId: (sessionId as string) ?? null,
                                 requestId: hasRequestId ? (requestId as string) : null,
-                                model: env.LLM_MODEL,
+                                model: agentLlm.model,
                                 userInput: useServerHistory ? (message as string) : "(旧模式 messages)",
                                 assistantText: partial?.text || null,
                                 thinking: partial?.thinking || null,
