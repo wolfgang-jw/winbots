@@ -34,3 +34,11 @@ export {
   resetAgentRegistryForTest,
   type ScanDeps, type Stamp,
 } from "./scan";
+
+// ── 第 3 步（模块 4：技能过滤）──────────────────────────────────────────
+// 通配实现仍只在 ./match 里一份，此处只转发策略层，不重复导出匹配函数。
+export {
+  resolveSkillPolicy, isSkillAllowedByPolicy, isSkillAllowedForAgent,
+  filterSkillsForAgent,
+  type SkillRef, type SkillPolicy,
+} from "./skillPolicy";

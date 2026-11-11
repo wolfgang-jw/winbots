@@ -23,8 +23,19 @@ export interface AgentSetup {
   description: string;
   /** setup.json 的 llm，可空；非空时必须在注入的合法名字集合里 */
   llmRef: string | null;
+  /**
+   * 技能白名单模式（§3.1）。缺省 "allow"。
+   * 语义见 skillPolicy.resolveSkillPolicy 与 SkillPolicy 类型注释。
+   */
   skillsMode: AgentSkillsMode;
-  /** null = 不限制（§3.1「skills.list 缺省」） */
+  /**
+   * 技能白名单（§3.1）。
+   *
+   * ⚠️ 本字段在 AgentSetup（解析结果）里为 null 表示「setup.json 未写 list」。
+   *    它**不等于**「不限制」：skillsMode=allow 时 null 按**全禁**处理（裁决 D-3-1）。
+   *    只有 skillsMode="all" 才表示跟随全局开关。
+   *    （原注释「null = 不限制」是第 2 步遗留，与 mode 默认 allow 冲突，已更正。）
+   */
   skillsAllow: string[] | null;
   /** null = 不限制（§3.1「tools.allow 缺省 = 不限制」） */
   toolsAllow: string[] | null;
