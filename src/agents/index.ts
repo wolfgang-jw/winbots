@@ -53,3 +53,10 @@ export {
   toolNotAllowed, toolNotAllowedAgentUnavailable,
   type ToolRef, type ToolPolicy, type ToolFilter,
 } from "./toolPolicy";
+
+// ── 第 5 步（模块 3：system 装配与预算）────────────────────────────────
+// 只转发装配层，不转发预算实现（预算的唯一口径在 @/skills 的 budget.ts）。
+export {
+  buildSystemText, fitSystemBudget,
+  type PersonaPart, type BuildSystemParts, type BuiltSystem,
+} from "./prompt";

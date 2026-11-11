@@ -82,6 +82,8 @@ import { env } from "@/infra/env";
 import { ensureToolRegistry, getToolDefinitions, executeTool, toDisplayName } from "@/tools";
 // [skill / 升级 §3.1、§3.2] skill 子系统：指纹校验 + 多技能装配（不再收窄工具面）
 import { ensureSkillRegistry, assembleForRequestMulti } from "@/skills";
+// [agent / 第 5 步 §3] system 三段式装配（人设 → 技能 → 基础）；只从门面取，不直连 ./prompt。
+import { buildSystemText, fitSystemBudget } from "@/agents";
 import {
     generateSessionId,
     isValidSessionId,
@@ -537,11 +539,35 @@ router.post("/stream", async (c) => {
         const toolDefs = getToolDefinitions();
         // ✅ [skill / 升级 §3.2] 多技能装配：仍是请求边界算一次、全请求复用（同一请求内不切换）。
         const skillAssembly = assembleForRequestMulti();
+
+        // [agent / 第 5 步 §3] system 三段式装配：人设 → 技能声明 → 基础。
+        // ⚠️ 人设来源属第 6 步（会话绑定）；本步运行期恒为 null，走「无 agent」等价路径（D-5-2）。
+        //    agent 记录一旦接入，这里只需把 null 换成真实记录，**装配代码一行不用改**。
+        // ⚠️ 用 `let` 而非 `const`：`const x = null` 会被 TS 收窄成 `null` 字面量类型，
+        //    紧跟其后的 `x ? ... : ...` 会被判为「条件恒假」而报 TS2367/TS2801 类错误。
+        //    第 6 步把这里换成 `const agentCtx = resolveAgentForSession(...)` 后即可改回 const。
+        let agentCtx: { personaText: string } | null = null;
+        const built = buildSystemText({
+            persona: agentCtx ? { text: agentCtx.personaText } : null,
+            skillText: skillAssembly.systemText,
+            baseText: "",
+        });
+        // [agent / 第 5 步] 总预算：超限整段截断（复用 skills/budget.ts 的统一口径）。
+        //   第 6 步接入 agent 时传 systemBudget（P4）；本步无 agent 来源，故用缺省口径。
+        const systemFit = fitSystemBudget(built.systemText);
+        if (systemFit.truncated) {
+            console.warn(
+                `⚠️  [agent] system 超预算（原长 ${systemFit.originalChars} 字），已省略段落：` +
+                systemFit.omitted.join("、"),
+            );
+        }
         if (skillAssembly.skills.length > 0 || skillAssembly.notices.length > 0) {
             console.log(
                 `🧩 [skill] 本轮装配技能 ${skillAssembly.skills.length} 个` +
                 `（${skillAssembly.skillNames.join("、")}）｜${skillAssembly.diag}｜` +
-                `可见工具=${toolDefs.length} 个`,
+                `可见工具=${toolDefs.length} 个` +
+                `｜system=${systemFit.systemText.length} 字` +
+                `（人设=${built.parts.persona ? "有" : "无"}）`,
             );
         }
         // [T-VIS / §8.7] 工具可见性日志已下沉到 getToolDefinitions()：它按「祖先目录 / 组开关 /
@@ -626,9 +652,11 @@ router.post("/stream", async (c) => {
                         //   · 全关时 systemText === ""，与升级前一致（无 system、无 notice）。
                         //   ⚠️ 不要写进 while 里，否则每轮工具往返都会再插一条（C-3）。
                         //   ⚠️ 只注入内存，**不落库**（见 §6.2.8）。
-                        if (skillAssembly.systemText !== "") {
+                        // [agent / 第 5 步 §3] 注入源改为三段装配 + 预算裁剪后的结果（systemFit）。
+                        //   判定条件与位置不变：仍 !== ""、仍在 while 外、仍只插一次。
+                        if (systemFit.systemText !== "") {
                             workingMessages = [
-                                { role: "system", content: skillAssembly.systemText },
+                                { role: "system", content: systemFit.systemText },
                                 ...workingMessages,
                             ];
                         }
