@@ -571,3 +571,110 @@ export function deleteSession(sessionId: string): boolean {
     // changes > 0 表示确实删除了会话（否则会话不存在）
     return changes > 0;
 }
+
+// ============================================================
+// [agent / 第 6 步 A14 / A15 / A17] 会话 ↔ agent 绑定
+// ============================================================
+//
+// 设计说明：
+// - 绑定的**唯一数据源**是 sessions 表的 agent_uid / persona_snapshot 两列。
+//   所有读写都集中在本文件：会话数据的所有权只能有一处，否则「会话隔离 N4」的承诺失效。
+// - 三个函数覆盖完整生命周期：读（getSessionAgentBinding）/ 首轮写（bindSessionAgent）/
+//   降级清（unbindSessionAgent）。
+// - 判定规则（正常 / 降级 / 409）**不在本文件**：那是纯逻辑，放在 agents/binding.ts，
+//   本文件只管存取，不 import @/agents（保持 infra 不依赖业务域）。
+
+/**
+ * [agent / 第 6 步 A14] 会话的 agent 绑定信息。
+ *
+ * ⚠️ 独立成类型而不是往 SessionSummary 里加字段：
+ *   SessionSummary 是「列表页摘要」，被 listSessions / getSessionDetail 广泛使用；
+ *   给它加两个只有绑定逻辑才关心的字段，会让每个消费方都得看一眼（信息污染）。
+ */
+export interface SessionAgentBinding {
+    /** 绑定的 agent uid；null = 未绑定 */
+    agentUid: string | null;
+    /** 绑定时刻的人设快照；null = 未绑定 或 该 agent 无 AGENT.md */
+    personaSnapshot: string | null;
+}
+
+/**
+ * [agent / 第 6 步 A14] 读取会话的 agent 绑定。
+ *
+ * 语义：
+ *   · 会话不存在       → { agentUid: null, personaSnapshot: null }（按未绑定处理，A17）
+ *   · 会话存在但未绑定  → { agentUid: null, ... }
+ *   · 已绑定           → 返回真实值
+ *
+ * ⚠️ 不存在时**不抛错**：A17 要求「目录被删 / 会话丢失 → 降级为未绑定，不报错」。
+ *    把「不存在」与「未绑定」在读取层合并，降级逻辑就不必到处判 null。
+ *
+ * @param sessionId 会话 ID（调用方需先通过 isValidSessionId 校验）
+ */
+export function getSessionAgentBinding(sessionId: string): SessionAgentBinding {
+    const db = getDb();
+    const row = db
+        .query<{ agent_uid: string | null; persona_snapshot: string | null }, { $sid: string }>(
+            `SELECT agent_uid, persona_snapshot FROM sessions WHERE id = $sid`
+        )
+        .get({ $sid: sessionId });
+    return {
+        agentUid: row?.agent_uid ?? null,
+        personaSnapshot: row?.persona_snapshot ?? null,
+    };
+}
+
+/**
+ * [agent / 第 6 步 A14] 首轮绑定：把 agent 写进会话（仅当尚未绑定）。
+ *
+ * 为什么必须靠 SQL 做「判空 + 写入」而不是「先读后写」：
+ *   并发两轮首请求同时读到未绑定，各自写入 → 后写者覆盖先写者，
+ *   人设快照会被换掉（A15「绑定时刻快照不可变」被破坏）。
+ *   用 `WHERE agent_uid IS NULL` 让数据库做 CAS，第二次写入影响 0 行。
+ *
+ * @param sessionId       会话 ID
+ * @param agentUid        绑定的 agent uid（调用方需先确认它在注册表里且 status === "ok"）
+ * @param personaSnapshot 绑定时刻的 AGENT.md 全文；无正文时传 null
+ * @returns true = 本次写入生效（即首轮）；false = 已有绑定，本次未写（调用方据此做 409 判定）
+ */
+export function bindSessionAgent(
+    sessionId: string,
+    agentUid: string,
+    personaSnapshot: string | null,
+): boolean {
+    const db = getDb();
+    const now = Date.now();
+    // 会话行可能还不存在（/session 只分配了 ID，首条消息才建行）→ 先确保存在
+    ensureSessionRow(sessionId, now);
+    const result = db.run(
+        `UPDATE sessions
+         SET agent_uid = $uid, persona_snapshot = $snap
+         WHERE id = $sid AND agent_uid IS NULL`,
+        { $uid: agentUid, $snap: personaSnapshot, $sid: sessionId }
+    );
+    let changes = (result as { changes?: number } | undefined)?.changes;
+    if (typeof changes !== "number") {
+        // 与 deleteSession 同款兜底（低版本 Bun 的 run() 不返回 changes）
+        const row = db
+            .query<{ c: number }, Record<string, never>>("SELECT changes() AS c")
+            .get({});
+        changes = row?.c ?? 0;
+    }
+    return changes > 0;
+}
+
+/**
+ * [agent / 第 6 步 A17] 解除会话的 agent 绑定（降级路径用）。
+ *
+ * ⚠️ 只清 agent_uid / persona_snapshot，**不动 title / messages**：
+ *    A17 要求「不报错、不中断会话」，清历史等于让用户的对话凭空消失。
+ *
+ * @param sessionId 会话 ID
+ */
+export function unbindSessionAgent(sessionId: string): void {
+    const db = getDb();
+    db.run(
+        `UPDATE sessions SET agent_uid = NULL, persona_snapshot = NULL WHERE id = $sid`,
+        { $sid: sessionId }
+    );
+}

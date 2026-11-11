@@ -83,7 +83,14 @@ import { ensureToolRegistry, getToolDefinitions, executeTool, toDisplayName } fr
 // [skill / 升级 §3.1、§3.2] skill 子系统：指纹校验 + 多技能装配（不再收窄工具面）
 import { ensureSkillRegistry, assembleForRequestMulti } from "@/skills";
 // [agent / 第 5 步 §3] system 三段式装配（人设 → 技能 → 基础）；只从门面取，不直连 ./prompt。
-import { buildSystemText, fitSystemBudget } from "@/agents";
+// [agent / 第 6 步 §4] 绑定解析、注册表、判据函数；同样只从门面取（V27：零直连）。
+import {
+    buildSystemText, fitSystemBudget,
+    ensureAgentRegistry, getAgentRegistry, resolveBinding,
+    isSkillAllowedByPolicy, denyAllToolFilter,
+} from "@/agents";
+// [agent / 第 6 步 F3] env 不暴露 llm[]，合法 llm 名字集合必须从 env.json 直接取。
+import { loadEnvJson } from "@/infra/envJson";
 import {
     generateSessionId,
     isValidSessionId,
@@ -93,6 +100,9 @@ import {
     listSessions,
     getSessionDetail,
     deleteSession,
+    // [agent / 第 6 步 A14] 会话 ↔ agent 绑定读写（存储层的唯一入口）
+    getSessionAgentBinding,
+    bindSessionAgent,
     type SessionMessage,
     type MessageMeta,
 } from "@/infra/session";
@@ -423,10 +433,27 @@ router.post("/stream", async (c) => {
         // [skill / §8.3] 技能目录同样按「请求边界」重扫一次；必须在 ensureToolRegistry 之后
         //   （技能校验要读工具注册表判断 unknown_tool）。
         await ensureSkillRegistry();
+        // [agent / 第 6 步 A14] agent 注册表同样按请求边界重扫（与 tools/skills 同口径）。
+        //   ✅ 必须在 ensureToolRegistry 之后：agent 的「必须工具」可用性判定依赖工具注册表。
+        //   ⚠️ isKnownLlm 从 env.json 的 llm[].name 取（F3：env 不暴露 llm[]）。
+        //   ⚠️ 扫描失败**不能**让请求 500（A17）：ensureAgentRegistry 内部已 catch 扫描错误，
+        //      但 loadEnvJson() 在 env.json 损坏时会抛错，必须在外面兜住。
+        try {
+            const llmNames = new Set(loadEnvJson().llm.map((g) => g.name));
+            await ensureAgentRegistry({
+                isKnownLlm: (n) => llmNames.has(n),
+                mintUid: true,   // 运行期允许补写 uid（D-J 一次性迁移）
+            });
+        } catch (e) {
+            console.warn(
+                `⚠️  [agent] 注册表扫描失败，本轮按未绑定处理（A17 不中断会话）：` +
+                `${e instanceof Error ? e.message : String(e)}`,
+            );
+        }
 
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
-        const { messages, sessionId, message, requestId } = body;
+        const { messages, sessionId, message, requestId, agentUid } = body;
         // ✅ [skill / 升级 §3.1] 请求级技能入参已删除：技能面完全由配置页开关（SKILLON__*）决定。
         //    旧字段 body.skill / X-Skill 直接忽略（**不报 400**：老前端在灰度期仍可能发，
         //    静默忽略比 400 更稳，且它们本来就只是「本轮激活」的残留）。
@@ -468,6 +495,10 @@ router.post("/stream", async (c) => {
 
         // [US-2.2] 计算本次请求的上下文消息数组
         let contextMessages: SessionMessage[];
+        /** [agent / 第 6 步] 已校验通过的绑定 uid（供装配与工具判据使用）；null = 未绑定 */
+        let boundAgentUid: string | null = null;
+        /** [agent / 第 6 步 A15] 会话里存的人设快照（**不读 AGENT.md**） */
+        let boundPersonaSnapshot: string | null = null;
         if (useServerHistory) {
             const sid = sessionId as string;
             const isNewSession = !hasSession(sid);
@@ -475,9 +506,76 @@ router.post("/stream", async (c) => {
                 console.log(`🆕 新会话首次写入: ${sid}`);
             }
             const historySnapshot = getHistory(sid);
+            // ── [agent / 第 6 步 A14] 会话绑定：首轮写入、后续校验，不一致返 409 ──
+            //   ① 请求带 agentUid 且会话已绑定 → 必须一致，否则 409（A14 锁定语义）
+            //   ② 请求带 agentUid 且会话未绑定 → 首轮绑定（CAS，见 bindSessionAgent）
+            //   ③ 请求没带 agentUid          → 不动绑定，沿用会话已有值（A8 兼容）
+            //   ⚠️ 请求字段名定为 `agentUid`（不是 agent / agentName）：
+            //      A16 的 uid 双层标识就是为了「同名不同 agent」可区分，传名字会重新引入歧义。
+            const reqAgentUid: string | null =
+                typeof agentUid === "string" && agentUid.trim() !== "" ? agentUid.trim() : null;
+            const existingBinding = getSessionAgentBinding(sid);
+            if (reqAgentUid === null) {
+                // A8：请求没带 agentUid → 完全沿用会话已有绑定（可能是 null）
+                boundAgentUid = existingBinding.agentUid;
+                boundPersonaSnapshot = existingBinding.personaSnapshot;
+            } else if (existingBinding.agentUid === null) {
+                // 首轮绑定：人设快照取自**当前**注册表里的 AGENT.md 全文（A15 冻结）
+                const reg = getAgentRegistry();
+                const rec = reg.agents.get(reqAgentUid);
+                // ⚠️ 只有校验通过的 uid 才允许绑定；不存在/非法时**不绑**，
+                //    让后续走 unbound/degraded 路径，而不是把垃圾 uid 写进库。
+                if (rec && rec.status === "ok") {
+                    const snap = rec.body === "" ? null : rec.body;
+                    const ok = bindSessionAgent(sid, reqAgentUid, snap);
+                    if (!ok) {
+                        // CAS 失败：并发下别的请求先绑了 → 重读判定是否一致
+                        const again = getSessionAgentBinding(sid);
+                        if (again.agentUid !== null && again.agentUid !== reqAgentUid) {
+                            return c.json(
+                                {
+                                    error:
+                                        `该会话已绑定 agent（uid=${again.agentUid}），` +
+                                        `不能再切换为 ${reqAgentUid}。请新建会话后再选择该 agent。`,
+                                    code: "agent_locked",
+                                },
+                                409,
+                            );
+                        }
+                    }
+                    boundAgentUid = reqAgentUid;
+                    // ⚠️ 快照必须在这里一并记下；不要留到后面再读注册表，
+                    //    否则并发下「读到的可能被别的请求改过」。
+                    boundPersonaSnapshot = snap;
+                } else {
+                    console.warn(
+                        `⚠️  [agent] 请求的 agentUid=${reqAgentUid} 不在注册表或状态非法，` +
+                        `本次不建立绑定（会话按未绑定处理）`,
+                    );
+                }
+            } else if (existingBinding.agentUid !== reqAgentUid) {
+                // 锁定后不一致 → 409（A14）。文案给出可操作方向，不诱导模型重试。
+                return c.json(
+                    {
+                        error:
+                            `该会话已绑定 agent（uid=${existingBinding.agentUid}），` +
+                            `不能再切换为 ${reqAgentUid}。请新建会话后再选择该 agent。`,
+                        code: "agent_locked",
+                    },
+                    409,
+                );
+            } else {
+                boundAgentUid = existingBinding.agentUid;
+                // A15：沿用会话里已存的快照（不是 rec.body）
+                boundPersonaSnapshot = existingBinding.personaSnapshot;
+            }
             const userMsg: SessionMessage = { role: "user", content: message };
+            // [agent / 第 6 步 A14] 绑定判定结束，写入用户消息
             appendMessage(sid, userMsg);
             contextMessages = [...historySnapshot, userMsg];
+            // [agent / 第 6 步] 以上三步只决定「本轮用哪个 agent」，不改动消息内容。
+            // A17：降级时不抛错、不中断会话，仅告警一次（在装配处统一打印）。
+            // A15：人设快照只在绑定时刻写一次，之后永不改写。
         } else {
             contextMessages = messages as SessionMessage[];
         }
@@ -536,17 +634,33 @@ router.post("/stream", async (c) => {
         // [skill / 升级版 §3.2] 装配在**请求边界**算一次、全请求复用；技能不再收窄工具面。
         // ✅ [skill / 升级 §1、§3.5] 工具面 = 全部可用工具 ∪ 元工具，**与开了哪些技能无关**；
         //    getToolDefinitions() 内部已按「祖先目录 AND 组开关 AND 工具自身条件」过滤，并已追加元工具。
-        const toolDefs = getToolDefinitions();
-        // ✅ [skill / 升级 §3.2] 多技能装配：仍是请求边界算一次、全请求复用（同一请求内不切换）。
-        const skillAssembly = assembleForRequestMulti();
+        // ── [agent / 第 6 步] 绑定解析：一次算清「人设 / 技能策略 / 工具判据 / 预算」 ──
+        //   ⚠️ 顺序：必须先 resolveBinding，再算 toolDefs / skillAssembly ——
+        //      工具判据是 getToolDefinitions 的入参，技能白名单是装配的入参，顺序反了拿不到。
+        const binding = resolveBinding(boundAgentUid, boundPersonaSnapshot, getAgentRegistry());
+        if (binding.kind === "degraded") {
+            // A17：降级**不报错、不中断**，只告警一次
+            console.warn(`⚠️  [agent] ${binding.reason}`);
+        }
+        // A10：清单与执行必须同口径。降级时工具全拒（元工具除外，复用 denyAllToolFilter）。
+        const agentToolFilter =
+            binding.kind === "bound" ? binding.toolFilter
+                : binding.kind === "degraded" ? denyAllToolFilter()
+                    : undefined;
+        // 技能白名单：只有 bound 才收窄；unbound / degraded 不收窄（降级时技能仍按全局口径）
+        const agentSkillFilter = binding.kind === "bound"
+            ? (c: { dir: string; name: string }) => isSkillAllowedByPolicy(binding.skillPolicy, c)
+            : undefined;
 
-        // [agent / 第 5 步 §3] system 三段式装配：人设 → 技能声明 → 基础。
-        // ⚠️ 人设来源属第 6 步（会话绑定）；本步运行期恒为 null，走「无 agent」等价路径（D-5-2）。
-        //    agent 记录一旦接入，这里只需把 null 换成真实记录，**装配代码一行不用改**。
-        // ⚠️ 用 `let` 而非 `const`：`const x = null` 会被 TS 收窄成 `null` 字面量类型，
-        //    紧跟其后的 `x ? ... : ...` 会被判为「条件恒假」而报 TS2367/TS2801 类错误。
-        //    第 6 步把这里换成 `const agentCtx = resolveAgentForSession(...)` 后即可改回 const。
-        let agentCtx: { personaText: string } | null = null;
+        const toolDefs = getToolDefinitions(agentToolFilter);
+        // ✅ [skill / 升级 §3.2] 多技能装配：仍是请求边界算一次、全请求复用（同一请求内不切换）。
+        const skillAssembly = assembleForRequestMulti(undefined, agentSkillFilter);
+
+        // [agent / 第 5 步 §3 + 第 6 步 A15] system 三段式装配：人设 → 技能声明 → 基础。
+        //   人设来自**绑定时刻的快照**（binding.personaText），不是 AGENT.md 现读 —— A15「人设冻结」。
+        //   unbound 时 persona 传 null（等价路径，A8）；degraded 时保留快照（避免「助手换了性格」）。
+        let agentCtx: { personaText: string } | null =
+            binding.kind === "unbound" ? null : { personaText: binding.personaText };
         const built = buildSystemText({
             persona: agentCtx ? { text: agentCtx.personaText } : null,
             skillText: skillAssembly.systemText,
@@ -554,7 +668,13 @@ router.post("/stream", async (c) => {
         });
         // [agent / 第 5 步] 总预算：超限整段截断（复用 skills/budget.ts 的统一口径）。
         //   第 6 步接入 agent 时传 systemBudget（P4）；本步无 agent 来源，故用缺省口径。
-        const systemFit = fitSystemBudget(built.systemText);
+        const systemFit = fitSystemBudget(
+            built.systemText,
+            // [agent / 第 6 步 P4] 已绑定时用该 agent 的 systemBudget。
+            // ⚠️ 实现上只有 < L2_MAX(3000) 才真正收紧：prompt.ts 的 cap 归一化决定了
+            //    9000（缺省）等价于「不额外收紧，上限仍是 3000」。这是第 5 步的既定口径。
+            binding.kind === "bound" ? { totalMax: binding.systemBudget } : {},
+        );
         if (systemFit.truncated) {
             console.warn(
                 `⚠️  [agent] system 超预算（原长 ${systemFit.originalChars} 字），已省略段落：` +
@@ -811,7 +931,7 @@ router.post("/stream", async (c) => {
                                     // ✅ [升级 §5.2] 来源标识改为数组：本轮参与装配的全部技能。
                                     //    ⚠️ 仅展示与审计，**不参与任何权限判定**（N-SK-12 不变）。
                                     skills: skillAssembly.skillNames.length > 0 ? skillAssembly.skillNames : undefined,
-                                });
+                                }, agentToolFilter); // [agent / 第 6 步 A10] 与 getToolDefinitions 同一判据
 
                                 // 推送「工具结果」事件
                                 send({

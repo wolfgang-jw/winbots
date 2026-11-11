@@ -60,3 +60,13 @@ export {
   buildSystemText, fitSystemBudget,
   type PersonaPart, type BuildSystemParts, type BuiltSystem,
 } from "./prompt";
+
+// ── 第 6 步（模块 2：会话绑定与生命周期）────────────────────────────────
+// 只转发绑定解析；存储侧（getSessionAgentBinding / bindSessionAgent）在 @/infra/session，
+// 不在此处转发 —— agents/ 不得在运行期依赖存储层（见 binding.ts 的依赖约束）。
+// ⚠️ 不要在这里重复转发 denyAllToolFilter / toolFilterOf：第 4 步的 toolPolicy 块已导出，
+//    重复 export 会报 "Module has already exported a member named"。
+export {
+  resolveBinding,
+  type BindingResolution,
+} from "./binding";

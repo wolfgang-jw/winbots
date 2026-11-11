@@ -25,6 +25,16 @@ const DATA_DIR = resolve(import.meta.dir, "../../data");
 /** 数据库文件路径 */
 const DB_PATH = resolve(DATA_DIR, "winbots.db");
 
+/**
+ * [agent / 第 6 步 R-6-3] 仅供单测：把数据库指向临时文件。
+ *
+ * ⚠️ **生产代码永不调用**。它存在的原因是 DB_PATH 是模块级常量，
+ *    无法靠环境变量覆盖，而「老库补列」这条迁移逻辑必须有可执行验证
+ *    （否则只能靠手工造老库，回归时必漏）。
+ *    null = 恢复默认路径（会先关闭现有连接）。
+ */
+let overrideDbPath: string | null = null;
+
 /** 数据库单例 */
 let db: Database | null = null;
 
@@ -32,11 +42,16 @@ let db: Database | null = null;
  * 建表 SQL（幂等：IF NOT EXISTS）。
  *
  * sessions：会话表
- *   - id            会话 ID（主键）
- *   - title         标题（默认「新会话」，US-4.2 使用）
- *   - created_at    创建时间（epoch ms）
- *   - updated_at    最后活动时间（epoch ms，US-4.3 列表倒序用）
- *   - message_count 消息条数（冗余字段，便于列表展示，US-4.3 使用）
+ *   - id               会话 ID（主键）
+ *   - title            标题（默认「新会话」，US-4.2 使用）
+ *   - created_at       创建时间（epoch ms）
+ *   - updated_at       最后活动时间（epoch ms，US-4.3 列表倒序用）
+ *   - message_count    消息条数（冗余字段，便于列表展示，US-4.3 使用）
+ *   - agent_uid        [agent / 第 6 步 A14] 绑定的 agent uid；NULL = 未绑定（A8 等价路径）
+ *   - persona_snapshot [agent / 第 6 步 A15] 绑定时刻的人设快照；NULL = 未绑定或该 agent 无 AGENT.md
+ *
+ * ⚠️ 新增的两列对**老库**无效：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，
+ *    必须由 initDb() 里的 ensureSessionAgentColumns() 兜底补列（见下方）。
  *
  * messages：消息表
  *   - id         自增主键
@@ -49,11 +64,15 @@ let db: Database | null = null;
  */
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS sessions (
-    id            TEXT PRIMARY KEY,
-    title         TEXT NOT NULL DEFAULT '新会话',
-    created_at    INTEGER NOT NULL,
-    updated_at    INTEGER NOT NULL,
-    message_count INTEGER NOT NULL DEFAULT 0
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL DEFAULT '新会话',
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    message_count    INTEGER NOT NULL DEFAULT 0,
+    -- [agent / 第 6 步 A14] 绑定 agent 的 uid；NULL = 未绑定（走等价路径，A8）
+    agent_uid        TEXT,
+    -- [agent / 第 6 步 A15] 绑定时刻的人设快照；NULL = 未绑定 或 该 agent 无 AGENT.md
+    persona_snapshot TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -75,6 +94,35 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
 `;
 
 /**
+ * [agent / 第 6 步 D-6-1] 为老库补上 agent 绑定列（幂等）。
+ *
+ * 为什么不用迁移框架：本步只加两列，且都是 nullable、无默认值、无索引，
+ *   ALTER TABLE ADD COLUMN 在 SQLite 上是 O(1) 元数据操作，不需要重建表。
+ *
+ * 为什么用 PRAGMA table_info 而不是 try/catch：
+ *   SQLite 的 ADD COLUMN 重复执行会报 "duplicate column name"，
+ *   靠 catch 吞错会掩盖真实的磁盘/权限错误。先探查再执行，语义明确。
+ */
+function ensureSessionAgentColumns(database: Database): void {
+    const rows = database
+        .query<{ name: string }, Record<string, never>>(`PRAGMA table_info(sessions)`)
+        .all({});
+    const cols = new Set(rows.map((r) => r.name));
+    const added: string[] = [];
+    if (!cols.has("agent_uid")) {
+        database.run(`ALTER TABLE sessions ADD COLUMN agent_uid TEXT`);
+        added.push("agent_uid");
+    }
+    if (!cols.has("persona_snapshot")) {
+        database.run(`ALTER TABLE sessions ADD COLUMN persona_snapshot TEXT`);
+        added.push("persona_snapshot");
+    }
+    if (added.length > 0) {
+        console.log(`🧩 [agent] 会话表已补列：${added.join("、")}（老库升级，幂等）`);
+    }
+}
+
+/**
  * 初始化数据库：打开连接、设置 PRAGMA、建表。
  * 幂等：重复调用返回同一单例。
  *
@@ -83,10 +131,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
 export function initDb(): Database {
     if (db) return db;
 
+    const dbPath = overrideDbPath ?? DB_PATH;
+
     // 确保数据目录存在（首次运行自动创建）
     mkdirSync(DATA_DIR, { recursive: true });
 
-    db = new Database(DB_PATH, { create: true });
+    db = new Database(dbPath, { create: true });
 
     // WAL 模式：提升并发读性能，并增强抗中断能力（N3/N4）
     db.run("PRAGMA journal_mode = WAL;");
@@ -98,7 +148,10 @@ export function initDb(): Database {
     // 建表（多语句一次执行）
     db.run(SCHEMA_SQL);
 
-    console.log(`🗄️  [US-4.1] 本地数据库已就绪: ${DB_PATH}`);
+    // [agent / 第 6 步 D-6-1] 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+    ensureSessionAgentColumns(db);
+
+    console.log(`🗄️  [US-4.1] 本地数据库已就绪: ${dbPath}`);
     return db;
 }
 
@@ -127,4 +180,24 @@ export function closeDb(): void {
         console.warn("⚠️  [US-4.1] 数据库关闭失败（忽略）:", e);
     }
     db = null;
+}
+
+/**
+ * [agent / 第 6 步 R-6-3] 仅供单测：切换数据库文件。
+ *
+ * @param p 临时库路径；传 null 恢复默认并关闭当前连接
+ *
+ * ⚠️ **生产代码永不调用**。见 overrideDbPath 的注释。
+ */
+export function __setDbPathForTest(p: string | null): void {
+    if (p === null) {
+        closeDb();
+        overrideDbPath = null;
+        return;
+    }
+    if (db) {
+        // 已有连接：先关掉，避免测试之间串库
+        closeDb();
+    }
+    overrideDbPath = p;
 }

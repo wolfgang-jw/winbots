@@ -101,10 +101,21 @@ function pickActive(requested: string | null, reg: SkillRegistry): SkillRecord |
  * @param onlyUsable [升级版 §3.3] true → 额外剔除「必须工具不可用」的技能（新装配用）；
  *                   false（缺省）→ 旧行为，因此旧路径逐字不变。
  */
-function buildL0(reg: SkillRegistry, deps: AssembleDeps, onlyUsable = false): SkillL0Item[] {
+function buildL0(
+  reg: SkillRegistry,
+  deps: AssembleDeps,
+  onlyUsable = false,
+  /**
+   * [agent / 第 6 步 A10] agent 侧白名单过滤（**必须在全局条件之后**）。
+   * 缺省 undefined = 不过滤，旧路径 assembleForRequest 逐字节不变。
+   */
+  agentFilter?: (candidate: { dir: string; name: string }) => boolean,
+): SkillL0Item[] {
   const usable = [...reg.skills.values()]
     .filter((r) => r.status === "ok" && deps.isToggleOn(r.toggleKey))
     .filter((r) => (onlyUsable ? (r.unavailable ?? []).length === 0 : true))
+    // [agent / 第 6 步 A10] agent 侧白名单：必须在全局三条件之后（反了会成为后门）。
+    .filter((r) => (agentFilter ? agentFilter({ dir: r.dir, name: r.name }) : true))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   // [升级版 §4.5] 同名歧义：模型靠名字调元工具，短名会拿到 ambiguous_skill → 改用完整目录路径。
@@ -266,7 +277,18 @@ function depsLine(s: SkillBlock): string {
  * ⚠️ 顺序不能乱：① 回填 unavailable → ② 算 usable → ③ 建技能块 → ④ buildL0(…, true)。
  *    若把 buildL0 提前，过滤读到的还是上一轮的旧值。
  */
-export function assembleForRequestMulti(deps: AssembleDeps = REAL_DEPS): MultiAssembly {
+export function assembleForRequestMulti(
+  deps: AssembleDeps = REAL_DEPS,
+  /**
+   * [agent / 第 6 步 A10] agent 侧技能白名单过滤（**必须在全局三条件之后**）。
+   * 缺省 undefined = 不过滤，逐字节等价于改动前（A8）。
+   * 判据由 @/agents 的 isSkillAllowedByPolicy 提供，本文件不含通配实现。
+   *
+   * ⚠️ 必须是**可选**第二参数：scripts/verify-agent-compat.ts 无参调用本函数，
+   *    改成必选会让该脚本编译失败，第 1 步的等价基线随之失真。
+   */
+  agentFilter?: (candidate: { dir: string; name: string }) => boolean,
+): MultiAssembly {
   const reg = deps.getRegistry();
 
   // ① 先把可用性回填到内存记录（不落盘、不改 status）
@@ -278,6 +300,8 @@ export function assembleForRequestMulti(deps: AssembleDeps = REAL_DEPS): MultiAs
   const all = [...reg.skills.values()];
   const usable = all
     .filter((r) => r.status === "ok" && deps.isToggleOn(r.toggleKey) && (r.unavailable ?? []).length === 0)
+    // [agent / 第 6 步 A10] agent 白名单在全局三条件之后收窄（顺序不可反）。
+    .filter((r) => (agentFilter ? agentFilter({ dir: r.dir, name: r.name }) : true))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.dir < b.dir ? -1 : 1));
 
   // ③ 技能块：L1 只受 L1_MAX 保护（多技能传 totalMax: null，避免 L1 被 L2 挤出预算）
@@ -300,7 +324,7 @@ export function assembleForRequestMulti(deps: AssembleDeps = REAL_DEPS): MultiAs
   });
 
   // ④ L0（已回填，可用性过滤生效）
-  const l0 = buildL0(reg, deps, true);
+  const l0 = buildL0(reg, deps, true, agentFilter);
 
   // ⑤ notices：已开启但不可用 / 已开启但挂起（未开启的不提示 —— 用户本来就没开）
   const notices: string[] = [];
