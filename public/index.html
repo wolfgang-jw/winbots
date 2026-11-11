@@ -102,8 +102,11 @@
         <!-- 输入区域 -->
         <div class="chat-agent-bar" id="chat-agent-bar">
             <label class="chat-agent-bar__label" for="chat-agent-select">智能体</label>
+            <!-- [D-1 / C5] 首项改为默认智能体的实值，取消「空值即默认」的隐式约定。
+                 注意：这个 option 只是首屏占位，真实渲染由 renderChatAgentOptions() 重建，
+                 两处文案与 value 必须保持一致（见 chat.js 的 renderChatAgentOptions）。 -->
             <select class="chat-agent-bar__select" id="chat-agent-select" disabled>
-                <option value="">（默认 · 不绑定智能体）</option>
+                <option value="ag_00000000">默认智能体</option>
             </select>
             <span class="chat-agent-bar__hint" id="chat-agent-hint"></span>
         </div>

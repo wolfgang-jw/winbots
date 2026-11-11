@@ -9,7 +9,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   AGENT_UID_RE, agentDepth, agentLeafName, checkAgentName, checkAgentPath,
-  generateAgentUid, isAgentUid, isDefaultAgentPath, MAX_AGENT_DEPTH,
+  generateAgentUid, isAgentUid, isDefaultAgentPath, isDefaultAgentUid, MAX_AGENT_DEPTH,
+  DEFAULT_AGENT_UID,
 } from "../paths";
 
 describe("checkAgentName", () => {
@@ -98,5 +99,20 @@ describe("路径辅助", () => {
     expect(agentLeafName("")).toBe("");
     expect(isDefaultAgentPath("default")).toBe(true);
     expect(isDefaultAgentPath("ops/default")).toBe(false);
+  });
+
+  test("【D-1】isDefaultAgentUid 按 uid 判定，与路径无关", () => {
+    expect(isDefaultAgentUid(DEFAULT_AGENT_UID)).toBe(true);
+    expect(isDefaultAgentUid("ag_00000001")).toBe(false);
+    expect(isDefaultAgentUid("")).toBe(false);
+    // 核心区分：路径叫 default 不等于身份是默认（C2）
+    expect(isDefaultAgentPath("default")).toBe(true);
+    expect(isDefaultAgentUid("ag_7f3a9c21")).toBe(false);
+  });
+
+  test("【D-1】generateAgentUid 永不产出保留 uid", () => {
+    for (let i = 0; i < 2000; i++) {
+      expect(generateAgentUid()).not.toBe(DEFAULT_AGENT_UID);
+    }
   });
 });

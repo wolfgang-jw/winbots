@@ -75,6 +75,20 @@ export function resolveBinding(
   personaSnapshot: string | null,
   registry: AgentRegistry,
 ): BindingResolution {
+  /**
+   * 【D-1 / Q2 决策】走到这里说明「会话确实没有绑定」。
+   *
+   * ⚠️ 正常业务流不该出现这个分支（C8）：
+   *   首问不选 / 存量 NULL 续聊 都已在 chat.ts 落成 agent_uid = ag_00000000，
+   *   因此到达本函数时 agentUid 应为实值。
+   *   能落到这里的只有两种异常：
+   *     ① 默认智能体不可用（创建失败 / 扫描判 invalid / setup 读不出来）
+   *        → chat.ts 的默认绑定被跳过，boundAgentUid 保持 null；
+   *     ② 旧模式请求（body.messages，无 sessionId）→ 本就是未绑定语义。
+   *
+   * 保留该分支而不是删除（C8-b）：默认智能体的可用性依赖磁盘文件，
+   *   删掉会让「磁盘配置损坏」直接导致所有未选智能体的会话不可用。
+   */
   if (agentUid === null || agentUid === "") return { kind: "unbound" };
 
   const rec = registry.agents.get(agentUid);

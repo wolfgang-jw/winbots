@@ -90,6 +90,8 @@ import {
     isSkillAllowedByPolicy, denyAllToolFilter,
     // [agent / 第 7 步 模块 6a] LLM 查表纯函数 + 结果类型（llm[] 由本文件从 env.json 注入）
     resolveLlm, type ResolvedLlm,
+    // 【D-1】默认智能体的保留 uid：首问未选智能体时绑定它（需求 1）
+    DEFAULT_AGENT_UID,
 } from "@/agents";
 // [agent / 第 6 步 F3] env 不暴露 llm[]，合法 llm 名字集合必须从 env.json 直接取。
 // [agent / 第 7 步] 同一份 llm[] 也用于 agent 的 LLM 解析 —— 见 C2。
@@ -442,10 +444,13 @@ router.post("/stream", async (c) => {
         //   ⚠️ 扫描失败**不能**让请求 500（A17）：ensureAgentRegistry 内部已 catch 扫描错误，
         //      但 loadEnvJson() 在 env.json 损坏时会抛错，必须在外面兜住。
         try {
-            const llmNames = new Set(loadEnvJson().llm.map((g) => g.name));
+            const llmGroups = loadEnvJson().llm;
+            const llmNames = new Set(llmGroups.map((g) => g.name));
             await ensureAgentRegistry({
                 isKnownLlm: (n) => llmNames.has(n),
                 mintUid: true,   // 运行期允许补写 uid（D-J 一次性迁移）
+                // 【D-1】默认智能体的 llm 字段取 llm[0].name（需求文档 A-1.7）
+                defaultLlmName: llmGroups[0]?.name ?? null,
             });
         } catch (e) {
             console.warn(
@@ -457,6 +462,26 @@ router.post("/stream", async (c) => {
         // ── 1. 解析请求体 ──────────────────────────────────────────
         const body = await c.req.json();
         const { messages, sessionId, message, requestId, agentUid } = body;
+        /* [D-1 / C9] agentUid 空串一律 400。C5 已取消「空值即默认」，前端首项改为实值
+         * ag_00000000，空串不再有任何业务含义，静默接受会掩盖「前端漏清洗」的缺陷。
+         * 校验必须在会话存在性判定之前，否则「已绑定会话 + 空串」会先撞上 409（A-1.17）。
+         */
+        if (agentUid !== undefined && agentUid !== null) {
+            if (typeof agentUid !== "string") {
+                return c.json({ error: "agentUid 必须是字符串", code: "agent_uid_invalid" }, 400);
+            }
+            if (agentUid.trim() === "") {
+                return c.json(
+                    {
+                        error:
+                            "agentUid 不能为空串：如需使用默认智能体，请省略该字段" +
+                            "（或传 null）；空串不是合法取值",
+                        code: "agent_uid_empty",
+                    },
+                    400,
+                );
+            }
+        }
         // ✅ [skill / 升级 §3.1] 请求级技能入参已删除：技能面完全由配置页开关（SKILLON__*）决定。
         //    旧字段 body.skill / X-Skill 直接忽略（**不报 400**：老前端在灰度期仍可能发，
         //    静默忽略比 400 更稳，且它们本来就只是「本轮激活」的残留）。
@@ -519,9 +544,47 @@ router.post("/stream", async (c) => {
                 typeof agentUid === "string" && agentUid.trim() !== "" ? agentUid.trim() : null;
             const existingBinding = getSessionAgentBinding(sid);
             if (reqAgentUid === null) {
-                // A8：请求没带 agentUid → 完全沿用会话已有绑定（可能是 null）
-                boundAgentUid = existingBinding.agentUid;
-                boundPersonaSnapshot = existingBinding.personaSnapshot;
+                /* 【D-1】请求未指定 agentUid。
+                 *
+                 * 分两种情形（数据上都是 agent_uid，但处理不同）：
+                 *   ① 会话已绑定 → 沿用已有绑定（原 A8 语义，不变）
+                 *   ② 会话未绑定 → 绑定默认智能体 ag_00000000（需求 1 的核心）
+                 *
+                 * 关于 ② 与「存量 NULL 会话续聊」的关系（见代码修改文档开头的口径收窄）：
+                 *   两者在数据上完全同形，本实现统一处理 —— 都绑默认智能体并冻结快照。
+                 *   需求文档 A-1.10（新会话首问）与 A-1.13（存量续聊）因此走同一条代码。
+                 */
+                if (existingBinding.agentUid !== null) {
+                    boundAgentUid = existingBinding.agentUid;
+                    boundPersonaSnapshot = existingBinding.personaSnapshot;
+                } else {
+                    // ② 未绑定 → 绑定默认智能体。
+                    //   ⚠️ 必须走与「带 uid 首轮绑定」**完全相同**的门槛（rec.status === "ok"）
+                    //      和 CAS（bindSessionAgent），否则默认智能体会绕过校验。
+                    const regDef = getAgentRegistry();
+                    const recDef = regDef.agents.get(DEFAULT_AGENT_UID);
+                    if (recDef && recDef.status === "ok") {
+                        const snapDef = recDef.body === "" ? null : recDef.body;
+                        bindSessionAgent(sid, DEFAULT_AGENT_UID, snapDef);
+                        // ⚠️ CAS 返回值不必单独判 409：reqAgentUid === null 说明用户没做选择，
+                        //    并发下另一个请求先绑了别的 agent 是合法的（那是用户显式选的），
+                        //    此时重读即可，**不应**报 409 —— 否则「两个人同时发第一条消息」
+                        //    会因为其中一个是默认绑定而莫名失败。
+                        const afterDef = getSessionAgentBinding(sid);
+                        boundAgentUid = afterDef.agentUid;
+                        boundPersonaSnapshot = afterDef.personaSnapshot;
+                    } else {
+                        // 默认智能体不可用（创建失败 / 判 invalid / setup 读不出来）
+                        // → 不绑定，走 unbound 兜底（C8）；对话不中断（A-1.9b）。
+                        console.warn(
+                            `⚠️  [agent] 默认智能体（uid=${DEFAULT_AGENT_UID}）不可用` +
+                            `（${recDef ? `status=${recDef.status}，${recDef.invalidReason ?? ""}` : "不在注册表"}），` +
+                            "本轮按 unbound 兜底装配",
+                        );
+                        boundAgentUid = null;
+                        boundPersonaSnapshot = null;
+                    }
+                }
             } else if (existingBinding.agentUid === null) {
                 // 首轮绑定：人设快照取自**当前**注册表里的 AGENT.md 全文（A15 冻结）
                 const reg = getAgentRegistry();

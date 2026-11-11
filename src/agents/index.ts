@@ -12,10 +12,11 @@ export type {
 
 export {
   checkAgentName, checkAgentPath, agentDepth, agentLeafName,
-  isDefaultAgentPath, isAgentUid, generateAgentUid,
+  isDefaultAgentPath, isDefaultAgentUid, isAgentUid, generateAgentUid,
   AGENTS_ROOT, AGENT_FILE, SETUP_FILE,
   MAX_AGENT_DEPTH, AGENT_BODY_WARN_BYTES,
   AGENT_NAME_RE, AGENT_NAME_MAX_LEN, AGENT_UID_RE,
+  DEFAULT_AGENT_UID, DEFAULT_AGENT_PATH, DEFAULT_AGENT_BODY,
   type AgentNameCheck,
 } from "./paths";
 
@@ -33,7 +34,8 @@ export {
   walkAgentFiles, computeAgentFingerprint, scanAgentsOnce,
   resetAgentRegistryForTest,
   agentRegistryStateForTest,
-  type ScanDeps, type Stamp,
+  ensureDefaultAgent,
+  type ScanDeps, type Stamp, type EnsureDefaultOpts,
 } from "./scan";
 
 // ── 第 3 步（模块 4：技能过滤）──────────────────────────────────────────
@@ -96,5 +98,6 @@ export {
 export {
   upsertAgent, deleteAgent, readAgentFile,
   normalizeAgentPath, validateAgentPath, buildSetupJson,
+  readAgentUid, guardDefaultAgent,
   type WriteAgentInput, type WriteResult, type AgentFileContent,
 } from "./write";

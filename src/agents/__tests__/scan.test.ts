@@ -74,13 +74,27 @@ describe("scanAgentsOnce", () => {
     expect(reg.warnings.some((w) => w.includes("目录 ops"))).toBe(false);
   });
 
-  test("A3 default/ 目录 → isDefault true（X-2 端到端回归）", () => {
+  test("A3 default/ 目录 → isDefault 按 uid 判定（D-1 基线变更）", () => {
+    /* 【D-1 基线变更】原断言是「路径为 default → isDefault 为 true」，
+     * 现 isDefault 改按 uid 判定（需求文档 C2），因此必须把 uid 设为保留值
+     * ag_00000000 才为 true。同时补一条反向断言：路径叫 default 但 uid 不是它
+     * → isDefault 为 false（这正是「路径式判据」被废弃的原因）。
+     */
+    makeAgent("default", { uid: "ag_00000000", name: "default" });
+    const reg = scan();
+    const rec = reg.agents.get("ag_00000000");
+    expect(rec?.status).toBe("ok");
+    expect(rec?.isDefault).toBe(true);
+    expect(reg.warnings.some((w) => w.includes("命名不合规"))).toBe(false);
+  });
+
+  test("A3b 路径为 default 但 uid 不是保留值 → isDefault false", () => {
     makeAgent("default", { uid: "ag_0000000a", name: "default" });
     const reg = scan();
     const rec = reg.agents.get("ag_0000000a");
     expect(rec?.status).toBe("ok");
-    expect(rec?.isDefault).toBe(true);
-    expect(reg.warnings.some((w) => w.includes("命名不合规"))).toBe(false);
+    // 路径是 default，但身份不是默认智能体 —— 这正是 D-1 要区分的两种语义
+    expect(rec?.isDefault).toBe(false);
   });
 
   test("A4 坏 JSON → invalid，invalidReason 以 parse_failed: 开头", () => {

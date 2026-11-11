@@ -17,14 +17,16 @@
  *     agent 侧没有这条禁令，a/b/c/d/ 超深只说明它自己不是 agent，
  *     不应连带忽略同层的 a/b/c/（那是合法的 3 段 agent）。
  */
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import { join } from "node:path";
 import { hashText } from "@/tools/paths";
 import type { AgentRecord, AgentRegistry } from "./types";
 import {
   AGENTS_ROOT, AGENT_BODY_WARN_BYTES, AGENT_FILE, SETUP_FILE, MAX_AGENT_DEPTH, AGENT_UID_RE,
-  agentDepth, agentLeafName, checkAgentName, generateAgentUid, isDefaultAgentPath,
+  agentDepth, agentLeafName, checkAgentName, generateAgentUid,
+  isDefaultAgentUid,
+  DEFAULT_AGENT_UID, DEFAULT_AGENT_PATH, DEFAULT_AGENT_BODY,
 } from "./paths";
 import { parseAgentSetup, SYSTEM_BUDGET_DEFAULT } from "./setup";
 
@@ -47,6 +49,15 @@ export interface ScanDeps {
    * 单测传 false 得到可预期的结果；运行期传 true。
    */
   mintUid: boolean;
+  /**
+   * 【D-1】env.json 的 llm[0].name，用于给自动创建的默认智能体写 llm 字段。
+   *
+   * 为什么可选：单测与 verify-agent-compat.ts 不读 env，省略本字段时表现为
+   *   「不写 llm 字段」→ 该 agent 走 env 默认组，而那正好等价于 llm[0]
+   *   （需求文档 A-1.7：默认智能体的 llmRef 解析结果 = llm[0]）。
+   *   因此省略与显式传 llm[0].name 的运行效果相同，不破坏既有测试。
+   */
+  defaultLlmName?: string | null;
 }
 
 /* ============================================================
@@ -280,7 +291,8 @@ export function scanAgentsOnce(
       uid: s.uid,
       name: s.name,
       path: dir,
-      isDefault: isDefaultAgentPath(dir),
+      // 【D-1】按 uid 判定（需求文档 C2）；不再看路径
+      isDefault: isDefaultAgentUid(s.uid),
       dir: abs,
       title: s.title,
       description: s.description,
@@ -386,7 +398,10 @@ function invalidRecord(dir: string, abs: string, leaf: string, reason: string, u
     uid,
     name: leaf,
     path: dir,
-    isDefault: isDefaultAgentPath(dir),
+    // 【D-1】按 uid 判定；uid 为空串（parse_failed 抢救失败）时自然为 false。
+    //   ⚠️ 这一处很关键：默认智能体若因正文被清空而 invalid，仍必须保持 isDefault=true，
+    //      否则配置页会把它当成普通 invalid 记录，用户看不到「这是默认智能体」。
+    isDefault: isDefaultAgentUid(uid),
     dir: abs,
     title: "",
     description: "",
@@ -435,6 +450,103 @@ function writeUidBack(abs: string, originalText: string, uid: string): { ok: boo
 }
 
 /* ============================================================
+ * 【D-1】默认智能体自动创建
+ * ============================================================ */
+
+export interface EnsureDefaultOpts {
+  /** env.json 的 llm[0].name；null = 无法确定，则不写 llm 字段（走 env 默认组） */
+  defaultLlmName: string | null;
+  /** 合法 llm 名字判定（与扫描 deps 同源） */
+  isKnownLlm: (name: string) => boolean;
+}
+
+/**
+ * 【D-1】确保默认智能体存在（需求文档 C1 / C7-c）。
+ *
+ * 触发点只有一个：`ensureAgentRegistry` 在扫描完成后调用本函数；
+ *   若注册表里没有 `uid === ag_00000000` **且** `status === "ok"` 的记录 → 落盘重建。
+ *
+ * 为什么放在扫描之后、而不是之前：
+ *   扫描是「读现状」，重建是「补缺失」。先读后补，语义清晰，
+ *   也避免把「用户手工改坏」误当成「从未存在」。
+ *
+ * ⚠️ 本函数**有副作用**（写磁盘），与 scanAgentsOnce 的纯读语义不同，
+ *    故单独成函数、单独注释，不要塞进 scanAgentsOnce 内部。
+ *
+ * @returns 是否发生了创建（true = 刚刚新建/覆盖了文件）
+ */
+export function ensureDefaultAgent(opts: EnsureDefaultOpts): boolean {
+  /* ① 已经存在且可用 → 什么都不做 */
+  for (const r of registry.agents.values()) {
+    if (r.uid === DEFAULT_AGENT_UID && r.status === "ok") return false;
+  }
+
+  /* ② 选出落盘路径：优先 default；被别的 agent 占用则另选（需求文档 §4.9） */
+  const dir = pickDefaultAgentDir();
+  const abs = join(AGENTS_ROOT, dir);
+
+  /* ③ 组装 setup.json。
+   *    ⚠️ name 必须等于目录叶子名（setup.ts 的 name_mismatch 校验），
+   *       因此用 dir 的叶子名，不要写死 "default" —— 另选路径时仍成立。
+   */
+  const leaf = agentLeafName(dir);
+  const setup: Record<string, unknown> = { uid: DEFAULT_AGENT_UID, name: leaf };
+  if (opts.defaultLlmName !== null && opts.defaultLlmName !== "" && opts.isKnownLlm(opts.defaultLlmName)) {
+    setup.llm = opts.defaultLlmName;
+  }
+  // 其余字段刻意**不写**：让 parseAgentSetup 用默认值（skills 全禁、tools 不限制、
+  // maxRounds 跟随 env、memory 开、systemBudget 9000）——
+  // 这与「一个刚新建、什么都没配的普通 agent」完全一致（需求文档 A-1.6 功能等价）。
+
+  try {
+    if (!existsSync(abs)) mkdirSync(abs, { recursive: true });
+    writeFileSync(join(abs, SETUP_FILE), JSON.stringify(setup, null, 2) + "\n", "utf-8");
+    // 【Q1 决策】正文固定为「你是默认智能体。」—— 非空，天然通过 R-2 的正文空判定
+    writeFileSync(join(abs, AGENT_FILE), DEFAULT_AGENT_BODY, "utf-8");
+    console.log(`🛡️  [agent-scan] 已自动创建默认智能体：uid=${DEFAULT_AGENT_UID} path=${dir}`);
+    return true;
+  } catch (err) {
+    // 创建失败不能阻断扫描（A17 精神）：注册表照常返回，本轮走 unbound 兜底（C8）
+    console.warn(
+      `⚠️  [agent-scan] 默认智能体创建失败，本轮按 unbound 兜底装配：` +
+      `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
+/**
+ * 选一个可用的默认智能体落盘目录。
+ *
+ * 正常情况恒为 "default"（需求文档 C7 禁止改名/移动 + C10 保留字 → 路径唯一性已闭环）。
+ * 只有「绕过配置页直接在磁盘上塞了一个 default/」这种破坏性情形才会走到另选分支。
+ */
+function pickDefaultAgentDir(): string {
+  const absDefault = join(AGENTS_ROOT, DEFAULT_AGENT_PATH);
+  if (!existsSync(absDefault)) return DEFAULT_AGENT_PATH;
+
+  // 路径存在：读它的 setup.json 判断是不是我们自己
+  try {
+    const raw = readFileSync(join(absDefault, SETUP_FILE), "utf-8");
+    const j = JSON.parse(raw.replace(/^\uFEFF/, "")) as { uid?: unknown };
+    if (j.uid === DEFAULT_AGENT_UID) {
+      // 是我们的目录（可能正文被清空 → 判 invalid）→ 在原路径覆盖修复
+      return DEFAULT_AGENT_PATH;
+    }
+  } catch {
+    /* 读不出来：按被占用处理 */
+  }
+
+  // 另选：default-2 / default-3 …（最多试 9 个）
+  for (let i = 2; i <= 9; i++) {
+    const cand = `${DEFAULT_AGENT_PATH}-${i}`;
+    if (!existsSync(join(AGENTS_ROOT, cand))) return cand;
+  }
+  // 全部占满（极端）：仍返回 default，让写入自然报错并走 warn 分支
+  return DEFAULT_AGENT_PATH;
+}
+
+/* ============================================================
  * 单例与重入（照搬 skills/scan.ts 的 in-flight 去重）
  * ============================================================ */
 
@@ -476,7 +588,33 @@ export async function ensureAgentRegistry(
   //    返回第一次扫描的陈旧注册表，新增/删除 agent 永远看不到（第 9 步 E-1 缺陷）。
   const run = Promise.resolve().then(async (): Promise<AgentRegistry> => {
     try {
-      const next = scanAgentsOnce(AGENTS_ROOT, fp, files, deps);
+      let next = scanAgentsOnce(AGENTS_ROOT, fp, files, deps);
+
+      /* 【D-1】扫描后补检默认智能体：缺失则落盘重建，然后**再扫一次**拿到它的记录。
+       *
+       * 为什么必须重扫而不是手工往 Map 里塞：
+       *   手工塞要复制 raw.push 的 18 个字段赋值，容易漏（尤其 body / bodySize）；
+       *   重扫一次的成本只是「再读几个文件」，在几十个 agent 的规模下可忽略。
+       *
+       * ⚠️ 只在「确实创建过」时才重扫，避免每次请求都多扫一遍。
+       * ⚠️ **必须以本轮扫描结果 next 作为「是否已存在」的判据**，
+       *    不能用 ensureDefaultAgent 内部读的模块级单例 —— 首次启动时单例还是空的，
+       *    若拿单例判断会无视刚扫到的结果，每轮都重写文件（幂等性失效）。
+       */
+      const hasDefault = [...next.agents.values()].some(
+        (r) => r.uid === DEFAULT_AGENT_UID && r.status === "ok",
+      );
+      if (!hasDefault) {
+        const created = ensureDefaultAgent({
+          defaultLlmName: deps.defaultLlmName ?? null,
+          isKnownLlm: deps.isKnownLlm,
+        });
+        if (created) {
+          const files2 = walkAgentFiles();
+          next = scanAgentsOnce(AGENTS_ROOT, computeAgentFingerprint(files2), files2, deps);
+        }
+      }
+
       registry = { ...next, failed: next.failed || walkFailed };
       ready = !registry.failed;
       const okCount = [...next.agents.values()].filter((r) => r.status === "ok").length;

@@ -153,8 +153,7 @@
         dsmlBlocked: false,
         /** @type {string} [批次二 / NB-06、AC-CUE-02] 本轮已收到的 notice 文案（"" 表示本轮没有 notice） */
         currentNoticeText: "",
-        chatAgentUid: "",
-        chatAgentOptions: [],
+        chatAgentUid: "",        chatAgentOptions: [],
         chatAgentLoaded: false,
         chatAgentLocked: false,
         chatAgentBoundUid: "",
@@ -946,8 +945,15 @@
         $dom.input.disabled = !enabled;
         $dom.sendBtn.disabled = !enabled;
         // [agent / R-1] 流式期间锁定选择器：绑定必须在首轮确定，中途改了也没有意义
+        // 【D-2 修正】必须并列带上 state.chatAgentLocked：
+        //   本函数在流式结束时以 enabled=true 被调用，若只判 !enabled 会把
+        //   renderChatAgentOptions() 刚设好的「首问后锁定」覆盖回可选 ——
+        //   表现为提示语显示「已锁定」但下拉实际可点（需求 2 失效）。
+        //   判定口径与 renderChatAgentOptions 保持一致。
         if ($dom.chatAgentSelect) {
-            $dom.chatAgentSelect.disabled = !enabled || state.chatAgentOptions.length === 0;
+            $dom.chatAgentSelect.disabled = !enabled
+                || state.chatAgentOptions.length === 0
+                || state.chatAgentLocked;
         }
         if (enabled) {
             $dom.input.focus();
@@ -1188,6 +1194,12 @@
                 try {
                     const errData = await response.json();
                     errorMsg = errData.error || errorMsg;
+                    // [D-1] 空串 400：理论上不该发生（首项已是实值），一旦出现说明本地状态被污染，
+                    //   直接复位到默认智能体并重绘，避免下一次请求继续发空串。
+                    if (errData.code === "agent_uid_empty") {
+                        state.chatAgentUid = DEFAULT_AGENT_UID;
+                        renderChatAgentOptions();
+                    }
                     // [agent / R-1] 服务端 A14 锁定语义：已绑定会话收到不同 uid 返回 409
                     if (errData.error === "agent_locked" || response.status === 409) {
                         errorMsg = "本会话已绑定其他智能体，无法切换（请新建会话）";
@@ -1206,7 +1218,16 @@
 
             // [agent / R-1] 本轮请求已被服务端接受（未 409）→ 该 uid 即为本会话的绑定值，
             // 后续若用户切换候选，409 时用它回滚下拉显示。
-            state.chatAgentBoundUid = state.chatAgentUid || "";
+            // 【D-2 需求 2 核心】同时置 locked：从第一条消息成功发出起，智能体不可再切换
+            //   （默认智能体与自建智能体一视同仁）。必须放在 response.ok 之后 ——
+            //   放在 fetch 之前会在请求失败时也锁死下拉，用户连重试都做不了。
+            if (!state.chatAgentUid) {
+                // 兜底：理论上首项已是实值，这里防御 state 被别处清空的情形
+                state.chatAgentUid = DEFAULT_AGENT_UID;
+            }
+            state.chatAgentBoundUid = state.chatAgentUid;
+            state.chatAgentLocked = true;
+            renderChatAgentOptions();
 
             // 获取可读流
             const reader = response.body.getReader();
@@ -1597,9 +1618,16 @@
 
             // 3. 更新当前会话 ID（续接该会话）
             state.sessionId = id;
-            // [agent / R-1 方案 A] 按该会话已绑定的 agent 恢复选择器；
-            // 已绑定则置 locked，避免用户误以为可以切换（服务端 A14 会 409）。
-            applyChatAgentBinding(data.session && data.session.agentUid ? data.session.agentUid : "", !!(data.session && data.session.agentUid));
+            /* [agent / R-1 方案 A + D-2] 按该会话已绑定的 agent 恢复选择器。
+             *
+             * 【D-2 修正】置锁判据从「有没有 agentUid」改为「有没有消息」：
+             *   需求 2 的语义是「发送第一个问题后锁定」，而「已发送过消息」才是它的判据。
+             *   旧逻辑下，本次改造前创建的存量会话（agent_uid 为 NULL 但已有消息）
+             *   不会锁定 —— 用户以为能切换，一发就是 409。
+             */
+            const sessionAgentUid = (data.session && data.session.agentUid) || "";
+            const hasMessages = messages.length > 0;
+            applyChatAgentBinding(sessionAgentUid, hasMessages);
             persistSessionId(id);
 
             // 4. 滚动到底部
@@ -1807,39 +1835,80 @@
         }
     }
 
+    // ============================================
+    // [D-1] 默认智能体的前端常量
+    // ------------------------------------------------------------
+    //  ⚠️ 必须与后端 src/agents/paths.ts 的 DEFAULT_AGENT_UID 逐字一致。
+    //     前端无法 import 后端常量，只能复制 —— 这是本模块唯一的一处「双份真相」，
+    //     改动后端常量时必须同步改这里。
+    //  ⚠️ 放在模块顶部（state 之前）而不是 renderChatAgentOptions 之前：
+    //     IIFE 内 const 有 TDZ，靠后声明会让「模块初始化期就调用 render 的路径」抛
+    //     ReferenceError。放顶部是零成本的最稳做法。
+    // ============================================
+    const DEFAULT_AGENT_UID = "ag_00000000";
+
     function renderChatAgentOptions() {
         const sel = $dom.chatAgentSelect;
         if (!sel) return;
         const keep = state.chatAgentUid;
         // 用 DOM API 构造 option：路径是不可信文本，绝不拼 innerHTML。
         sel.innerHTML = "";
+
+        /* 【D-2 / C5】首项 = 默认智能体，value 为实值而不是空串。
+         *
+         * 为什么不能再用 ""：
+         *   C5 已取消「空值即默认」的约定；后端 D-1 起对空串一律 400。
+         *   若首项仍为 ""，用户停在首项发消息时 state.chatAgentUid 是空串，
+         *   请求体会走「空值不发」分支 —— 虽然侥幸不报错，但下拉显示与绑定语义脱节。
+         */
         const optDefault = document.createElement("option");
-        optDefault.value = "";
-        optDefault.textContent = "（默认 · 不绑定智能体）";
+        optDefault.value = DEFAULT_AGENT_UID;
+        optDefault.textContent = "默认智能体";
         sel.appendChild(optDefault);
+
         for (const a of state.chatAgentOptions) {
+            // 默认智能体已由首项承载，跳过以免出现两个同名选项
+            if (a.uid === DEFAULT_AGENT_UID) continue;
             const o = document.createElement("option");
             o.value = a.uid;
             o.textContent = a.path;
             sel.appendChild(o);
         }
-        sel.value = state.chatAgentOptions.some((a) => a.uid === keep) ? keep : "";
-        // 已绑定但列表尚未加载（或该 agent 已变 invalid）时，补一个占位项显示其 uid，
-        // 避免下拉显示为「不绑定」而误导出错误认知。
-        if (keep && !state.chatAgentOptions.some((a) => a.uid === keep)) {
+
+        /* 选中项决策（顺序不可换）：
+         *   ① keep 是默认智能体   → 选首项
+         *   ② keep 在候选里       → 选它
+         *   ③ keep 为空（新会话） → 选首项（默认智能体），与 C5 口径一致
+         *   ④ keep 非空但不在候选 → 走占位项分支（已删除 / 变 invalid）
+         */
+        if (keep === DEFAULT_AGENT_UID) {
+            sel.value = DEFAULT_AGENT_UID;
+        } else if (keep && state.chatAgentOptions.some((x) => x.uid === keep)) {
+            sel.value = keep;
+        } else if (!keep) {
+            sel.value = DEFAULT_AGENT_UID;
+        } else {
             const o = document.createElement("option");
             o.value = keep;
             o.textContent = keep + "（已绑定）";
             sel.appendChild(o);
             sel.value = keep;
         }
+
         // 注意：不在此处回写 state.chatAgentUid —— 列表尚未加载时 keep 可能不在候选中，
         // 回写会静默丢掉 applyChatAgentBinding 传入的已绑定 uid。
         sel.disabled = state.chatAgentOptions.length === 0 || state.isStreaming || state.chatAgentLocked;
+
+        /* 【D-2】提示文案：明确告知「首问之后锁定」，
+         * 而不是笼统的「已绑定」—— 用户需要知道下一步该做什么（新建会话）。 */
         if ($dom.chatAgentHint) {
-            $dom.chatAgentHint.textContent = state.chatAgentLocked
-                ? "本会话已绑定，不可切换"
-                : (state.chatAgentOptions.length === 0 ? "暂无可用智能体" : "");
+            if (state.chatAgentLocked) {
+                $dom.chatAgentHint.textContent = "本会话已发送过消息，智能体已锁定；如需更换请新建会话";
+            } else if (state.chatAgentOptions.length === 0) {
+                $dom.chatAgentHint.textContent = "暂无可用智能体";
+            } else {
+                $dom.chatAgentHint.textContent = "";
+            }
         }
     }
 
@@ -3398,7 +3467,7 @@
                 </div>
                 <div class="agent-row__actions">
                   <button type="button" class="config-btn config-btn--sm" data-agent-edit="${escapeHtml(a.path)}">编辑</button>
-                  <button type="button" class="config-btn config-btn--sm config-btn--danger" data-agent-del="${escapeHtml(a.path)}">删除</button>
+                  <button type="button" class="config-btn config-btn--sm config-btn--danger" data-agent-del="${escapeHtml(a.path)}"${a.isDefault ? ' disabled title="默认智能体不可删除"' : ""}>删除</button>
                 </div>
               </div>`;
         }).join("");
@@ -3436,19 +3505,98 @@
                 return;
             }
         } else {
-            // 新建：给一份最小可用的 setup 骨架
-            agentState.setupDraft = JSON.stringify({
-                title: "",
-                description: "",
-                llm: "",
-                skills: { mode: "allow", list: [] },
-                tools: { allow: null, deny: [] },
-                limits: { maxRounds: null },
-                memory: { enabled: true },
-                systemBudget: 9000,
-            }, null, 2);
+            /* 【D-3 / C4】新建：以默认智能体的当前配置为模板（需求 3）。
+             *
+             * 与旧实现的差别：
+             *   旧 = 硬编码骨架（llm 空、skills 空、limit null、budget 9000），与默认智能体无关；
+             *   新 = 拉一次默认智能体的详情，把它的 setup.json 原样复制过来（去掉身份字段）。
+             *
+             * ⚠️ 正文不拷贝（C4 明确）：bodyDraft 保持 ""，用户在浮层里自己写人设。
+             * ⚠️ uid / name 不拷贝：由后端按新建规则生成（uid 随机、name = 目录叶子名）。
+             * ⚠️ 继承是「新建那一刻取一次」（C4 推论）：不缓存、不订阅。
+             */
+            agentState.bodyDraft = "";  // C4：正文空白，不拷贝「你是默认智能体。」
+            agentState.setupDraft = await buildNewAgentSetupDraft();
         }
         renderAgentEditor();
+    }
+
+    /**
+     * 【D-3】构造新建智能体的 setup 草稿：以默认智能体的当前配置为模板。
+     *
+     * 数据源：GET /api/agents/default 的 setupJson 原文。
+     *   ⚠️ 用 setupJson 原文而不是自己按字段重组：原文保留了用户的键顺序与
+     *     将来新增的字段，重组会漏。
+     *
+     * 清理动作（只删 4 个键）：
+     *   ① uid  —— 避免保存时把默认智能体的 uid 带过去
+     *   ② name —— 后端按目录叶子名生成，写死会触发 name_mismatch
+     *   ③④ title / description —— 属展示信息而非配置项，新建的 agent 该有自己的标题
+     *
+     * 【实测修正】删完这些后，默认智能体的 setup.json 常只剩 `{}`（它的配置全是
+     * 解析期默认值，文件里本就没有那些键）。为让「继承」在 UI 上可见，
+     * 再用 `record` 里**解析后的生效值**补齐 llm / skills / tools / limits /
+     * memory / systemBudget（只补缺不覆盖）。
+     *
+     * 失败兜底：默认智能体读不到时，退回内置最小骨架，保证「新建」不被阻断。
+     *
+     * @returns {Promise<string>} 格式化的 setup.json 文本
+     */
+    async function buildNewAgentSetupDraft() {
+        const fallback = () => JSON.stringify({
+            title: "",
+            description: "",
+            llm: "",
+            skills: { mode: "allow", list: [] },
+            tools: { allow: null, deny: [] },
+            limits: { maxRounds: null },
+            memory: { enabled: true },
+            systemBudget: 9000,
+        }, null, 2);
+
+        try {
+            // 默认智能体的路径恒为 default（C7 禁改名/移动），直接按路径取。
+            // 这里的 "default" 与 DEFAULT_AGENT_UID 是两码事：一处是路径，一处是身份。
+            const resp = await fetch("/api/agents/default", { cache: "no-store" });
+            if (!resp.ok) return fallback();
+            const data = await resp.json();
+            if (!data.ok || !data.setupJson) return fallback();
+
+            const obj = JSON.parse(data.setupJson);
+            delete obj.uid;
+            delete obj.name;
+            delete obj.title;
+            delete obj.description;
+
+            /* 【D-3 实测修正】默认智能体的 setup.json 往往只有身份字段（uid / name），
+             * 配置项全走解析期默认值 —— 直接删完就只剩 `{}`，用户看到一片空白，
+             * 「继承默认配置」等于没继承（保存后虽然等价，但完全不可见、不可确认）。
+             *
+             * 这里把默认智能体**解析后的实际生效值**补齐进草稿，
+             * 让「继承」这件事在 UI 上可见、可改：
+             *   llm / skills / tools / limits / memory / systemBudget 取自 record 的生效值。
+             * 只补缺（!== undefined），已存在的键一律不覆盖。
+             */
+            const rec = data.record || {};
+            const fill = (k, v) => { if (!(k in obj)) obj[k] = v; };
+            // llmRef 为 null 表示「跟随全局 llm[0]」，草稿里不写该键，保持同样语义
+            if (rec.llmRef) fill("llm", rec.llmRef);
+            fill("skills", rec.skillsMode === "all"
+                ? { mode: "all", list: [] }
+                : { mode: "allow", list: Array.isArray(rec.skillsAllow) ? rec.skillsAllow : [] });
+            fill("tools", {
+                allow: rec.toolsAllow === undefined ? null : rec.toolsAllow,
+                deny: Array.isArray(rec.toolsDeny) ? rec.toolsDeny : [],
+            });
+            fill("limits", { maxRounds: rec.maxRounds === undefined ? null : rec.maxRounds });
+            fill("memory", { enabled: rec.memoryEnabled !== false });
+            fill("systemBudget", rec.systemBudget === undefined ? 9000 : rec.systemBudget);
+
+            return JSON.stringify(obj, null, 2);
+        } catch (e) {
+            console.warn("[D-3] 读取默认智能体配置失败，退回内置骨架:", e);
+            return fallback();
+        }
     }
 
     /** 把 path 逐段编码（保留 / 作为分隔符） */
@@ -3572,7 +3720,8 @@
             const data = await resp.json();
             if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
             await loadAgentList();
-            setAgentHint(`已删除 ${path}`);        } catch (e) {
+            setAgentHint(`已删除 ${path}`);
+        } catch (e) {
             showAgentError(`删除失败：${String(e.message || e)}`);
         }
     }

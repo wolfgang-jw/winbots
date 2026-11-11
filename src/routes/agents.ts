@@ -221,7 +221,15 @@ app.post("/", async (c) => {
         { isKnownLlm },
     );
 
-    if (!res.ok) return c.json({ ok: false, error: res.error ?? "写入失败" }, 400);
+    if (!res.ok) {
+        // 【D-1】把「保留名 / 默认智能体保护」与普通校验错误区分开，
+        //   前端据此给出不同引导（前者应该说「换个名字」，后者是「改配置」）。
+        const err = res.error ?? "写入失败";
+        const code = err.includes("保留名字") || err.includes("不允许改名或移动") || err.includes("不允许删除")
+            ? "agent_reserved"
+            : "agent_write_failed";
+        return c.json({ ok: false, error: err, code }, 400);
+    }
 
     return c.json({ ok: true, path: res.path, overwritten: res.overwritten === true });
 });
@@ -238,8 +246,18 @@ app.delete("/:path{.+}", (c) => {
 
     const res = deleteAgent(path);
     if (!res.ok) {
-        const code = res.error === "目录不存在" ? 404 : 400;
-        return c.json({ ok: false, error: res.error ?? "删除失败" }, code);
+        // 【D-1】默认智能体不可删 → 403（有权限语义，比 400 更准确）；
+        //   目录不存在 → 404；其余 → 400。
+        const isProtected = (res.error ?? "").includes("不允许删除");
+        const status = isProtected ? 403 : (res.error === "目录不存在" ? 404 : 400);
+        return c.json(
+            {
+                ok: false,
+                error: res.error ?? "删除失败",
+                code: isProtected ? "agent_reserved" : "agent_delete_failed",
+            },
+            status,
+        );
     }
 
     return c.json({ ok: true, path: res.path });

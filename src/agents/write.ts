@@ -24,7 +24,10 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { AGENTS_ROOT, AGENT_FILE, SETUP_FILE, checkAgentPath, AGENT_UID_RE } from "./paths";
+import {
+  AGENTS_ROOT, AGENT_FILE, SETUP_FILE, checkAgentPath, AGENT_UID_RE,
+  DEFAULT_AGENT_UID, isDefaultAgentPath,
+} from "./paths";
 import { parseAgentSetup } from "./setup";
 import type { AgentSetup } from "./types";
 
@@ -92,42 +95,133 @@ function setupJsonOf(path: string): string {
   return join(absDirOf(path), SETUP_FILE);
 }
 
+/**
+ * 【D-1】读取某目录当前持有的 uid；目录或 setup.json 不存在时返回 null。
+ *
+ * ⚠️ 与内部 readExistingUid 的区别：那个接受**文件绝对路径**、仅供 upsert 内部使用；
+ *    本函数接受**相对路径**、供对外保护判定使用。刻意不合并 ——
+ *    合并会让 upsert 内部多一层重复的路径归一化。
+ */
+export function readAgentUid(path: string): string | null {
+  const sj = setupJsonOf(path);
+  if (!existsSync(sj)) return null;
+  try {
+    const j = JSON.parse(readFileSync(sj, "utf8")) as { uid?: unknown };
+    return typeof j.uid === "string" && AGENT_UID_RE.test(j.uid) ? j.uid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 【D-1】写操作的身份守卫（需求文档 C7 / C10 / §4.8 / §4.9）。
+ *
+ * 只拦两件事，**绝不拦配置内容**（A-1.5f 红线）：
+ *   ① 目标是默认智能体，但请求路径不是 default  → 拒绝（C7 禁止改名/移动）
+ *   ② 目标是普通智能体，但请求路径是 default    → 拒绝（C10 保留名字）
+ *
+ * ⚠️ 注意判定方向：①判「uid 是默认 + 路径不是默认」，②判「uid 不是默认 + 路径是默认」。
+ *    两个条件互斥，合起来保证「default 路径 ⟺ ag_00000000 身份」的双向唯一。
+ *
+ * ⚠️ 为什么 ② 用 `isDefaultAgentPath(path)` 而不是前缀匹配：
+ *    需求文档 §4.3 明确 `default` 是**精确**保留字，`default2` / `ops/default` 都合法。
+ *
+ * @param path 归一化后的目标相对路径
+ * @returns 拒绝原因；null = 放行
+ */
+export function guardDefaultAgent(path: string): string | null {
+  const existingUid = readAgentUid(path);
+  const isSelfDefault = existingUid === DEFAULT_AGENT_UID;
+
+  // ② 保留名字：普通智能体不得占用 default 路径
+  //   ⚠️ 判定「是不是自己」用 existingUid：若 default 目录里已是 ag_00000000（编辑默认智能体），
+  //      则不拦；只有「default 路径被非默认身份占用」才拦（C10）。
+  if (!isSelfDefault && isDefaultAgentPath(path)) {
+    return (
+      "「default」是默认智能体的保留名字，不能用于创建其它智能体" +
+      "（如需新建，请换一个名字）"
+    );
+  }
+
+  // ① 默认智能体不得改名/移动：其路径必须恒为 default
+  //   ⚠️ 这一支的实际覆盖：API 没有「改名」原语（upsertAgent 只按目标路径写），
+  //      因此它真正拦住的是「把 default 目录的 setup.json 内容 POST 到一个新路径、
+  //      同时希望沿用 uid」这种试图复制默认身份的操作 —— 那会让系统中出现两个
+  //      ag_00000000。基于「目标路径上已有 ag_00000000 但路径不是 default」来判。
+  if (isSelfDefault && !isDefaultAgentPath(path)) {
+    return (
+      `默认智能体（uid=${DEFAULT_AGENT_UID}）不允许改名或移动目录，` +
+      "路径必须保持为「default」"
+    );
+  }
+
+  return null;
+}
+
 /* ============================================================
  * setup.json 序列化（字段名严格对齐 parseAgentSetup 的读取键）
  * ============================================================ */
 export function buildSetupJson(path: string, uid: string, setup: Partial<AgentSetup>): string {
   const leaf = path.split("/").pop() ?? path;
 
+  /* 【BUG 修复】兼容两种入参形态：
+   *
+   *   ① 内部形态（AgentSetup 的字段名）：skillsMode / skillsAllow / toolsAllow /
+   *      toolsDeny / maxRounds / memoryEnabled。write.test.ts 与内部调用走这条。
+   *   ② 磁盘形态（setup.json 的原始键名）：skills:{mode,list} / tools:{allow,deny} /
+   *      limits:{maxRounds} / memory:{enabled}。配置页前端编辑框里贴的就是这种，
+   *      直接 POST 上来。
+   *
+   * 修复前只认 ①，而前端发的是 ②：两者字段名不同 → skills / tools / limits /
+   * memory 全被当作 undefined 跳过，**保存后静默丢失**，只剩 systemBudget
+   * （唯一两边同名的键）。这是既有缺陷（改造前就存在），
+   * 在「新建智能体继承默认配置」后变得致命 —— 继承来的配置一保存就没了。
+   *
+   * 归一化只补缺、不覆盖：① 已给出时以 ① 为准。
+   */
+  const raw = setup as unknown as Record<string, any>;
+  const pick = <T>(a: T | undefined, b: T | undefined): T | undefined =>
+    a !== undefined ? a : b;
+
+  const skillsMode = pick(setup.skillsMode, raw.skills?.mode);
+  const skillsAllow = pick(setup.skillsAllow, raw.skills?.list);
+  const toolsAllow = pick(setup.toolsAllow, raw.tools?.allow);
+  const toolsDeny = pick(setup.toolsDeny, raw.tools?.deny);
+  const maxRounds = pick(setup.maxRounds, raw.limits?.maxRounds);
+  const memoryEnabled = pick(setup.memoryEnabled, raw.memory?.enabled);
+  // llm 同理：磁盘键名是 llm，内部字段名是 llmRef
+  const llmRef = pick(setup.llmRef, raw.llm);
+
   const out: Record<string, unknown> = { uid, name: leaf };
 
   if (setup.title !== undefined) out.title = setup.title;
   if (setup.description !== undefined) out.description = setup.description;
-  if (setup.llmRef !== undefined) out.llm = setup.llmRef;
+  if (llmRef !== undefined) out.llm = llmRef;
 
   // skills: { mode, list }  ← 键是 list
-  if (setup.skillsMode !== undefined || setup.skillsAllow !== undefined) {
+  if (skillsMode !== undefined || skillsAllow !== undefined) {
     out.skills = {
-      ...(setup.skillsMode !== undefined ? { mode: setup.skillsMode } : {}),
-      ...(setup.skillsAllow !== undefined ? { list: setup.skillsAllow } : {}),
+      ...(skillsMode !== undefined ? { mode: skillsMode } : {}),
+      ...(skillsAllow !== undefined ? { list: skillsAllow } : {}),
     };
   }
 
   // tools: { allow, deny }
-  if (setup.toolsAllow !== undefined || setup.toolsDeny !== undefined) {
+  if (toolsAllow !== undefined || toolsDeny !== undefined) {
     out.tools = {
-      ...(setup.toolsAllow !== undefined ? { allow: setup.toolsAllow } : {}),
-      ...(setup.toolsDeny !== undefined ? { deny: setup.toolsDeny } : {}),
+      ...(toolsAllow !== undefined ? { allow: toolsAllow } : {}),
+      ...(toolsDeny !== undefined ? { deny: toolsDeny } : {}),
     };
   }
 
   // limits: { maxRounds }  ← 在 limits 下
-  if (setup.maxRounds !== undefined) {
-    out.limits = { maxRounds: setup.maxRounds };
+  if (maxRounds !== undefined) {
+    out.limits = { maxRounds };
   }
 
   // memory: { enabled }
-  if (setup.memoryEnabled !== undefined) {
-    out.memory = { enabled: setup.memoryEnabled };
+  if (memoryEnabled !== undefined) {
+    out.memory = { enabled: memoryEnabled };
   }
 
   if (setup.systemBudget !== undefined) out.systemBudget = setup.systemBudget;
@@ -209,6 +303,11 @@ export function upsertAgent(
   const bad = validateAgentPath(path);
   if (bad) return { ok: false, error: bad };
 
+  // 【D-1】身份守卫：默认智能体不可改名/移动；default 是保留名字（C7 / C10）。
+  //   ⚠️ 必须在任何写盘动作之前 —— 包括 mkdirSync，否则拒绝时仍会留下空目录。
+  const guarded = guardDefaultAgent(path);
+  if (guarded !== null) return { ok: false, error: guarded };
+
   if (input.body !== undefined && typeof input.body !== "string") {
     return { ok: false, error: "body 必须是字符串" };
   }
@@ -276,6 +375,18 @@ export function deleteAgent(rawPath: string): WriteResult {
   const path = normalizeAgentPath(rawPath);
   const bad = validateAgentPath(path);
   if (bad) return { ok: false, error: bad };
+
+  // 【D-1】删除保护（A-1.5）：当前处于默认身份的智能体不可删除。
+  //   ⚠️ 判据是「该目录当前的 uid」，不是「路径是否为 default」——
+  //      否则用户把别的 agent 放进 default 就会被误判为不可删。
+  if (readAgentUid(path) === DEFAULT_AGENT_UID) {
+    return {
+      ok: false,
+      error:
+        `默认智能体（uid=${DEFAULT_AGENT_UID}）不允许删除。` +
+        "如需重置其内容，请在配置页编辑配置项或正文。",
+    };
+  }
 
   const dir = absDirOf(path);
   if (!existsSync(dir)) return { ok: false, error: "目录不存在" };

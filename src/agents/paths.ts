@@ -114,9 +114,40 @@ export function agentLeafName(path: string): string {
   return segs.length === 0 ? "" : (segs[segs.length - 1] as string);
 }
 
-/** 【D-B】是否为默认 agent 目录（path 恰为 "default"） */
+/**
+ * 【D-1】默认智能体的固定 uid。
+ *
+ * ⚠️ 这是**保留 uid**：`generateAgentUid()` 必须永不产出它（见下）。
+ *    设定理由：需求 1 要求「默认智能体 uid 固定为 ag_00000000」，
+ *    而现有生成规则是随机 4 字节 —— 随机空间里 00000000 是合法值，不排除就会撞。
+ *
+ * ⚠️ 双份真相：`public/js/chat.js` 里有一份同名常量（前端无法 import 后端），
+ *    改动这里必须同步改 `public/js/chat.js` 的 DEFAULT_AGENT_UID。
+ */
+export const DEFAULT_AGENT_UID = "ag_00000000";
+
+/** 【D-1】默认智能体的固定相对路径（与 uid 强绑定，见需求文档 C7） */
+export const DEFAULT_AGENT_PATH = "default";
+
+/** 【D-1】默认智能体自动创建时的 AGENT.md 正文（需求文档 Q1 决策） */
+export const DEFAULT_AGENT_BODY = "你是默认智能体。";
+
+/**
+ * 【D-1】是否为默认智能体：按 **uid** 判定，不再按路径。
+ *
+ * 为什么不按路径：路径可被用户/磁盘操作改写（把别的 agent 挪到 default/），
+ *   而 uid 是身份标识（A16 双层标识语义）。需求文档 C2 已明确定为 uid 判定。
+ *
+ * ⚠️ 保留 `isDefaultAgentPath` 供「路径期望值」校验场景使用（见 write.ts 的保护逻辑），
+ *    两者不要混用：一个回答「它是不是默认身份」，另一个回答「这个路径是不是默认路径」。
+ */
+export function isDefaultAgentUid(uid: string): boolean {
+  return uid === DEFAULT_AGENT_UID;
+}
+
+/** 【D-B】是否为默认 agent 目录（path 恰为 "default"）—— 仅作路径期望值使用 */
 export function isDefaultAgentPath(path: string): boolean {
-  return path === "default";
+  return path === DEFAULT_AGENT_PATH;
 }
 
 /** uid 格式（ag_ + 8 位小写十六进制） */
@@ -134,5 +165,14 @@ export function isAgentUid(v: string): boolean {
  *   在「几十~几百个 agent」的规模下可忽略，且碰撞由扫描期的重复检测兜底（两个都 invalid）。
  */
 export function generateAgentUid(): string {
-  return `ag_${randomBytes(4).toString("hex")}`;
+  // 【D-1】排除保留 uid：随机命中 ag_00000000 的概率是 1/2^32，
+  //   但一旦命中就会与默认智能体同 uid（两个都判 invalid），
+  //   而默认智能体是系统必需项 —— 代价不对等，直接循环重试。
+  //   连续 3 次命中 00000000 的概率是 2^-96，循环 3 次足够。
+  for (let i = 0; i < 3; i++) {
+    const uid = `ag_${randomBytes(4).toString("hex")}`;
+    if (uid !== DEFAULT_AGENT_UID) return uid;
+  }
+  // 理论不可达：返回确定性兜底值（仍符合 AGENT_UID_RE）
+  return "ag_00000001";
 }
