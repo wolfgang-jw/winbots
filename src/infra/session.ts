@@ -423,6 +423,11 @@ export interface SessionSummary {
     updatedAt: number;
     /** 消息条数 */
     messageCount: number;
+    /**
+     * [agent / 第 9 步 A19] 绑定 agent 的 uid；未绑定为 null。
+     * 列表据此渲染角标（🤖 名称），无需前端再发一次请求。
+     */
+    agentUid: string | null;
 }
 
 /**
@@ -444,10 +449,11 @@ export function listSessions(): SessionSummary[] {
                 created_at: number;
                 updated_at: number;
                 message_count: number;
+                agent_uid: string | null;
             },
             Record<string, never>
         >(
-            `SELECT id, title, created_at, updated_at, message_count
+            `SELECT id, title, created_at, updated_at, message_count, agent_uid
              FROM sessions
              ORDER BY updated_at DESC, id DESC`
         )
@@ -460,6 +466,7 @@ export function listSessions(): SessionSummary[] {
         createdAt: r.created_at,
         updatedAt: r.updated_at,
         messageCount: r.message_count,
+        agentUid: r.agent_uid ?? null,
     }));
 }
 
@@ -501,10 +508,11 @@ export function getSessionDetail(sessionId: string): SessionDetail {
                 created_at: number;
                 updated_at: number;
                 message_count: number;
+                agent_uid: string | null;
             },
             { $sid: string }
         >(
-            `SELECT id, title, created_at, updated_at, message_count
+            `SELECT id, title, created_at, updated_at, message_count, agent_uid
              FROM sessions
              WHERE id = $sid`
         )
@@ -521,6 +529,7 @@ export function getSessionDetail(sessionId: string): SessionDetail {
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         messageCount: row.message_count,
+        agentUid: row.agent_uid ?? null,
     };
 
     // 2. 查询消息列表（含 meta），复用 US-4.1 既有函数

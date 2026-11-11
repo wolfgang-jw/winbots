@@ -32,6 +32,7 @@ export {
   emptyAgentRegistry,
   walkAgentFiles, computeAgentFingerprint, scanAgentsOnce,
   resetAgentRegistryForTest,
+  agentRegistryStateForTest,
   type ScanDeps, type Stamp,
 } from "./scan";
 
@@ -86,3 +87,14 @@ export {
   buildSummarizePrompt, parseSummarizeOutput, callSummarizeLlm,
   type SummarizeMessage, type SummarizeParams, type SummarizeResult,
 } from "./memorySummarize";
+
+// ── 第 9 步（模块 7-A13：agent 读写）────────────────────────────────────
+// 只转发「文件层」：路径归一/校验 + 读 + 写 + 删。
+// HTTP 编排在 routes/agents.ts；本文件不 import @/infra/*，保持 agents 的模块图纯洁。
+// ⚠️ 不要转发 AGENTS_ROOT / checkAgentPath 等：paths 块已导出，重复会报
+//    "Module has already exported a member named"。
+export {
+  upsertAgent, deleteAgent, readAgentFile,
+  normalizeAgentPath, validateAgentPath, buildSetupJson,
+  type WriteAgentInput, type WriteResult, type AgentFileContent,
+} from "./write";

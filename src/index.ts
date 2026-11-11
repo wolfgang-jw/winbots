@@ -22,6 +22,8 @@ import approvalRoute from "@/routes/approval";   // [批次三 / NH-02 ②③] �
 import skillsRoute from "@/routes/skills";   // [skill] 技能只读查询（清单 / 预览）
 // [agent / 第 8 步 模块 6b] 记忆摘要：独立路由，完全脱离对话主循环（A11）
 import { memoryRoute } from "@/routes/memory";
+// [agent / 第 9 步 模块 7-A13] agent 配置读写（列表/详情/新建/删除）
+import agentsRoute from "@/routes/agents";
 import { openBrowser } from "@/infra/openBrowser";
 import { originGuard } from "@/middleware/origin";
 import { initDb, closeDb } from "@/infra/db";   // ← [US-4.1] 新增
@@ -51,6 +53,8 @@ app.route("/api/approvals", approvalRoute);
 app.route("/api/skills", skillsRoute);
 // [agent / 第 8 步 模块 6b] 记忆摘要（必须在 serveStatic 之前，否则会返回 HTML）
 app.route("/api/memory", memoryRoute);
+// [agent / 第 9 步 模块 7-A13] agent 读写（必须在 serveStatic 之前，否则会返回 HTML）
+app.route("/api/agents", agentsRoute);
 
 // ============================================
 // 静态文件服务（前端页面）

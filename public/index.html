@@ -163,6 +163,36 @@
         </div>
     </div>
 
+    <!-- [agent / 第 9 步 · 模块 7-A14] 智能体编辑浮层。
+         复用 .approval-modal 系列视觉类；AGENT.md 与 setup.json 各一个 textarea。
+         ⚠️ 正文用 .value 读写（不用 innerHTML 拼用户文本），与技能预览同一安全口径。 -->
+    <div class="approval-modal agent-editor-modal" id="agent-editor-modal" role="dialog" aria-modal="true"
+         aria-labelledby="agent-editor-title" hidden>
+        <div class="approval-modal__backdrop" data-agent-close="1"></div>
+        <div class="approval-modal__panel agent-editor__panel">
+            <div class="approval-modal__title" id="agent-editor-title">编辑智能体</div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="agent-editor-path">路径（相对 etc/agents/，不含 .md）</label>
+                <input type="text" id="agent-editor-path" class="agent-editor__path" placeholder="例：ops/devops" autocomplete="off">
+            </div>
+            <div class="config-item__error" id="agent-editor-error" hidden></div>
+            <div class="agent-editor__cols">
+                <div class="agent-editor__col">
+                    <label class="agent-editor__label" for="agent-editor-body">AGENT.md（人格正文）</label>
+                    <textarea id="agent-editor-body" class="agent-editor__text" spellcheck="false" placeholder="这里是该 agent 的系统提示正文…"></textarea>
+                </div>
+                <div class="agent-editor__col">
+                    <label class="agent-editor__label" for="agent-editor-setup">setup.json（模型 / 技能 / 工具 / 预算）</label>
+                    <textarea id="agent-editor-setup" class="agent-editor__text agent-editor__text--mono" spellcheck="false"></textarea>
+                </div>
+            </div>
+            <div class="agent-editor__preview" id="agent-editor-preview"></div>
+            <div class="skill-preview__footer">
+                <button type="button" class="approval-modal__cancel" id="agent-editor-cancel">取消</button>
+                <button type="button" class="approval-modal__submit" id="agent-editor-save">保存</button>
+            </div>
+        </div>
+    </div>
     <!-- ==================== 历史视图（US-4.8） ==================== -->
     <section class="history-layout" id="view-history" hidden>
         <div class="history-header">

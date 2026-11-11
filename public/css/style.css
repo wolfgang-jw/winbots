@@ -1985,3 +1985,108 @@ body.approval-open { overflow: hidden; }
 
 /* 说明：--primary 是纯粹的「JS 定位用标记类」，不产生任何样式，故意不在这里定义。
    它必须与 --ok / --danger 同时存在，供 modal.js 稳定查到确认按钮（两者互斥切换）。 */
+
+/* ============================================================
+ * [agent / 第 9 步 · 模块 7-A14] 智能体配置区（配置页第四段）
+ * ------------------------------------------------------------
+ *   · 列表行复用 .config-section 的视觉；行内两列：主信息 + 操作
+ *   · 编辑浮层复用 .approval-modal 骨架，内部再分两栏 textarea
+ * ============================================================ */
+
+.agent-toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 0 12px;
+}
+.agent-toolbar__hint {
+    font-size: 0.8rem; color: var(--gray-600);
+}
+.config-btn--sm {
+    padding: 5px 14px; font-size: 0.8rem; border-radius: 14px;
+}
+.config-btn--danger {
+    background: linear-gradient(135deg, #e53935, #b71c1c);
+}
+
+/* ---------- 列表行 ---------- */
+.agent-row {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 10px 12px; border-radius: 8px;
+    background: var(--white);
+    border: 1px solid var(--gray-200);
+    margin-bottom: 8px;
+}
+.agent-row:hover { border-color: var(--tomato-red); }
+.agent-row__main { flex: 1 1 auto; min-width: 0; }
+.agent-row__title {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    font-size: 0.9rem; color: var(--gray-800);
+}
+.agent-row__title code {
+    font-size: 0.85rem; background: var(--gray-100, #f3f3f3);
+    padding: 1px 6px; border-radius: 4px;
+}
+.agent-row__name { color: var(--gray-600); font-size: 0.82rem; }
+.agent-row__meta {
+    margin-top: 4px; font-size: 0.76rem; color: var(--gray-600);
+    line-height: 1.6; word-break: break-all;
+}
+.agent-row__reason {
+    margin-top: 4px; font-size: 0.76rem; color: #c62828;
+    background: #ffebee; border-radius: 4px; padding: 4px 8px;
+}
+.agent-row__actions {
+    flex: 0 0 auto; display: flex; gap: 6px; align-items: center;
+}
+
+/* ---------- 编辑浮层 ---------- */
+.agent-editor__panel {
+    width: min(1100px, 94vw);
+    max-height: 88vh; overflow: auto;
+    display: flex; flex-direction: column;
+}
+.agent-editor__pathrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 0 10px;
+}
+.agent-editor__label {
+    font-size: 0.8rem; color: var(--gray-600); flex: 0 0 auto;
+}
+.agent-editor__path {
+    flex: 1 1 auto; padding: 8px 10px;
+    border: 1px solid var(--gray-300, #ccc); border-radius: 6px;
+    font-size: 0.88rem; font-family: inherit;
+}
+.agent-editor__path:disabled {
+    background: var(--gray-100, #f3f3f3); color: var(--gray-600);
+}
+
+.agent-editor__cols {
+    display: flex; gap: 14px; flex: 1 1 auto; min-height: 0;
+}
+.agent-editor__col {
+    flex: 1 1 50%; display: flex; flex-direction: column; min-width: 0;
+}
+.agent-editor__col > .agent-editor__label { padding-bottom: 6px; }
+.agent-editor__text {
+    flex: 1 1 auto;
+    min-height: 300px;
+    padding: 10px 12px;
+    border: 1px solid var(--gray-300, #ccc); border-radius: 6px;
+    font-size: 0.84rem; line-height: 1.6;
+    font-family: inherit; resize: vertical;
+}
+.agent-editor__text--mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+}
+.agent-editor__preview {
+    margin-top: 8px; padding: 8px 10px;
+    font-size: 0.78rem; color: #c62828;
+    white-space: pre-wrap; word-break: break-all;
+}
+.agent-editor__preview:empty { display: none; }
+
+@media (max-width: 860px) {
+    .agent-editor__cols { flex-direction: column; }
+    .agent-editor__text { min-height: 180px; }
+}

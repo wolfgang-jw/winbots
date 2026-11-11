@@ -434,7 +434,13 @@ export async function ensureAgentRegistry(
   if (!opts.force && ready && !walkFailed && fp === registry.fingerprint) return registry;
   if (inflight) return inflight;
 
-  const run = (async (): Promise<AgentRegistry> => {
+  // ⚠️ 必须「先赋值、后执行」：把扫描体包在 Promise.resolve().then() 里，
+  //    保证 `inflight = p` 发生在扫描体运行之前。
+  //    否则（旧写法）同步扫描体会在 IIFE 里一路跑到 finally 把 inflight 清成 null，
+  //    随后 `inflight = run` 又把一个**已 resolve** 的 Promise 塞回去，
+  //    inflight 从此永久非 null → 后续请求全部命中 `if (inflight) return inflight`，
+  //    返回第一次扫描的陈旧注册表，新增/删除 agent 永远看不到（第 9 步 E-1 缺陷）。
+  const run = Promise.resolve().then(async (): Promise<AgentRegistry> => {
     try {
       const next = scanAgentsOnce(AGENTS_ROOT, fp, files, deps);
       registry = { ...next, failed: next.failed || walkFailed };
@@ -456,7 +462,7 @@ export async function ensureAgentRegistry(
     } finally {
       inflight = null;
     }
-  })();
+  });
 
   inflight = run;
   return run;
@@ -467,4 +473,17 @@ export function resetAgentRegistryForTest(): void {
   registry = emptyAgentRegistry();
   ready = false;
   inflight = null;
+}
+
+/**
+ * 仅供单测：读取内部单例状态。
+ * 存在的理由：`inflight` 若不慎永久非 null，会让注册表再也不刷新（E-1 缺陷），
+ * 而这个状态从外部完全不可见 —— 没有探针就没法写回归测试锁住它。
+ */
+export function agentRegistryStateForTest(): {
+  ready: boolean;
+  inflight: boolean;
+  fingerprint: string;
+} {
+  return { ready, inflight: inflight !== null, fingerprint: registry.fingerprint };
 }

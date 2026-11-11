@@ -1854,6 +1854,18 @@
     };
 
     /** 拉取并渲染配置视图（进入视图 / 保存成功后调用） */
+    // [agent / 第 9 步] 声明必须在 loadConfigView 之前：switchView("config") 同步走到
+    //   renderAgentSection()，const 若后置会 TDZ 抛 ReferenceError。
+    const agentState = {
+        list: [],
+        warnings: [],
+        counts: { total: 0, ok: 0, invalid: 0 },
+        editing: null,
+        bodyDraft: "",
+        setupDraft: "",
+        preview: null,
+    };
+
     async function loadConfigView() {
         const box = document.getElementById("config-form");
         if (!box) return;
@@ -1912,10 +1924,11 @@
         // [C-11 / §11 / §10.2] 工具树与遗留键区块接在系统项之后
         box.insertAdjacentHTML(
             "beforeend",
-            renderToolSection() + renderSkillSection() + renderOrphanSection(),
+            renderToolSection() + renderSkillSection() + renderAgentSection() + renderOrphanSection(),
         );
         bindToolTreeEvents(box);
         bindSkillTreeEvents(box);
+        bindAgentSectionEvents(box);   // [agent / 第 9 步] 第四段：智能体列表
 
         box.querySelectorAll("[data-config-key]").forEach((el) => {
             el.addEventListener("input", () => setConfigDirty(true));
@@ -3151,4 +3164,357 @@
     } else {
         init();
     }
+    // ⚠️ IIFE 闭合括号移至文件末尾：第 9 步 agent 段需留在 IIFE 内部，否则 init 引用不到。
+
+    /* ============================================================
+     * [agent / 第 9 步 · 模块 7-A14] 智能体配置区（第四段）
+     * ------------------------------------------------------------
+     *  数据源：GET /api/agents（列表）、GET /api/agents/:path（详情）
+     *  写操作：POST /api/agents（新建/覆盖）、DELETE /api/agents/:path
+     *
+     *  ⚠️ 与技能/工具区不同：agent 是「独立文件」，编辑走浮层，不并入
+     *     configState 的草稿-保存模式（避免与 env.json 的 PUT 混在一起）。
+     *     因此这里的所有改动**即时落盘**，只读列表可随时刷新。
+     * ============================================================ */
+    // ⚠️ agentState 的声明已前移至 configState 之后（见上方）：
+    //    switchView("config") 会同步触发 renderAgentSection()，若在此处声明，
+    //    首次以 ?view=config 加载时会撞上 const 的 TDZ 而抛 ReferenceError。
+
+    /** 第四段：智能体列表 */
+    function renderAgentSection() {
+        const c = agentState.counts || { total: 0, ok: 0, invalid: 0 };
+        const head = `
+          <h3 class="config-section__title">
+            智能体配置（<code>etc/agents/</code> 下的每个目录是一个 agent；点击行内「编辑」修改）
+          </h3>`;
+        const warnBlock = (agentState.warnings || []).length > 0
+            ? `<div class="tool-node__warn">${agentState.warnings.map((w) => escapeHtml(w)).join("<br>")}</div>`
+            : "";
+
+        return `<section class="config-section" id="config-agent-section">${head}
+          <div class="config-item__desc" id="config-agent-stats">
+            共 ${c.total} 个智能体（正常 ${c.ok}，异常 ${c.invalid}）。
+            agent 目录内两个文件：<code>AGENT.md</code>（人格正文）与 <code>setup.json</code>（模型 / 技能 / 工具 / 预算）。
+            保存时自动备份为 <code>.bak</code>。
+          </div>
+          ${warnBlock}
+          <div class="config-item__error" id="config-agent-fields" hidden></div>
+          <div class="agent-toolbar">
+            <button type="button" class="config-btn" id="config-agent-new">＋ 新建智能体</button>
+            <button type="button" class="config-btn" id="config-agent-reload">🔄 刷新列表</button>
+            <span class="agent-toolbar__hint" id="config-agent-hint"></span>
+          </div>
+          <div id="config-agent-list"><div class="config-loading">加载中…</div></div>
+        </section>`;
+    }
+
+    /** 绑定第四段的事件（在 renderConfigForm 之后调用） */
+    function bindAgentSectionEvents(box) {
+        const newBtn = box.querySelector("#config-agent-new");
+        if (newBtn) newBtn.addEventListener("click", openAgentEditorNew);
+        const reloadBtn = box.querySelector("#config-agent-reload");
+        if (reloadBtn) reloadBtn.addEventListener("click", () => loadAgentList());
+        loadAgentList();
+    }
+
+    /** 拉取列表并重画 */
+    async function loadAgentList() {
+        const listBox = document.getElementById("config-agent-list");
+        if (!listBox) return;
+        listBox.innerHTML = '<div class="config-loading">加载中…</div>';
+        try {
+            const resp = await fetch("/api/agents", { cache: "no-store" });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            agentState.list = data.items || [];
+            agentState.warnings = data.warnings || [];
+            agentState.counts = data.counts || { total: 0, ok: 0, invalid: 0 };
+            renderAgentList(listBox);
+            // 同步第四段顶部的统计数字（该段只在 renderConfigForm 时渲染一次，
+            // 增删 agent 后若不刷新会一直显示旧数字）
+            updateAgentCountsText();
+        } catch (e) {
+            listBox.innerHTML = `<div class="config-error">加载智能体失败：${escapeHtml(String(e.message || e))}</div>`;
+        }
+    }
+
+    /** 重画列表表格 */
+    function renderAgentList(listBox) {
+        if (!agentState.list || agentState.list.length === 0) {
+            listBox.innerHTML = `
+              <div class="config-item__desc">
+                还没有任何智能体。在 <code>etc/agents/&lt;路径&gt;/</code> 下新建目录，
+                或点上方「＋ 新建智能体」。未创建时对话使用默认模型（env.json 的 llm[0]）。
+              </div>`;
+            return;
+        }
+        const rows = agentState.list.map((a) => {
+            const badge = a.status === "ok"
+                ? '<span class="config-badge config-badge--set">正常</span>'
+                : `<span class="config-badge config-badge--shadow">异常</span>`;
+            const def = a.isDefault ? '<span class="config-badge">默认</span>' : "";
+            const reason = a.status !== "ok" && a.invalidReason
+                ? `<div class="agent-row__reason">${escapeHtml(a.invalidReason)}</div>` : "";
+            const rounds = a.maxRounds === null || a.maxRounds === undefined ? "—" : String(a.maxRounds);
+            return `
+              <div class="agent-row" data-agent-path="${escapeHtml(a.path)}">
+                <div class="agent-row__main">
+                  <div class="agent-row__title">
+                    <code>${escapeHtml(a.path)}</code>
+                    ${badge}${def}
+                    ${a.title ? `<span class="agent-row__name">${escapeHtml(a.title)}</span>` : ""}
+                  </div>
+                  <div class="agent-row__meta">
+                    uid ${escapeHtml(a.uid)} ·
+                    LLM ${escapeHtml(a.llmRef || "（默认）")} ·
+                    技能 ${a.skillsMode === "all" ? "全部" : `白名单 ${(a.skillsAllow || []).length} 项`} ·
+                    工具 ${a.toolsAllow === null ? "不限" : `${(a.toolsAllow || []).length} 项`} ·
+                    轮次 ${escapeHtml(rounds)} ·
+                    预算 ${escapeHtml(String(a.systemBudget))} ·
+                    记忆 ${a.memoryEnabled ? "开" : "关"} ·
+                    正文 ${escapeHtml(String(a.bodySize))}B
+                  </div>
+                  ${reason}
+                </div>
+                <div class="agent-row__actions">
+                  <button type="button" class="config-btn config-btn--sm" data-agent-edit="${escapeHtml(a.path)}">编辑</button>
+                  <button type="button" class="config-btn config-btn--sm config-btn--danger" data-agent-del="${escapeHtml(a.path)}">删除</button>
+                </div>
+              </div>`;
+        }).join("");
+
+        listBox.innerHTML = rows;
+
+        listBox.querySelectorAll("[data-agent-edit]").forEach((btn) => {
+            btn.addEventListener("click", () => openAgentEditor(btn.dataset.agentEdit));
+        });
+        listBox.querySelectorAll("[data-agent-del]").forEach((btn) => {
+            btn.addEventListener("click", () => deleteAgentByPath(btn.dataset.agentDel));
+        });
+    }
+
+    /** 打开编辑浮层：path 为空 = 新建 */
+    async function openAgentEditor(path) {
+        agentState.editing = path || null;
+        agentState.bodyDraft = "";
+        agentState.setupDraft = "";
+        agentState.preview = null;
+        // 清掉上一次残留的错误提示（否则「上次保存失败的原因」会跟着新一次编辑显示）
+        const errEl = document.getElementById("agent-editor-error");
+        if (errEl) { errEl.hidden = true; errEl.textContent = ""; }
+
+        if (path) {
+            try {
+                const resp = await fetch(`/api/agents/${encodePath(path)}`, { cache: "no-store" });
+                const data = await resp.json();
+                if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+                agentState.bodyDraft = data.body || "";
+                agentState.setupDraft = data.setupJson || "";
+                if (data.setupError) agentState.preview = { error: data.setupError };
+            } catch (e) {
+                showAgentError(`读取失败：${String(e.message || e)}`);
+                return;
+            }
+        } else {
+            // 新建：给一份最小可用的 setup 骨架
+            agentState.setupDraft = JSON.stringify({
+                title: "",
+                description: "",
+                llm: "",
+                skills: { mode: "allow", list: [] },
+                tools: { allow: null, deny: [] },
+                limits: { maxRounds: null },
+                memory: { enabled: true },
+                systemBudget: 9000,
+            }, null, 2);
+        }
+        renderAgentEditor();
+    }
+
+    /** 把 path 逐段编码（保留 / 作为分隔符） */
+    function encodePath(path) {
+        return String(path).split("/").map(encodeURIComponent).join("/");
+    }
+
+    /** 重画编辑浮层内容 */
+    function renderAgentEditor() {
+        const modal = document.getElementById("agent-editor-modal");
+        const titleEl = document.getElementById("agent-editor-title");
+        const pathEl = document.getElementById("agent-editor-path");
+        const bodyEl = document.getElementById("agent-editor-body");
+        const setupEl = document.getElementById("agent-editor-setup");
+        const previewEl = document.getElementById("agent-editor-preview");
+        if (!modal) return;
+
+        if (titleEl) titleEl.textContent = agentState.editing ? `编辑智能体：${agentState.editing}` : "新建智能体";
+        if (pathEl) {
+            pathEl.value = agentState.editing || "";
+            // 编辑已有 agent 时 path 不可改（改名等于搬家，容易误操作）
+            pathEl.disabled = !!agentState.editing;
+        }
+        if (bodyEl) bodyEl.value = agentState.bodyDraft;
+        if (setupEl) setupEl.value = agentState.setupDraft;
+        if (previewEl) {
+            const p = agentState.preview;
+            if (!p) previewEl.textContent = "";
+            else if (p.error) previewEl.textContent = p.error;
+            else previewEl.textContent = JSON.stringify(p, null, 2);
+        }
+        modal.hidden = false;
+        if (pathEl) pathEl.focus();
+    }
+
+    /** 关闭编辑浮层 */
+    function closeAgentEditor() {
+        const modal = document.getElementById("agent-editor-modal");
+        if (modal) modal.hidden = true;
+        agentState.editing = null;
+        agentState.preview = null;
+    }
+
+    /** 保存（新建或覆盖） */
+    async function saveAgentEditor() {
+        const pathEl = document.getElementById("agent-editor-path");
+        const bodyEl = document.getElementById("agent-editor-body");
+        const setupEl = document.getElementById("agent-editor-setup");
+        const path = (pathEl && pathEl.value ? pathEl.value : "").trim();
+        if (!path) { showAgentError("请填写路径（例：ops/devops）"); return; }
+
+        let setupObj = undefined;
+        const setupText = setupEl ? setupEl.value.trim() : "";
+        if (setupText) {
+            try {
+                setupObj = JSON.parse(setupText);
+            } catch (e) {
+                showAgentError(`setup.json 不是合法 JSON：${String(e.message || e)}`);
+                return;
+            }
+            // 空串的 llm 会被 parseAgentSetup 判 invalid_setup（它要求非空字符串）。
+            // 这里当成「不指定 llm」剔除，避免用户忘了填就保存失败。
+            if (setupObj && typeof setupObj === "object" && "llm" in setupObj
+                && (setupObj.llm === "" || setupObj.llm === null)) {
+                delete setupObj.llm;
+            }
+            // 同理：limits.maxRounds 为 null / 空串时整个 limits 剔除
+            if (setupObj && setupObj.limits && typeof setupObj.limits === "object"
+                && (setupObj.limits.maxRounds === null || setupObj.limits.maxRounds === "")) {
+                delete setupObj.limits;
+            }
+        }
+
+        const payload = {
+            path,
+            body: bodyEl ? bodyEl.value : "",
+            ...(setupObj !== undefined ? { setup: setupObj } : {}),
+        };
+
+        const okConfirm = await WinbotsConfirm({
+            source: "save-agent",
+            title: agentState.editing ? "确认修改智能体" : "确认新建智能体",
+            message: `将写入 etc/agents/${path}/\n\nAGENT.md 与 setup.json 会先备份为 .bak。`,
+            okText: agentState.editing ? "保存修改" : "创建",
+            cancelText: "取消",
+            danger: false,
+        });
+        if (!okConfirm) return;
+
+        try {
+            const resp = await fetch("/api/agents", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            closeAgentEditor();
+            await loadAgentList();
+            setAgentHint(data.overwritten ? `已更新 ${data.path}` : `已创建 ${data.path}`);
+        } catch (e) {
+            showAgentError(`保存失败：${String(e.message || e)}`);
+        }
+    }
+
+    /** 删除 */
+    async function deleteAgentByPath(path) {
+        if (!path) return;
+        const okConfirm = await WinbotsConfirm({
+            source: "delete-agent",
+            title: "确认删除智能体",
+            message: `将删除整个目录 etc/agents/${path}/（含 AGENT.md、setup.json 与 .bak）。\n\n此操作不可撤销。`,
+            okText: "删除",
+            cancelText: "取消",
+            danger: true,
+        });
+        if (!okConfirm) return;
+
+        try {
+            const resp = await fetch(`/api/agents/${encodePath(path)}`, { method: "DELETE" });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            await loadAgentList();
+            setAgentHint(`已删除 ${path}`);        } catch (e) {
+            showAgentError(`删除失败：${String(e.message || e)}`);
+        }
+    }
+
+    /** 新建入口 */
+    function openAgentEditorNew() {
+        openAgentEditor(null);
+    }
+
+    /** 刷新第四段顶部的统计文案（增删 agent 后调用） */
+    function updateAgentCountsText() {
+        const el = document.getElementById("config-agent-stats");
+        if (!el) return;
+        const c = agentState.counts || { total: 0, ok: 0, invalid: 0 };
+        el.innerHTML = `共 ${c.total} 个智能体（正常 ${c.ok}，异常 ${c.invalid}）。
+            agent 目录内两个文件：<code>AGENT.md</code>（人格正文）与 <code>setup.json</code>（模型 / 技能 / 工具 / 预算）。
+            保存时自动备份为 <code>.bak</code>。`;
+    }
+
+    /** 顶部提示 */
+    function setAgentHint(text) {
+        const hint = document.getElementById("config-agent-hint");
+        if (hint) hint.textContent = text || "";
+    }
+
+    /** 错误提示（写到第四段自己的错误行，不干扰 env.json 的 #config-result） */
+    function showAgentError(text) {
+        // 浮层打开时只写浮层；否则写到第四段的错误行。
+        // （同时写两处会让「关掉浮层后错误仍留在页面上」以及「旧错误不清除」两个问题同时出现）
+        const modal = document.getElementById("agent-editor-modal");
+        const inModal = modal && !modal.hidden;
+        const p = document.getElementById("agent-editor-error");
+        const el = document.getElementById("config-agent-fields");
+        if (inModal) {
+            if (p) { p.hidden = false; p.textContent = text; }
+            if (el) { el.hidden = true; el.textContent = ""; }
+        } else {
+            if (el) { el.hidden = false; el.textContent = text; }
+            if (p) { p.hidden = true; p.textContent = ""; }
+        }
+    }
+
+    /** 绑定编辑浮层内的按钮（只在启动时绑一次） */
+    function bindAgentEditorModal() {
+        const modal = document.getElementById("agent-editor-modal");
+        if (!modal) return;
+        const cancelBtn = document.getElementById("agent-editor-cancel");
+        if (cancelBtn) cancelBtn.addEventListener("click", closeAgentEditor);
+        const saveBtn = document.getElementById("agent-editor-save");
+        if (saveBtn) saveBtn.addEventListener("click", saveAgentEditor);
+        const bodyEl = document.getElementById("agent-editor-body");
+        if (bodyEl) bodyEl.addEventListener("input", () => { agentState.bodyDraft = bodyEl.value; });
+        const setupEl = document.getElementById("agent-editor-setup");
+        if (setupEl) setupEl.addEventListener("input", () => { agentState.setupDraft = setupEl.value; });
+        // 点遮罩关闭（与既有 modal 行为一致）
+        modal.addEventListener("click", (ev) => { if (ev.target === modal) closeAgentEditor(); });
+        document.addEventListener("keydown", (ev) => {
+            if (ev.key === "Escape" && !modal.hidden) closeAgentEditor();
+        });
+    }
+
+    /* [agent / 第 9 步] 编辑浮层的按钮只在启动时绑一次（DOM 已就绪） */
+    bindAgentEditorModal();
+
 })();

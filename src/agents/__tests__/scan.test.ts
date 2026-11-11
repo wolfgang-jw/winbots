@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   computeAgentFingerprint, scanAgentsOnce, walkAgentFiles,
+  ensureAgentRegistry, resetAgentRegistryForTest, agentRegistryStateForTest,
 } from "../scan";
 import type { ScanDeps } from "../scan";
 import type { AgentRecord, AgentRegistry } from "../types";
@@ -244,5 +245,48 @@ describe("scanAgentsOnce", () => {
     const reg = scan();
     expect(okByPath(reg, "solo")?.uid).toBe("ag_00000061");
     expect(okByPath(reg, "nope")).toBeUndefined();
+  });
+});
+
+/* ============================================================
+ * E-1 回归：ensureAgentRegistry 的 in-flight 去重不能「粘住」
+ *
+ * 缺陷现场：`const run = (async () => {...})(); inflight = run;`
+ *   scanAgentsOnce 是同步的 → IIFE 一路跑到 finally 把 inflight 清成 null，
+ *   之后 `inflight = run` 又把一个已 resolve 的 Promise 塞回去。
+ *   结果 inflight 永久非 null，后续请求全部命中 `if (inflight) return inflight`，
+ *   拿到第一次扫描的陈旧注册表 → 新增/删除 agent 永远看不到。
+ *
+ * 这三条用例锁住三件事：
+ *   1. 一次扫描结束后 inflight 必须清空（否则下一次就被劫持）
+ *   2. 连续两次调用都能正常完成（不会挂在一个旧 Promise 上）
+ *   3. 文件系统变化后注册表会真的重扫（指纹驱动）
+ * ============================================================ */
+describe("ensureAgentRegistry 单例（E-1 回归）", () => {
+  test("E1-1 扫描结束后 inflight 必须清空", async () => {
+    resetAgentRegistryForTest();
+    await ensureAgentRegistry(DEPS);
+    expect(agentRegistryStateForTest().inflight).toBe(false);
+  });
+
+  test("E1-2 连续两次调用都能完成，且第二次不被旧 Promise 劫持", async () => {
+    resetAgentRegistryForTest();
+    const a = await ensureAgentRegistry(DEPS);
+    const b = await ensureAgentRegistry(DEPS);
+    // 两次都返回了注册表（没有挂起、没有抛错）
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    expect(agentRegistryStateForTest().inflight).toBe(false);
+    expect(agentRegistryStateForTest().ready).toBe(true);
+  });
+
+  test("E1-3 并发调用合并为一次扫描，结束后 inflight 仍清空", async () => {
+    resetAgentRegistryForTest();
+    const [x, y] = await Promise.all([
+      ensureAgentRegistry(DEPS),
+      ensureAgentRegistry(DEPS),
+    ]);
+    expect(x).toBe(y);                        // in-flight 去重生效：同一个对象
+    expect(agentRegistryStateForTest().inflight).toBe(false);
   });
 });
