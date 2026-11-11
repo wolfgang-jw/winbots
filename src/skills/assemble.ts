@@ -9,7 +9,8 @@
  *     chat.ts 走这一条。
  */
 import { isToggleOn } from "@/infra/settings";
-import { applyBudget, layer } from "./markdown";
+import { layer } from "./markdown";
+import { applySkillBudget } from "./budget";
 import { L1_MAX, L1_TOTAL_WARN, SKILL_NAME_PATTERN } from "./paths";
 import { getSkillRegistry, type SkillRecord, type SkillRegistry } from "./scan";
 import { checkRequiredTools } from "./availability";
@@ -282,7 +283,7 @@ export function assembleForRequestMulti(deps: AssembleDeps = REAL_DEPS): MultiAs
   // ③ 技能块：L1 只受 L1_MAX 保护（多技能传 totalMax: null，避免 L1 被 L2 挤出预算）
   const skills: SkillBlock[] = usable.map((r) => {
     const { l1, l2 } = layer(r.sections);
-    const b = applyBudget(l1, l2, { totalMax: null });
+    const b = applySkillBudget(l1, l2, { profile: "multi" });
     if (b.l1Text.length >= L1_MAX) {
       console.warn(`⚠️  [skill] ${r.dir} 的 L1 达到/超过 ${L1_MAX} 字上限，已整段截断（建议精简「目标 / 使用时机」）`);
     }
@@ -378,7 +379,7 @@ export function previewSkill(
     };
   }
   const { l1, l2 } = layer(rec.sections);
-  const b = applyBudget(l1, l2);
+  const b = applySkillBudget(l1, l2);
   return {
     found: true,
     l0: `${rec.title} · ${rec.summary}`,

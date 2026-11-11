@@ -1,0 +1,24 @@
+{
+  "_comment": "模块 8 · 第 1 步：存量会话夹具。⚠️ 只有 requestId / sessionId / message，不含任何 agent 字段（见文档 §5.2 决策 3）。",
+  "version": 1,
+  "sessions": [
+    {
+      "name": "legacy-plain",
+      "requestId": "req_compat_0001",
+      "sessionId": "sess_compat_0001",
+      "message": "你好"
+    },
+    {
+      "name": "legacy-tool-intent",
+      "requestId": "req_compat_0002",
+      "sessionId": "sess_compat_0002",
+      "message": "帮我看看 working 目录下有哪些文件"
+    },
+    {
+      "name": "legacy-empty-skill-scope",
+      "requestId": "req_compat_0003",
+      "sessionId": "sess_compat_0003",
+      "message": "1+1 等于几"
+    }
+  ]
+}

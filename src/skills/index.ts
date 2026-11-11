@@ -34,3 +34,8 @@ export {
   SKILLS_ROOT, SKILL_FILE, SKILL_NAME_PATTERN,
   MAX_SKILL_DEPTH, BUDGET_MAX, L1_MAX, L2_MAX, L1_TOTAL_WARN,
 } from "./paths";
+// [模块 8 · 第 1 步] 预算口径单一入口（第 5 步 system 装配复用它）
+export {
+  applySkillBudget, resolveBudgetLimits,
+  type BudgetLimits, type BudgetProfile,
+} from "./budget";

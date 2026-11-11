@@ -2,6 +2,11 @@
  * src/skills/markdown.ts
  * 正文切段 + 分层归类 + 预算截断（§4.2 / §4.3 / §4.4）。
  *
+ * [模块 8 · 第 1 步] 本文件的 `applyBudget` 是**底层实现**，不是对外口径：
+ *   业务侧（assemble.ts / 将来的 agents/prompt.ts）请统一走 `./budget` 的 `applySkillBudget()`
+ *   ——它把「三个上限 + 截断标注 + totalMax 口径」收敛在一处。
+ *   仅当需要绕过口径做边界构造（如单测）时，才直接调用本函数。
+ *
  * ⚠️ 与 src/tools/index.ts 的 capToolResult 的差别（刻意不同，别"顺手统一"）：
  *    · capToolResult：标注**预留**在上限内，最终长度 ≤ maxChars；
  *    · 本文件：上限只按**段落正文**累加，标注是额外追加的元信息，
