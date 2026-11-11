@@ -42,3 +42,14 @@ export {
   filterSkillsForAgent,
   type SkillRef, type SkillPolicy,
 } from "./skillPolicy";
+
+// ── 第 4 步（模块 5：工具过滤）──────────────────────────────────────────
+// 通配实现仍只在 ./match 里一份；此处转发策略层与判据容器，不重复导出匹配函数。
+// ⚠️ 必须含 `type ToolFilter`：src/tools/index.ts 以 `import type` 从这里取（V1 判据），
+//    漏转发会被 __tests__/toolPolicy.test.ts 的 T19 抓到（它逐一断言 10 个符号）。
+export {
+  resolveToolPolicy, denyAllPolicy, isToolAllowedByPolicy, isToolAllowedForAgent,
+  filterToolsForAgent, toolFilterOf, denyAllToolFilter, isToolAllowedByFilter,
+  toolNotAllowed, toolNotAllowedAgentUnavailable,
+  type ToolRef, type ToolPolicy, type ToolFilter,
+} from "./toolPolicy";

@@ -33,6 +33,13 @@ import { env } from "@/infra/env";
 import { MAX_TOOL_ENTRIES } from "./paths";
 import { ensureRegistry, getRegistry, type Registry } from "./scan";
 import { groupState, refreshManagedValues } from "@/infra/settings";
+// [模块 5 · 第 4 步 / A10] 清单与执行的**同口径**判据容器。
+//   ⚠️ 必须是 `import type`：本文件在运行期不得依赖 agents/（工具子系统不认识 agent）。
+//      「谁来判定放行」完全在 chat.ts：它把 ToolFilter 传进来，
+//      本文件只调用 filter.allows(...)，不自带任何 allow/deny 逻辑。
+//   ⚠️ 不要为了「能调用判定函数」把它改成值导入：那会让 tools → agents → match
+//      进入运行期模块图，破坏「第 4 步不接线」（判据 V5）。
+import type { ToolFilter } from "@/agents";
 // ⚠️ 迁移后不再 import @/infra/migrate（迁移文档 4.2 / 4.8）：
 //    存量迁移（.env → env.json）已并入启动链的 envJson.migrateFromDotenv()，早于任何请求；
 //    本文件跑在请求边界，太晚，且旧的 parseEnvText 已随 .env 支持一并删除。
@@ -112,7 +119,7 @@ export interface ToolDef {
  * [skill / 升级 §3.5] 清单与「开了哪些技能」**无关**：技能不再收窄工具面，
  *   末尾额外追加 1 条元工具 skill__get_l2（不计入 MAX_TOOL_ENTRIES）。
  */
-export function getToolDefinitions(): ToolDef[] {
+export function getToolDefinitions(opts?: ToolFilter): ToolDef[] {
     const reg = getRegistry();
     const picked: Array<{ name: string; def: ToolDef }> = [];
     const excluded: Array<{ groupId: string; reason: "dir_off" | "group_off" | "suspended" }> = [];
@@ -130,6 +137,12 @@ export function getToolDefinitions(): ToolDef[] {
         for (const it of g.items) {
             // §8.3 第三环节：工具自身声明的附加条件（如 shell 的权限档位）
             if (!isToolEnabled(it.tool)) continue;
+            // [模块 5 · 第 4 步 / A10] 第四环节：agent 侧收窄（**必须在全局三条件之后**）。
+            //   顺序反了 → 白名单会把全局关掉的工具放回来（后门）。
+            //   opts 缺省（未绑定 agent）→ 不进这一步，与改造前逐字节一致。
+            if (opts && !opts.allows({ visibleName: it.visibleName, callName: it.callName })) {
+                continue;
+            }
             kept += 1;
             picked.push({
                 name: it.visibleName,
@@ -143,7 +156,8 @@ export function getToolDefinitions(): ToolDef[] {
                 },
             });
         }
-        // 组可用、但组内工具全被「自身条件」挡掉 → 也记下来，否则日志里「可见 0 个」无从定位
+        // 组可用、但组内工具一条都没留下（自身条件不成立 / 被 agent 收窄）→ 记下来，
+        //   否则日志里「可见 0 个」无从定位。
         if (kept === 0 && g.items.length > 0) selfDisabled.push(groupId);
     }
 
@@ -179,7 +193,7 @@ export function getToolDefinitions(): ToolDef[] {
         : excluded.map((e) => `${e.groupId}(${e.reason})`).join("、");
     const selfOff = selfDisabled.length === 0
         ? ""
-        : `｜组可用但工具自身条件不成立：${selfDisabled.join("、")}`;
+        : `｜组可用但组内工具全部未通过筛选：${selfDisabled.join("、")}`;
     console.log(
         `🧰 [T-VIS] 模型可见工具 ${list.length} 个（用户工具 ${userToolCount} + 元工具 1）` +
         `｜排除 ${excluded.length} 组：${detail}${selfOff}`,
@@ -247,6 +261,10 @@ export async function executeTool(
     rawName: string,
     args: Record<string, unknown>,
     ctx?: ToolContext,
+    // [模块 5 · 第 4 步 / A10] 第 4 参（不是第 3 参）：ctx 已被 chat.ts 使用，
+    //   插在它之前会破坏所有既有调用点；加在末尾是唯一兼容位置。
+    //   缺省 → 行为与改造前逐字节一致（兼容路径，§1.4 A8）。
+    opts?: ToolFilter,
 ): Promise<string> {
     // ✅ [skill / 升级 §3.4] 元工具：代码内置、无工具组、不受组开关与门禁约束。
     //    ⚠️ 必须放在 getRegistry() / 名称解析之前（它不在注册表里，查表会得到 tool_not_found）。
@@ -296,6 +314,12 @@ export async function executeTool(
                 `工具 ${rec.callName} 已停用（自身启用条件不成立），本次未执行。请改用其他可用工具完成任务。`,
             );
         }
+        // [模块 5 · 第 4 步 / A10] 执行侧的 agent 收窄：与清单**同一个**容器、同一个函数。
+        //   ⚠️ 位置：必须在「组可用」与「自身启用」之后 —— 那两个状态比「未授权」更根本；
+        //      顺序反了会把「工具已停用」报成「未授权」，把用户引向错误的修复方向。
+        if (opts && !opts.allows({ visibleName: rec.visibleName, callName: rec.callName })) {
+            return toolNotAllowedEnvelope(rec.visibleName);
+        }
         if (ctx?.signal?.aborted) {
             return toolError("cancelled", "已取消：调用前请求已被中断，本次工具未执行。");
         }
@@ -330,10 +354,41 @@ export async function executeTool(
                 );
         }
     }
+    // [模块 5 · 第 4 步 / A10] 未注册 + agent 判据明确不放行 → tool_not_allowed，
+    //   而不是 tool_not_found。两者对模型的引导方向完全不同：
+    //   「改名字」 vs 「换途径 / 要授权」；报错码错了会引发无效重试。
+    //   ⚠️ 不能把「所有不存在的名字」都报成未授权（那会让真正的拼写错误无从发现）；
+    //      容器缺省时仍落到 tool_not_found（T25）。
+    if (opts && !opts.allows({ visibleName: rawName, callName: rawName })) {
+        return toolNotAllowedEnvelope(rawName);
+    }
     return toolError(
         "tool_not_found",
         `不存在名为 ${rawName} 的工具。本次请求的可用工具见 tools 字段；如需该能力请改用其他工具。`,
     );
+}
+
+/**
+ * [模块 5 · 第 4 步] `tool_not_allowed` 信封（在 tools/ 内就地拼）。
+ *
+ * ⚠️ 为什么不在 tools/index.ts 里 import agents/toolPolicy 的 toolNotAllowed()：
+ *   那是值导入，会破坏 V5（tools 运行期不依赖 agents）。
+ *   代价是这段 message 与 toolPolicy.toolNotAllowed 的 message 必须**逐字一致**：
+ *   由文档 §七 V11 的 grep + 人工 diff 兜住，改文案时两处一起改。
+ *
+ * ⚠️ 文案纪律（裁决 D-4-2）：不写「请新建会话」——该建议只对「目录被删」成立，
+ *   而本信封也用于 setup.json 损坏 / uid 重复，那两种情形新建会话解决不了问题。
+ */
+function toolNotAllowedEnvelope(visibleName: string): string {
+    return JSON.stringify({
+        ok: false,
+        error: {
+            code: "tool_not_allowed",
+            message:
+                `工具 ${visibleName} 未授权给当前 agent，本次未执行。` +
+                `请改用其他可用工具完成任务；若确认需要该能力，请联系管理员为当前 agent 添加授权。`,
+        },
+    });
 }
 
 /**
