@@ -6,7 +6,9 @@
   "scripts": {
     "verify:compat:baseline": "bun scripts/verify-agent-compat.ts --baseline",
     "verify:compat": "bun scripts/verify-agent-compat.ts",
-    "typecheck": "bun x tsc --noEmit"
+    "typecheck": "bun x tsc --noEmit",
+    "test": "bun test",
+    "test:agents": "bun test src/agents"
   },
   "devDependencies": {
     "@types/bun": "latest"
