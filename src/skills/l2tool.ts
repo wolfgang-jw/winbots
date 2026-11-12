@@ -12,7 +12,11 @@
  *    tools/index.ts 的 `toolError` 形状逐字一致，但**故意不复用其名字**，
  *    避免 `grep toolError` 时误以为这里导入了它）。
  */
-import { isToggleOn } from "@/infra/settings";
+// [FIX-SKILLTOGGLE] 技能开关必须走技能侧取值函数（isSkillToggleOn）：
+//   工具侧 isToggleOn 查的是 enabledToggles（TOOLON__*），技能键 SKILLON__* 永远不在其中，
+//   会让本元工具对所有技能恒返回 skill_disabled，与 assemble.ts 已装配出该技能的事实矛盾。
+//   assemble.ts 采用同一写法（isSkillToggleOn as isToggleOn），此处此前漏改。
+import { isSkillToggleOn } from "@/infra/settings";
 import { getSkillRegistry, type SkillRecord } from "./scan";
 import { SKILL_NAME_PATTERN } from "./paths";
 import { joinSections, layer } from "./markdown";
@@ -111,7 +115,8 @@ export function resolveL2(rawName: string): string {
     );
   }
 
-  if (!isToggleOn(rec.toggleKey)) {
+  // [FIX-SKILLTOGGLE] 用技能侧取值（查 enabledSkillToggles），不能用工具侧 isToggleOn
+  if (!isSkillToggleOn(rec.toggleKey)) {
     return l2error(
       "skill_disabled",
       `技能「${rec.dir}」未开启（${rec.toggleKey}=false），不返回 L2。请到配置页开启该技能`,

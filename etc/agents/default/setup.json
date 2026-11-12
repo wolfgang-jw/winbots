@@ -2,6 +2,12 @@
   "uid": "ag_00000000",
   "name": "default",
   "llm": "main",
+  "skills": {
+    "mode": "allow",
+    "list": [
+      "examples/hello"
+    ]
+  },
   "tools": {
     "allow": [
       "examples__*",

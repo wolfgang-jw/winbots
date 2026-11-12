@@ -43,7 +43,10 @@ import {
 import { ensureToolRegistry } from "@/tools";
 import {
   currentSettingText, defaultValueText, formatSettingValue, parseSettingValue,
-  isToggleOn, groupState,
+  // [FIX-SKILLTOGGLE] 技能树节点的 on 必须用技能侧取值函数：
+  //   工具侧 isToggleOn 查 enabledToggles（TOOLON__*），技能键 SKILLON__* 永远不在其中，
+  //   会让配置页把白名单里已勾选的技能一律显示为「关闭」。
+  isToggleOn, isSkillToggleOn, groupState,
   type SettingDef,
 } from "@/infra/settings";
 import { hasManagedPrefix, isSensitiveName, pathSegments, isReservedName } from "@/tools/paths";
@@ -345,7 +348,8 @@ function buildSkillTree(sreg: SkillRegistry): SkillNode[] {
       segment: rec.name,
       dir: rec.dir,
       isSkill: true,
-      on: isToggleOn(rec.toggleKey),
+      // [FIX-SKILLTOGGLE] 技能侧取值（enabledSkillToggles），不能用工具侧 isToggleOn
+      on: isSkillToggleOn(rec.toggleKey),
       status: rec.status,
       reason: rec.suspend ? SKILL_SUSPEND_LABEL[rec.suspend.code] : null,
       hint: rec.suspend ? rec.suspend.hint : null,

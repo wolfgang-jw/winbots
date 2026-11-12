@@ -233,7 +233,9 @@ export function isToggleOn(key: string): boolean {
  * ⚠️ 为什么技能不共用 `isToggleOn`：两套键空间本来就独立（N-SK-5），
  *    而 `enabledToggles`（工具）与 `enabledSkillToggles`（技能）分别由
  *    setup.json 的 `tools.allow` 与 `skills.list` 翻译而来，必须各取各的。
- * ⚠️ `skills/assemble.ts` 的 `isToggleOn` 注入点应换成本函数（见 chat.ts / routes/skills.ts）。
+ * ⚠️ 历史坑（[FIX-SKILLTOGGLE]）：`skills/l2tool.ts` 与 `routes/config.ts` 的技能节点
+ *    曾误用工具侧 `isToggleOn`，导致「技能已装配、但 get_l2 恒报 skill_disabled、
+ *    配置页恒显示关闭」。新增任何读技能开关的代码，必须用本函数。
  */
 export function isSkillToggleOn(key: string): boolean {
   if (key === "") return true;
