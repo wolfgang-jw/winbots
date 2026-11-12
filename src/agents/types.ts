@@ -10,8 +10,18 @@
 /** 【12.1 D-J】uid 格式：ag_ + 8 位小写十六进制，例 ag_7f3a9c21 */
 export type AgentUid = string;
 
-/** skills.mode：allow = 白名单；all = 跟随全局开关（§3.1） */
-export type AgentSkillsMode = "allow" | "all";
+/**
+ * skills.mode：**只允许 "allow"**（白名单）。
+ *
+ * ⚠️ `"all"` 已废除（需求 D-1）：它原本表示「跟随全局技能开关」，
+ *    而本次改造取消了全局总闸（env.json 的 tools 块整体移除），
+ *    `all` 失去了依附对象，且极易被误读成「全部技能都可用」。
+ *    出现 `"all"` 时 `parseAgentSetup` 直接判 `invalid_setup` 并提示如何改。
+ */
+export type AgentSkillsMode = "allow";
+
+/** 工具设置项的单值类型（toolSettings 的值必须收敛在标量与字符串数组） */
+export type SettingScalar = string | number | boolean | string[];
 
 /** setup.json 的解析结果（已校验的强类型形态） */
 export interface AgentSetup {
@@ -35,15 +45,27 @@ export interface AgentSetup {
   /**
    * 技能白名单（§3.1）。
    *
-   * ⚠️ 本字段在 AgentSetup（解析结果）里为 null 表示「setup.json 未写 list」。
-   *    它**不等于**「不限制」：skillsMode=allow 时 null 按**全禁**处理（裁决 D-3-1）。
-   *    只有 skillsMode="all" 才表示跟随全局开关。
-   *    （原注释「null = 不限制」是第 2 步遗留，与 mode 默认 allow 冲突，已更正。）
+   * ⚠️ null / [] / 缺失 → **全禁**（没有任何技能可用）。这是「显式列举才可用」的唯一口径。
    */
   skillsAllow: string[] | null;
-  /** null = 不限制（§3.1「tools.allow 缺省 = 不限制」） */
+  /**
+   * 工具白名单。
+   *
+   * ⚠️ **null / [] / 缺失 → 全禁**（本次改造的行为变更，见需求 BR-1）。
+   *    改造前这里的语义是「null = 不限制」，与技能侧刻意相反；现在两侧已统一为
+   *    「只在配置中明确列出的才能使用」。想给 agent 全部工具，必须显式写通配模式。
+   */
   toolsAllow: string[] | null;
   toolsDeny: string[];
+  /**
+   * 工具设置项（需求 D-2）：`{ "<dir>/<group>": { "<name>": 值 } }`，如
+   * `{ "internet/browser": { "headless": false } }`。
+   *
+   * ⚠️ **缺失 ≠ 全禁**：设置项缺失只表示「不覆盖」，一律用声明里的默认值；
+   *    该工具能不能用由 `toolsAllow` 决定（两者语义完全不同，不要混）。
+   * ⚠️ 键的形态是「目录/组」（根级组为单段 fileBase），值见 SettingScalar。
+   */
+  toolSettings: Record<string, Record<string, SettingScalar>>;
   /** null = 跟随 env.MAX_TOOL_ROUNDS；有值时已钳制到 1–32 */
   maxRounds: number | null;
   memoryEnabled: boolean;
@@ -74,6 +96,8 @@ export interface AgentRecord {
   skillsAllow: string[] | null;
   toolsAllow: string[] | null;
   toolsDeny: string[];
+  /** 工具设置项（缺失 = {}，表示全部用默认值；不是「全禁」） */
+  toolSettings: Record<string, Record<string, SettingScalar>>;
   maxRounds: number | null;
   memoryEnabled: boolean;
   systemBudget: number;

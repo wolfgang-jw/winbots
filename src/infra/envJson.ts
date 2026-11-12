@@ -3,8 +3,12 @@
  * env.json 的读取 / 规整 / 校验 / 序列化 / 原子写 / 备份（迁移文档 4.1）。
  *
  * 唯一职责：把「JSON 文件」与「强类型 EnvJson 对象」互相转换，并保证写盘安全。
- *   · 不做业务判断（开关语义在 settings.ts，配置页语义在 configFile.ts / routes/config.ts）
+ *   · 不做业务判断（配置页语义在 configFile.ts / routes/config.ts）
  *   · 不 import 任何业务模块（避免 env.ts ⇄ configFile.ts 成环）
+ *
+ * ⚠️ 自「工具/技能配置归位 setup.json」改造起，env.json **只承载全局运行参数**
+ *    （app / llm / log / stab），原 `tools` 块（TOOLON__ / TOOLSET__ / etc__tools__ /
+ *    SKILLON__ / SKILLSET__）已整体废除 —— 那些配置改为每个 agent 的 setup.json。
  *
  * ⚠️ 默认值单一来源：默认值来自 CONFIG_KEYS，由调用方注册（registerEnvJsonDefaults），
  *    本文件**不写任何默认值字面量**，也绝不把默认值预填进 env.json（方案 2.2-1）。
@@ -14,7 +18,7 @@
  */
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync, renameSync,
-  copyFileSync, unlinkSync, readdirSync, statSync,
+  copyFileSync, unlinkSync, readdirSync,
 } from "fs";
 import { resolve, join } from "path";
 import { parseThinkingMode, type ThinkingMode } from "./thinkingMode";
@@ -113,7 +117,6 @@ export function envJsonBackupDir(): string { return backupDir; }
 export function __setEnvJsonPathForTest(p: string | null): void {
   envJsonPath = p ?? resolve(PROJECT_ROOT, "env.json");
   envJsonTmp = `${envJsonPath}.tmp`;
-  cacheStamp = null;
 }
 
 /* ============================================================
@@ -143,8 +146,14 @@ export interface EnvJson {
   llm: LlmGroup[];
   log: { enabled: boolean; file: string; maxRows: number };
   stab: { maxToolRounds: number; sseHeartbeatMs: number; toolResultMaxChars: number };
-  /** 托管键 → **持久化文本（字符串）**；不是 boolean/number（第零章 P4） */
-  tools: Record<string, string>;
+  /**
+   * ⚠️ **本文件不再有 `tools` 块**（工具/技能配置归位 setup.json，见
+   *   docs/工具技能配置归位setup与agent权限收紧-需求文档.md §3.1）。
+   *   工具开关 / 工具设置项 / 技能开关全部改为：
+   *     · `etc/agents/<path>/setup.json` 的 `tools.allow/deny`、`toolSettings`、`skills.list`
+   *     · 运行期取值由 `src/infra/toolConfigContext.ts`（AsyncLocalStorage）承载
+   *   因此这里只剩纯全局运行参数：app / llm / log / stab。
+   */
 }
 
 /** 系统项键名 → JSON 路径（分组 + 字段名） */
@@ -449,91 +458,45 @@ export function loadEnvJson(): EnvJson {
   const log = coerceGroup(raw.log, def.log, "log");
   const stab = coerceGroup(raw.stab, def.stab, "stab");
 
-  // ③ tools：值必须是字符串；非字符串丢弃 + 告警
-  const tools: Record<string, string> = {};
-  const rawTools = raw.tools;
-  if (rawTools && typeof rawTools === "object" && !Array.isArray(rawTools)) {
-    for (const [k, v] of Object.entries(rawTools as Record<string, unknown>)) {
-      if (k.startsWith("_")) continue;                      // tools 里的 _comment 之类：忽略
-      if (typeof v !== "string") {
-        warnOnce(k, 'tools 的值必须是字符串，已丢弃该键（布尔请写 "true"/"false"，数组请写 JSON 文本）');
-        continue;
-      }
-      tools[k] = v;
-    }
-  } else if (rawTools !== undefined) {
-    warnOnce("tools", "tools 必须是对象，已按空处理");
+  /* ③ tools 块已废除（见 EnvJson 注释）。
+   *
+   * 旧文件里残留的 `tools` 键会落进下面的「未知顶层键」分支：告警一次 + 下次保存时移除。
+   * 这正是迁移后想要的收敛行为，**不需要**额外代码。
+   * ⚠️ 但迁移脚本必须先跑：新代码不读 `tools`，若 agent 的 setup.json 还没补齐权限，
+   *    所有 agent 会立刻变成「无任何工具」（需求 BR-4 / 代码文档 §6.2 硬性顺序）。
+   */
+  const legacyTools = raw.tools;
+  if (legacyTools !== undefined) {
+    warnOnce(
+      "tools",
+      "env.json 的 tools 块已废弃（工具/技能配置已迁移到各 agent 的 setup.json），" +
+      "本次忽略，下次保存会从文件中移除；请确认迁移脚本已执行",
+    );
   }
 
   // ④ 未知顶层键：告警但忽略（下次整树重写时会从文件里消失），不阻断启动
   for (const k of Object.keys(raw)) {
     if (k.startsWith("_")) continue;
-    if (["app", "llm", "log", "stab", "tools"].includes(k)) continue;
-    warnOnce(k, "未知的顶层键（既不是 app/llm/log/stab/tools 也不是 _ 开头的备注），已忽略；下次保存会从文件中移除");
+    if (["app", "llm", "log", "stab"].includes(k)) continue;
+    warnOnce(k, "未知的顶层键（既不是 app/llm/log/stab 也不是 _ 开头的备注），已忽略；下次保存会从文件中移除");
   }
 
-  return assertRequired({ app, llm, log, stab, tools }, true);
+  return assertRequired({ app, llm, log, stab }, true);
 }
 
 /* ============================================================
- * 托管键缓存（供 settings.ts 取值）
- * ============================================================ */
-
-/**
- * 托管键缓存。**只缓存 tools 块**：
- *   · tools 是唯一存放 TOOLON__ / TOOLSET__ / etc__tools__ / SKILLON__ / SKILLSET__ 的地方
- *   · 顶层 _unmapped 里的键**不进**这里（它们是「未识别」的，按遗留键处理）
+ * 托管键（已废除：工具/技能配置迁至 setup.json）
+ * ============================================================
  *
- * 缓存键 = `${mtimeMs 取整}:${size}`，与迁移前 settings.ts 的 statStamp 完全同款语义。
+ * 原先这里缓存 env.json 的 `tools` 块，供 `settings.ts` 取值（工具开关 / 工具设置项 /
+ * 技能开关）。改造后三者都由 **每个 agent 自己的 setup.json** 决定，运行期取值见
+ * `src/infra/toolConfigContext.ts`（AsyncLocalStorage 承载「当前请求的 agent 配置快照」）。
+ *
+ * 因此 `managedValues()` / `invalidateManagedCache()` / `refreshCount` / `toolsStamp()`
+ * 已整体删除，**不再存在任何「全局托管值」这一层**：
+ *   · 保存 agent 的 setup.json 后无需刷任何全局缓存（下次请求用新 record 构造上下文）；
+ *   · 不存在「全局总闸」，也就不会出现「改了 A 影响 B」。
  */
-let cache: ReadonlyMap<string, string> = new Map();
-let cacheStamp: string | null = null;
-/** 供测试与日志使用：本进程里缓存被重建过几次（不改语义） */
-export let refreshCount = 0;
-
-function toolsStamp(): string {
-  try {
-    const st = statSync(envJsonPath);
-    return `${Math.floor(st.mtimeMs)}:${st.size}`;
-  } catch {
-    return "absent";
-  }
-}
-
-/**
- * 读取托管键缓存。
- * @param force true = 忽略 stamp 强制重读（保存配置后必须用 true，见 R-3）
- * @returns 当前缓存（未被重建时返回同一对象引用）
- */
-export function managedValues(force = false): ReadonlyMap<string, string> {
-  const stamp = toolsStamp();
-  if (!force && stamp === cacheStamp) return cache;
-  // ⚠️ 读取必须容错：配置页与请求边界都会走这里，JSON 被改坏时不能把整站打成 500
-  //    （严格校验由 loadEnvJson 负责，启动期才致命）。
-  let raw: Record<string, unknown> | null = null;
-  try {
-    raw = readEnvJsonRaw();
-  } catch {
-    raw = null;
-  }
-  const next = new Map<string, string>();
-  const t = raw?.tools;
-  if (t && typeof t === "object" && !Array.isArray(t)) {
-    for (const [k, v] of Object.entries(t as Record<string, unknown>)) {
-      // 只认字符串（P4）；非字符串在 loadEnvJson 阶段已告警，这里静默跳过，避免重复刷屏
-      if (typeof v === "string") next.set(k, v);
-    }
-  }
-  cache = next;
-  cacheStamp = stamp;
-  refreshCount += 1;
-  return cache;
-}
-
-/** 强制让下一次 managedValues() 重读（写盘后调用，避免「同毫秒同大小」导致 stamp 未变） */
-export function invalidateManagedCache(): void {
-  cacheStamp = null;
-}
 
 /**
  * 顶层 `_unmapped`（迁移时未识别的旧键）。
@@ -561,16 +524,14 @@ export function listUnmappedKeys(): string[] {
 }
 
 /**
- * 「文件里出现过的全部键」= tools 块 ∪ 顶层 `_unmapped`。
+ * 「文件里出现过的全部键」= 顶层 `_unmapped`（`tools` 块已废除，候选键只剩它）。
  *
  * 用途：`listOrphanKeys()`（遗留键）与 `POST /refresh` 的残留 skill 键清理。
- * ⚠️ 与 `managedValues()` 的区别：它**不按前缀过滤** —— `_unmapped` 里的键正是
- *    「没被任何规则认领」的那一批，调用方自己决定要不要按前缀筛。
+ * ⚠️ 它**不按前缀过滤** —— `_unmapped` 里的键正是「没被任何规则认领」的那一批，
+ *    调用方自己决定要不要按前缀筛。
  */
 export function listJsonCandidateKeys(): string[] {
-  const out: string[] = [...managedValues().keys()];
-  out.push(...listUnmappedKeys());
-  return [...new Set(out)].sort();
+  return listUnmappedKeys();
 }
 
 /**
@@ -606,7 +567,7 @@ export function deleteUnmappedKeys(keys: readonly string[]): string[] {
 }
 
 /* ============================================================
- * 序列化（稳定顺序 + 保留 _ 开头的顶层键 + tools 字典序 + 默认值瘦身）
+ * 序列化（稳定顺序 + 保留 _ 开头的顶层键 + 默认值瘦身）
  * ============================================================ */
 
 /**
@@ -650,7 +611,7 @@ function pruneDefaults(obj: EnvJson, def: EnvJson): EnvJson {
 }
 
 /**
- * 序列化：稳定顺序 + 保留 `_` 开头的顶层键 + tools 字典序。
+ * 序列化：稳定顺序 + 保留 `_` 开头的顶层键。
  * @param obj      已规整的强类型对象
  * @param raw      **原始文件对象**：用于捞出 `_comment` / `_migratedFrom` / 其它 `_xxx`
  * @param unmapped 迁移期兜底：未被识别的旧键（P1：顶层 `_unmapped`）
@@ -708,10 +669,8 @@ export function serializeEnvJson(
   out.log = { ...(body.log as unknown as Record<string, unknown>) };
   out.stab = { ...(body.stab as unknown as Record<string, unknown>) };
 
-  // ③ tools：字典序
-  const sortedTools: Record<string, string> = {};
-  for (const k of Object.keys(body.tools).sort()) sortedTools[k] = body.tools[k] as string;
-  out.tools = sortedTools;
+  // ③ tools 块已废除（工具/技能配置归位 setup.json）：不再输出 out.tools。
+  //    旧文件里残留的 `tools` 键不会出现在新序列化结果里 → 保存一次即完成收敛。
 
   // 2 空格缩进 + 结尾换行（避免「最后一行没有换行」造成的 diff 噪声）
   return `${JSON.stringify(out, null, 2)}\n`;
@@ -742,13 +701,11 @@ export function writeEnvJson(text: string): WriteResult {
     writeFileSync(envJsonTmp, text, "utf-8");
     try {
       renameSync(envJsonTmp, envJsonPath);
-      invalidateManagedCache();               // 强制下次 managedValues() 重读
       return { ok: true };
     } catch {
       // Windows 下目标被占用等 → 回退为覆盖写（非原子，但保证内容完整）
       copyFileSync(envJsonTmp, envJsonPath);
       try { unlinkSync(envJsonTmp); } catch { /* 清理失败不致命 */ }
-      invalidateManagedCache();
       return { ok: true, degraded: true };
     }
   } catch (e) {
@@ -998,8 +955,10 @@ function buildEnvJsonFromDotenv(
   obj.stab.sseHeartbeatMs = intOf("SSE_HEARTBEAT_MS", def.stab.sseHeartbeatMs);
   obj.stab.toolResultMaxChars = intOf("TOOL_RESULT_MAX_CHARS", def.stab.toolResultMaxChars);
 
-  // tools
-  obj.tools = { ...managed };
+  // tools 块已废除：从 .env 迁移来的托管键不再写入 env.json。
+  //   它们会被 migrateFromDotenv 计入 unmapped（见下方 ⑤ 兜底分支），
+  //   由配置页「🧹 遗留键」展示、由迁移脚本据此写入各 agent 的 setup.json。
+  void managed;
   return obj;
 }
 
@@ -1032,7 +991,12 @@ export function migrateFromDotenv(): MigrationResult | null {
   }
 
   // ②③④⑤ 分类：系统项 / 旧启用开关（丢弃） / 旧键下沉 / 托管键 / 未识别
-  const tools: Record<string, string> = {};
+  //
+  // ⚠️ 托管键（TOOLON__ / TOOLSET__ / etc__tools__ / SKILLON__ / SKILLSET__）**不再进 env.json**：
+  //    env.json 的 tools 块已废除，它们迁到各 agent 的 setup.json。
+  //    这里把它们与其它未识别键一起放进 `_unmapped`，保证「升级不丢值」：
+  //      · 配置页「🧹 遗留键」可看到；
+  //      · 迁移脚本（scripts/migrate-tools-to-agents.ts）据此写 setup.json。
   const unmapped: Record<string, string> = {};
   const dropped: string[] = [];
   for (const [k, v] of fileMap) {
@@ -1040,13 +1004,13 @@ export function migrateFromDotenv(): MigrationResult | null {
     if (LEGACY_DROP_KEYS.has(k)) { dropped.push(k); continue; }      // §9.2「删除，不迁移」
     const sink = LEGACY_DOWN_SINK.get(k);
     if (sink) {
-      // 目标键已存在则以现有值为准，不覆盖（与原 migrate.ts 同口径）
-      if (!(sink in tools) && !fileMap.has(sink)) tools[sink] = normalizeLegacyValue(k, v);
+      // 下沉键同样不再进 tools 块 → 记进 _unmapped（键名用托管键名，便于迁移脚本识别）
+      if (!fileMap.has(sink)) unmapped[sink] = normalizeLegacyValue(k, v);
       continue;
     }
-    if (isManagedKey(k)) { tools[k] = v; continue; }                 // 托管键原样搬
-    unmapped[k] = v;                                                 // ⑤ 兜底
+    unmapped[k] = v;                                                 // 托管键与未识别键一律兜底
   }
+  const tools: Record<string, string> = {};                          // 仅为 buildEnvJsonFromDotenv 形参兼容
 
   let obj: EnvJson;
   try {

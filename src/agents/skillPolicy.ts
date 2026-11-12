@@ -4,8 +4,8 @@
  *
  * ⚠️ 三条铁律：
  *   1. 本文件**不含通配实现**：通配只有一份，在 match.ts（需求 §3.1）。
- *   2. 本文件**只收窄、不放宽**：输入必须是「全局已开启且正常」的技能集合，
- *      本函数在其上做减法。绝不允许把全局关掉的技能通过白名单放回来。
+ *   2. 本文件**只收窄、不放宽**：输入必须是「已注册且未挂起」的技能集合，
+ *      本函数在其上做减法。绝不允许把未列出的技能通过任何途径放回来。
  *   3. 本文件**不接线**：第 3 步无任何运行期调用方（判据见文档 §四）。
  *
  * 需求锚点：A1（每 agent 独立技能集合）、A10（清单与执行同口径）。
@@ -29,46 +29,46 @@ export interface SkillRef {
  *   若干处都要判「是否放行」，多字段组合容易在某一处写反（尤其 null / [] 的差别）。
  *   归一到 kind 之后，后续只认 kind，坏写法无处可藏。
  */
-export type SkillPolicy =
-  /** 不做任何收窄：只用全局开关口径（**仅 mode="all" 会产生**） */
-  | { kind: "unrestricted" }
+/**
+ * 策略裁决结果。
+ *
+ * ⚠️ 已删除 `unrestricted` 变体（需求 D-1）：`mode="all"` 随全局开关一起废除，
+ *    技能侧只剩白名单一种形态。删除它是刻意的 —— 让编译器逼出所有残留判断。
+ */
+export type SkillPolicy = {
   /** 白名单：命中 list 中的任一模式才可用；空数组 = 全禁 */
-  | { kind: "allowlist"; patterns: readonly string[] };
+  kind: "allowlist";
+  patterns: readonly string[];
+};
 
 /**
  * 把 setup 的 (mode, list) 裁决成 SkillPolicy。
  *
- * 裁决表（文档 §0.2 / D-3-1，用户确认口径：null = 全禁）：
- *   mode=all,   list=任意   → unrestricted（跟随全局开关；list 被忽略）  ← 唯一放行形态
- *   mode=allow, list=null   → allowlist([]) 全禁  ← 白名单未给 = 空 = 全禁
- *   mode=allow, list=[]     → allowlist([]) 全禁
- *   mode=allow, list=[..]   → allowlist(..)
+ * 裁决表（需求 BR-2「显式列举才可用」）：
+ *   list=null   → allowlist([]) 全禁  ← 白名单未给 = 空 = 全禁
+ *   list=[]     → allowlist([]) 全禁
+ *   list=[..]   → allowlist(..)
  *
  * 为什么 null 不当作「不限制」：
- *   需求 §3.1 把 skills.mode 默认定为 allow（白名单）。既然是白名单，
+ *   skills.mode 恒为 allow（白名单，D-1 已废除 all）。既然是白名单，
  *   「没给 list」只能读作「白名单为空」，而不是「没有白名单 = 全放行」。
  *   这是权限模型的保守默认：漏写字段不会意外获得全部技能。
  *
  * 已知代价（用户确认接受）：静默失效。只写 {"name":"devops"} 的 setup.json，
- *   agent 起来后没有任何技能，不报错也不告警。→ 文档 R-3-3，
- *   第 5 步接配置页时**必须**对「allow + null」给出显式提示。
+ *   agent 起来后没有任何技能，不报错也不告警。→ 因此智能体编辑弹窗对
+ *   「空技能集合」给出显式提示（FR-UI-4：`#agent-skills-empty`）。
  *
- * @param mode  setup.skillsMode
+ * @param mode  setup.skillsMode（类型已收窄为 "allow"，参数保留仅为签名稳定）
  * @param allow setup.skillsAllow（null = 未写 list）
  */
 export function resolveSkillPolicy(
   mode: AgentSkillsMode,
   allow: readonly string[] | null,
 ): SkillPolicy {
-  // mode=all：显式放弃白名单，完全跟随全局开关（等价于接 agent 前的现状）。
-  if (mode === "all") return { kind: "unrestricted" };
-
-  // mode=allow + 未写 list → 空白名单 → 全禁（裁决 D-3-1）。
-  if (allow === null) return { kind: "allowlist", patterns: [] };
-
-  // mode=allow + [] → 空白名单 → 全禁（与 null 同结果，但来源不同：用户明确写了空）。
-  // mode=allow + [..] → 白名单，原样保留。
-  return { kind: "allowlist", patterns: allow };
+  // mode 只可能是 "allow"（D-1）；此处显式 void 掉，避免「参数未使用」的告警，
+  //   也提醒后来者：想恢复 mode 分支必须先恢复全局开关这一层，而那已被明确废除。
+  void mode;
+  return { kind: "allowlist", patterns: allow ?? [] };
 }
 
 /**
@@ -85,7 +85,6 @@ export function isSkillAllowedByPolicy(
   policy: SkillPolicy,
   candidate: SkillRef,
 ): boolean {
-  if (policy.kind === "unrestricted") return true;
   // 空数组 → matchesAny 恒 false → 全禁（与「不限制」严格区分）
   return matchesAny(policy.patterns, candidate.dir);
 }

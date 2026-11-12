@@ -3,8 +3,12 @@
  * T1–T19：工具过滤策略（模块 5）。
  *
  * 重点不是「能不能过滤」，而是三件事：
- *   ① 裁决 D-4-1（allow 缺省 = 全部允许，`[]` = 全拒绝）被钉死，
- *      且与技能侧 D-3-1（null = 全禁）**刻意相反**——T2 / T6 并排断言；
+ *   ① 新裁决 BR-1（allow 缺省 null / 显式 [] **都是全禁**）被钉死，
+ *      且与技能侧 BR-2 同口径——T1 / T2 / T6 三者并排断言「三者结果一致」。
+ *      ⚠️ 旧裁决 D-4-1（allow 缺省 = 全部允许，与技能侧刻意相反）**已作废**：
+ *         「列出才可用」收紧了权限模型，省略字段不再等于不限制。
+ *         想给 agent 全部工具必须显式写通配（如 `local__*`），T2 里用
+ *         `["*"]` 作为「全开」的**显式**表达来对照。
  *   ② deny 一票否决（§6.1 第 7 条）不被写成 `allow ∥ !deny`——T8 / T9 专盯；
  *   ③ 匹配对象是 visibleName，通配复用 match.ts，不重复实现——T10 / T11。
  */
@@ -32,8 +36,15 @@ import {
 /** 被测函数只用到 AgentRecord 的这两个字段，用 Pick 造最小对象即可。 */
 type AgentSlice = Pick<AgentRecord, "toolsAllow" | "toolsDeny">;
 
+/**
+ * 缺省 patch **刻意用 ["*"] 而不是 null**。
+ *
+ * BR-1 之后 `toolsAllow: null` = 全禁（与 [] 同义），若这里仍以 null 为缺省，
+ * 本文件里所有「造一个能用工具的 agent」的用例都会变成「全禁」而失去检验力。
+ * ["*"] 是「显式全开」，等价于改造前 null 的**意图**，且是迁移时真正会写的形态。
+ */
 function agent(patch: Partial<AgentSlice> = {}): AgentSlice {
-  return { toolsAllow: null, toolsDeny: [], ...patch };
+  return { toolsAllow: ["*"], toolsDeny: [], ...patch };
 }
 
 function tool(visibleName: string, callName?: string): ToolRef {
@@ -50,24 +61,31 @@ const SHELL = tool("local__shell__run");
 const HTTP = tool("local__http__fetch");
 
 describe("resolveToolPolicy", () => {
-  test("T1 allow = null → unrestricted", () => {
-    expect(resolveToolPolicy(null).kind).toBe("unrestricted");
+  test("T1 allow = null → allowlist([])（全禁，不再是 unrestricted）", () => {
+    const p = resolveToolPolicy(null);
+    expect(p.kind).toBe("allowlist");
+    expect(p.patterns).toEqual([]);
   });
 
-  // ── 裁决 D-4-1 的守门人（与技能侧 D-3-1 刻意相反）────────────────────
-  test("T2【D-4-1】null = 全部允许；[] = 全部拒绝（两者结果必须不同）", () => {
+  // ── 新裁决 BR-1 的守门人（与技能侧 BR-2 同口径）──────────────────────
+  test("T2【BR-1】null 与 [] 都是全禁；要全开必须显式写通配", () => {
     const cands = [READ, SHELL, HTTP];
 
     const pNull = resolveToolPolicy(null);
     const pEmpty = resolveToolPolicy([]);
-    expect(pNull.kind).toBe("unrestricted");
-    expect(pEmpty.kind).toBe("allowlist");
-    // 两者 kind 不同（结构上就区分得开）
-    expect(pNull.kind).not.toBe(pEmpty.kind);
+    const pStar = resolveToolPolicy(["*"]);
 
-    // 语义上：null 全放行，[] 全拒绝 —— 若有人「顺手统一」成技能侧口径，此断言立刻报红
-    expect(cands.map((c) => isToolAllowedByPolicy(pNull, [], c))).toEqual([true, true, true]);
+    // 三者都是 allowlist（已无 unrestricted 变体）
+    expect(pNull.kind).toBe("allowlist");
+    expect(pEmpty.kind).toBe("allowlist");
+
+    // 语义上：null 与 [] 完全一致 —— 都全拒。
+    // 若有人「恢复旧口径」把 null 当成不限制，此断言立刻报红。
+    expect(cands.map((c) => isToolAllowedByPolicy(pNull, [], c))).toEqual([false, false, false]);
     expect(cands.map((c) => isToolAllowedByPolicy(pEmpty, [], c))).toEqual([false, false, false]);
+
+    // 「全开」只能靠显式通配表达（这正是迁移时写 local__* 的原因）
+    expect(cands.map((c) => isToolAllowedByPolicy(pStar, [], c))).toEqual([true, true, true]);
   });
 
   test("T3 allow = [..] → allowlist，patterns 原样保留", () => {
@@ -103,8 +121,10 @@ describe("isToolAllowedByPolicy：匹配口径", () => {
     ]);
   });
 
-  test("T7 deny 一票否决：unrestricted 下也生效", () => {
-    const p = resolveToolPolicy(null);
+  test("T7 deny 一票否决：显式全开（[\"*\"]）下也生效", () => {
+    // ⚠️ 用 ["*"] 而不是 null：BR-1 之后 null = 全禁，已无法表达「全开且不设 deny」。
+    //    deny 的独立语义必须在「allow 本会放行」的前提下才验得出来。
+    const p = resolveToolPolicy(["*"]);
     const deny = ["local__shell__*"];
     expect(isToolAllowedByPolicy(p, deny, SHELL)).toBe(false);
     expect(isToolAllowedByPolicy(p, deny, READ)).toBe(true);
@@ -139,8 +159,10 @@ describe("isToolAllowedByPolicy：匹配口径", () => {
     const pUnderscore = resolveToolPolicy(["local__fileRead__*"]);
     expect(isToolAllowedByPolicy(pUnderscore, [], READ)).toBe(true);
     // deny 侧同理：点号写不生效、下划线写生效
-    expect(isToolAllowedByPolicy(resolveToolPolicy(null), ["local.fileRead.*"], READ)).toBe(true);
-    expect(isToolAllowedByPolicy(resolveToolPolicy(null), ["local__fileRead__*"], READ)).toBe(false);
+    //   ⚠️ allow 用 ["*"] 而非 null（BR-1 后 null = 全禁）：
+    //     否则「deny 未命中 → true」会被 allow 的全禁掩盖，测不出 deny 的匹配口径。
+    expect(isToolAllowedByPolicy(resolveToolPolicy(["*"]), ["local.fileRead.*"], READ)).toBe(true);
+    expect(isToolAllowedByPolicy(resolveToolPolicy(["*"]), ["local__fileRead__*"], READ)).toBe(false);
   });
 
   test("T11 中间 * 不当通配（复用 match.ts 口径）", () => {
@@ -246,7 +268,7 @@ describe("门面转发", () => {
     const policy: ToolPolicy = resolveToolPolicy(null);
     const filter: ToolFilter = denyAllToolFilter();
     const ref: ToolRef = READ;
-    expect(policy.kind).toBe("unrestricted");
+    expect(policy.kind).toBe("allowlist");
     expect(filter.allows(ref)).toBe(false);
   });
 });

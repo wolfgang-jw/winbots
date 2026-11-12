@@ -2044,6 +2044,18 @@
         bodyDraft: "",
         setupDraft: "",
         preview: null,
+        /* [工具/技能配置归位 setup.json] 弹窗内工具/技能/设置项控件的状态：
+         *   options      —— GET /api/agents/meta/options 的缓存（目录/组/设置项/技能清单）
+         *   toolsAllow   —— 已勾选的工具组 id 集合（写回 setup.tools.allow）
+         *   toolsDeny    —— 明确排除的工具组 id 集合（写回 setup.tools.deny）
+         *   skillsList   —— 已勾选的技能目录集合（写回 setup.skills.list）
+         *   toolSettings —— { "<dir>/<group>": { name: value } }（写回 setup.toolSettings）
+         * 这些字段是「结构化控件的唯一真相」，每次变更都会同步刷新 setupDraft 文本。 */
+        options: null,
+        toolsAllow: new Set(),
+        toolsDeny: new Set(),
+        skillsList: new Set(),
+        toolSettings: {},
     };
 
     /**
@@ -2075,7 +2087,7 @@
             const data = await resp.json();
             configState.items = data.items || [];
             configState.scanVersion = data.scanVersion || "";
-            configState.toolTree = data.toolTree || [];
+            configState.toolTree = []; // [setup.json] 工具树不再由本接口下发（loadConfigView）
             configState.orphanKeys = data.orphanKeys || [];
             // [skill] 技能区：与工具树同一份 GET 返回，一次拿全
             configState.skillTree = data.skillTree || [];
@@ -2125,10 +2137,10 @@
         // [C-11 / §11 / §10.2] 工具树与遗留键区块接在系统项之后
         box.insertAdjacentHTML(
             "beforeend",
-            renderToolSection() + renderSkillSection() + renderLlmSection() + renderAgentSection() + renderOrphanSection(),
+            renderLlmSection() + renderAgentSection() + renderOrphanSection(),
         );
-        bindToolTreeEvents(box);
-        bindSkillTreeEvents(box);
+        // [工具/技能配置归位 setup.json] 工具树 / 技能开关区已移除（改在智能体编辑弹窗按 agent 配置）。
+        bindLlmSectionEvents(box);     // [FR-LLM-1~6] LLM 组列表
         bindLlmSectionEvents(box);     // [FR-LLM-1~6] LLM 组列表
         bindAgentSectionEvents(box);   // [agent / 第 9 步] 第四段：智能体列表
 
@@ -2302,35 +2314,36 @@
     /** 保存（AC-CFG-2 / F-CFG-2~F-CFG-5） */
     async function saveConfig() {
         const changes = collectConfigChanges();
-        const toolChanges = collectToolChanges();
+        const toolChanges = null; // [工具/技能配置归位 setup.json] 不再收集工具变更
         const keys = Object.keys(changes);
         // [需求域 R / R-17] 清空项单独收集：与普通修改项分开确认、分开提交（§9.2 互斥校验）
         const clearKeys = [...configState.clearKeys];
-        const toolCount = Object.keys(toolChanges.dirToggles).length
-            + Object.keys(toolChanges.groupToggles).length
-            + Object.keys(toolChanges.settings).length
-            + toolChanges.restore.length
-            + Object.keys(toolChanges.skillToggles || {}).length;   // [skill] 技能开关也算改动
+        const toolCount = 0; // 工具/技能变更不再由本接口提交
+        if (keys.length === 0 && clearKeys.length === 0 && toolCount === 0) return;
+        // （已删除：工具开关 / 设置项 / 恢复默认 / 技能开关的变更收集）
+        // （restore 已废弃）
+        // （skillToggles 已废弃）
         if (keys.length === 0 && clearKeys.length === 0 && toolCount === 0) return;
 
         // 二次确认（列出将被修改的键）
         const confirmParts = [];
-        const dirCount = Object.keys(toolChanges.dirToggles).length;
-        const groupCount = Object.keys(toolChanges.groupToggles).length;
-        if (dirCount + groupCount > 0) {
-            confirmParts.push("工具开关：目录 " + dirCount + " 个、工具组 " + groupCount + " 个");
+        const dirCount = 0; // 工具开关已迁移到 setup.json
+        const groupCount = 0; // 工具组开关已迁移到 setup.json
+        if (dirCount + groupCount > 0) { /* 已废弃：恒不成立 */ }
+        if (false) { /* 工具开关提示已废弃，恒不成立 */
         }
-        const settingKeys = Object.keys(toolChanges.settings);
+        const settingKeys = []; // 工具设置项已迁移到 setup.json
+        // （设置项变更已迁移到 setup.json）
         if (settingKeys.length > 0) confirmParts.push("工具设置项：\n" + settingKeys.join("\n"));
-        if (toolChanges.restore.length > 0) {
-            confirmParts.push("恢复默认（删键）：\n" + toolChanges.restore.join("\n"));
+        // （restore 占位）
+        if (false) { /* 占位：恢复默认与技能开关已不在本接口处理 */
         }
         if (keys.length > 0) confirmParts.push(`修改：\n${keys.join("\n")}`);
         // [skill / §12.2] 只改技能开关时确认框必须有内容，否则用户看不到将改什么
-        const skillToggleKeys = Object.keys(toolChanges.skillToggles || {});
+        const skillToggleKeys = []; // 技能开关已迁移到 setup.json（原为 Object.keys(toolChanges.skillToggles)）
         if (skillToggleKeys.length > 0) {
             confirmParts.push("技能开关：\n" + skillToggleKeys
-                .map((d) => `${d} → ${toolChanges.skillToggles[d] ? "开" : "关"}`).join("\n"));
+                .map((d) => `${d} → 关`).join("\n")); // 空数组，永不执行
         }
         if (clearKeys.length > 0) confirmParts.push(`清空密钥（保存后写为空值）：\n${clearKeys.join("\n")}`);
         // [modal] 原生 confirm 改页面内确认框：必须 await（同步布尔 → Promise<boolean>）
@@ -2361,11 +2374,11 @@
                     scanVersion: configState.scanVersion,   // [§9.3] 版本过期后端会 409
                     changes,
                     clear: clearKeys,
-                    dirToggles: toolChanges.dirToggles,
-                    groupToggles: toolChanges.groupToggles,
-                    settings: toolChanges.settings,
-                    restore: toolChanges.restore,
-                    skillToggles: toolChanges.skillToggles,   // [skill / §12.2]
+                    // dirToggles 不再提交（已迁移到 setup.json）
+                    // groupToggles 不再提交（已迁移到 setup.json）
+                    // settings 不再提交（已迁移到 setup.json 的 toolSettings）
+                    // restore 不再提交（已迁移到 setup.json）
+                    // skillToggles 不再提交（已迁移到 setup.json 的 skills）
                 }),
             });
             const data = await resp.json();
@@ -2373,7 +2386,7 @@
             if (resp.status === 409) {
                 // [§9.3] 扫描版本过期：工具目录有变化或页面停留过久 → 重扫后让用户重新确认
                 if (resultEl) {
-                    resultEl.textContent = "⚠️ 工具目录已变化（扫描版本过期），已自动刷新，请复核后重新保存。";
+                    resultEl.textContent = "⚠️ 扫描版本已过期（工具目录有变化或页面停留过久），已自动刷新，请复核后重新保存。";
                 }
                 await loadConfigView();
                 return;
@@ -3799,8 +3812,8 @@
                     LLM ${a.llmRef
                         ? escapeHtml(a.llmRef)
                         : '<span class="config-badge config-badge--shadow">未引用（无效）</span>'} ·
-                    技能 ${a.skillsMode === "all" ? "全部" : `白名单 ${(a.skillsAllow || []).length} 项`} ·
-                    工具 ${a.toolsAllow === null ? "不限" : `${(a.toolsAllow || []).length} 项`} ·
+                    技能 ${a.skillsMode === "all" ? "全部（已废弃）" : `白名单 ${(a.skillsAllow || []).length} 项`} ·
+                    工具 ${(a.toolsAllow || []).length === 0 ? "无（全禁）" : `${(a.toolsAllow || []).length} 项`} ·
                     轮次 ${escapeHtml(rounds)} ·
                     预算 ${escapeHtml(String(a.systemBudget))} ·
                     记忆 ${a.memoryEnabled ? "开" : "关"} ·
@@ -3957,6 +3970,381 @@
         return String(path).split("/").map(encodeURIComponent).join("/");
     }
 
+    /* ============================================================
+     * [工具/技能配置归位 setup.json] 弹窗内的工具 / 技能 / 工具设置项控件
+     *
+     * 数据流（代码文档 4.12②）：
+     *   GET /api/agents/meta/options  → agentState.options（缓存一次）
+     *   setupDraft(JSON)              → agentState.toolsAllow / skillsList / toolSettings（解析）
+     *   用户勾选 / 输入               → 同步回这三个集合，再回写 setupDraft 文本
+     *   saveAgentEditor()             → 以 setupDraft 为准提交（结构化控件已同步进去）
+     *
+     * 语义（需求 BR-1 / BR-2）：
+     *   · 工具：只勾的可用；一个都不勾 = tools.allow 为空 = 该 agent 无任何工具；
+     *   · 技能：只勾的可用；一个都不勾 = skills.list 为空 = 该 agent 无任何技能；
+     *   · skills.mode 固定 "allow"（D-1：mode="all" 已废弃）。
+     * ============================================================ */
+
+    /** 拉一次可配置项清单（幂等缓存；失败返回 null 并提示） */
+    async function ensureAgentOptions() {
+        if (agentState.options) return agentState.options;
+        try {
+            const resp = await fetch("/api/agents/meta/options", { cache: "no-store" });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+            agentState.options = data;
+            return data;
+        } catch (e) {
+            console.warn("[setup.json] 读取可配置项清单失败：", e);
+            return null;
+        }
+    }
+
+    /**
+     * 工具组 id（"local/fileRead"）→ 后端通配模式（"local__fileRead__*"）。
+     *
+     * ⚠️ 这两个域必须转换，不能直接把组 id 写进 allow：
+     *   后端 matchesAny 匹配的是「可见名」local__fileRead__read_file，
+     *   而 `matchWildcard` 只认末尾 *，精确串 "local/fileRead" 永远匹配不上 → 静默全禁。
+     */
+    function groupIdToPattern(gid) {
+        const parts = String(gid).split("/").filter((s) => s !== "");
+        if (parts.length === 0) return "*";
+        return parts.join("__") + "__*";
+    }
+
+    /** 通配模式是否覆盖某个工具组（读回显用，与 groupIdToPattern 互逆） */
+    function patternCoversGroup(pattern, gid) {
+        const want = groupIdToPattern(gid);
+        const p = String(pattern || "").trim();
+        if (p === "" ) return false;
+        if (p === "*") return true;
+        if (p.endsWith("*")) {
+            // "local__*" 覆盖 "local__fileRead__*"；"local__fileRead__*" 覆盖自己
+            const prefix = p.slice(0, -1);
+            return want.startsWith(prefix);
+        }
+        // 精确写法：允许直接写 "local__fileRead__read_file" 之类，按前缀粗判到组
+        return p.startsWith(want.slice(0, -1));
+    }
+
+    /** 解析 setupDraft → 三个集合（供控件回显）；解析失败时全部置空 */
+    function parseSetupDraftIntoToolState() {
+        agentState.toolsAllow = new Set();
+        agentState.toolsDeny = new Set();
+        agentState.skillsList = new Set();
+        agentState.toolSettings = {};
+        let obj = null;
+        try { obj = JSON.parse(agentState.setupDraft || "{}"); } catch { obj = null; }
+        if (!obj || typeof obj !== "object") return;
+
+        // 工具：allow 里写的是**后端通配模式**（"local__fileRead__*" / "local__*" / "*"），
+        //   这里原样保存模式串；勾选回显时用 patternCoversGroup() 落到具体组。
+        const norm = (s) => String(s).trim();
+        const allow = obj.tools && Array.isArray(obj.tools.allow) ? obj.tools.allow : [];
+        for (const a of allow) if (typeof a === "string" && a.trim() !== "") agentState.toolsAllow.add(norm(a));
+        const deny = obj.tools && Array.isArray(obj.tools.deny) ? obj.tools.deny : [];
+        for (const d of deny) if (typeof d === "string" && d.trim() !== "") agentState.toolsDeny.add(norm(d));
+
+        // 技能：list 形如 "examples/log_triage"
+        const list = obj.skills && Array.isArray(obj.skills.list) ? obj.skills.list : [];
+        for (const s of list) if (typeof s === "string" && s.trim() !== "") agentState.skillsList.add(s.trim());
+
+        // 设置项：{ "<dir>/<group>": { name: value } }
+        if (obj.toolSettings && typeof obj.toolSettings === "object" && !Array.isArray(obj.toolSettings)) {
+            for (const [gid, bag] of Object.entries(obj.toolSettings)) {
+                if (!bag || typeof bag !== "object" || Array.isArray(bag)) continue;
+                agentState.toolSettings[gid] = { ...bag };
+            }
+        }
+    }
+
+    /**
+     * 把三个集合写回 setupDraft 文本（结构化控件是唯一真相）。
+     * ⚠️ 保留 setupDraft 里其它字段（title / llm / limits / memory / systemBudget 等），
+     *    只覆盖 tools / skills / toolSettings 三块，避免「勾一下工具把 llm 弄丢」。
+     */
+    function syncToolStateIntoSetupDraft() {
+        let obj = {};
+        try { obj = JSON.parse(agentState.setupDraft || "{}") || {}; } catch { obj = {}; }
+        if (typeof obj !== "object" || Array.isArray(obj)) obj = {};
+
+        // tools：只写「有内容」的键，全空则删掉 tools 块（= 无任何工具）
+        // ⚠️ [D-17 修复] 集合里可能同时存着两种东西：
+        //   ① 从 setup.json 解析出来的**原始通配模式**（"local__*" / "*" / "local__fileRead__read_file"）
+        //   ② 勾选新组时写入的**组 id 转来的模式**（groupIdToPattern 的结果）
+        //   早先这里对每一项都无条件调 groupIdToPattern()，会把 ① 再转一次
+        //   → "local__*" 变成 "local__*__*"，多出一层，静默全禁。
+        //   因此：已是模式（以 "*" 结尾，或本身是 "*"）就原样保留，只有组 id 才转换。
+        const alreadyPattern = (s) => {
+            const t = String(s || "").trim();
+            return t === "*" || t.endsWith("*");
+        };
+        const toPattern = (s) => (alreadyPattern(s) ? String(s).trim() : groupIdToPattern(s));
+        const allow = [...agentState.toolsAllow].map(toPattern);
+        const deny = [...agentState.toolsDeny].map(toPattern);
+        if (allow.length === 0 && deny.length === 0) {
+            delete obj.tools;
+        } else {
+            obj.tools = {};
+            if (allow.length > 0) obj.tools.allow = allow;
+            if (deny.length > 0) obj.tools.deny = deny;
+            if (allow.length === 0) obj.tools.allow = [];   // 显式空数组（语义同 null：全禁）
+        }
+
+        // skills：mode 固定 allow；list 空则保留空数组（语义同 null：全禁）
+        const list = [...agentState.skillsList];
+        if (list.length === 0) {
+            delete obj.skills;
+        } else {
+            obj.skills = { mode: "allow", list };
+        }
+
+        // toolSettings：值等于默认值的键不写（4.5 注意）
+        const cleaned = {};
+        for (const [gid, bag] of Object.entries(agentState.toolSettings || {})) {
+            const out = {};
+            for (const [name, value] of Object.entries(bag || {})) {
+                if (value === undefined || value === null || value === "") continue;
+                const def = findSettingDef(gid, name);
+                if (def && isDefaultSettingValue(def, value)) continue;   // 等于默认值 → 省略
+                out[name] = value;
+            }
+            if (Object.keys(out).length > 0) cleaned[gid] = out;
+        }
+        if (Object.keys(cleaned).length === 0) delete obj.toolSettings;
+        else obj.toolSettings = cleaned;
+
+        agentState.setupDraft = JSON.stringify(obj, null, 2);
+        const setupEl = document.getElementById("agent-editor-setup");
+        if (setupEl) setupEl.value = agentState.setupDraft;
+    }
+
+    /** 在 options 里查某个设置项的定义 */
+    function findSettingDef(groupId, name) {
+        const opt = agentState.options;
+        if (!opt) return null;
+        const g = (opt.toolGroups || []).find((x) => x.id === groupId);
+        if (g) {
+            const s = (g.settings || []).find((x) => x.name === name);
+            if (s) return s;
+        }
+        const segs = String(groupId).split("/");
+        const dirPath = segs.length > 1 ? segs.slice(0, -1).join("/") : "";
+        const d = (opt.toolDirs || []).find((x) => x.path === dirPath);
+        if (d) return (d.settings || []).find((x) => x.name === name) || null;
+        return null;
+    }
+
+    /** 值是否等于声明里的默认值（等于则不写盘） */
+    function isDefaultSettingValue(def, value) {
+        const dv = def ? def.default : undefined;
+        if (dv === undefined) return false;
+        if (typeof dv === "boolean") return value === dv;
+        if (typeof dv === "number") return Number(value) === dv;
+        if (Array.isArray(dv)) {
+            const arr = Array.isArray(value) ? value : String(value).split(",").map((s) => s.trim()).filter(Boolean);
+            return JSON.stringify(arr) === JSON.stringify(dv);
+        }
+        return String(value) === String(dv);
+    }
+
+    /** 渲染三块控件（打开弹窗 / 选项就绪后调用） */
+    async function renderAgentToolControls() {
+        const toolsBox = document.getElementById("agent-tools-tree");
+        const skillsBox = document.getElementById("agent-skills-tree");
+        const settingsBox = document.getElementById("agent-toolsettings-tree");
+        if (!toolsBox && !skillsBox && !settingsBox) return;
+
+        parseSetupDraftIntoToolState();
+        const opt = await ensureAgentOptions();
+        if (!opt) {
+            if (toolsBox) toolsBox.innerHTML = '<div class="config-item__desc">（无法读取工具清单，请检查服务是否正常）</div>';
+            return;
+        }
+
+        /* ① 工具树：目录分组 → 组勾选 */
+        if (toolsBox) {
+            toolsBox.innerHTML = "";
+            const groupsByDir = new Map();
+            for (const g of opt.toolGroups || []) {
+                const key = g.dirPath || "";
+                if (!groupsByDir.has(key)) groupsByDir.set(key, []);
+                groupsByDir.get(key).push(g);
+            }
+            const dirTitle = (p) => (p === "" ? "（根目录）" : p);
+
+            for (const [dirPath, groups] of [...groupsByDir.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+                const head = document.createElement("div");
+                head.className = "agent-cfg-row agent-cfg-row--dir";
+                head.innerHTML = `<span class="agent-cfg-row__name">${escapeHtml(dirTitle(dirPath))}</span>`;
+                toolsBox.appendChild(head);
+
+                for (const g of groups) {
+                    const row = document.createElement("label");
+                    row.className = "agent-cfg-row" + (g.suspend ? " agent-cfg-row--suspended" : "");
+                    const cb = document.createElement("input");
+                    cb.type = "checkbox";
+                    const isOn = () => [...agentState.toolsAllow].some((p) => patternCoversGroup(p, g.id));
+                    cb.checked = isOn();
+                    cb.disabled = !!g.suspend;
+                    if (g.suspend) cb.title = "该工具组已挂起，不可开启";
+                    cb.addEventListener("change", () => {
+                        // 勾选：写入本组的精确模式（若已有更宽的模式覆盖，则不重复写）
+                        if (cb.checked) {
+                            if (!isOn()) agentState.toolsAllow.add(groupIdToPattern(g.id));
+                        } else {
+                            // 取消勾选：删掉覆盖本组的模式，并显式写 deny（防「更宽 allow 又把它带回来」）
+                            for (const p of [...agentState.toolsAllow]) {
+                                if (patternCoversGroup(p, g.id)) agentState.toolsAllow.delete(p);
+                            }
+                            if (![...agentState.toolsDeny].some((p) => patternCoversGroup(p, g.id))) {
+                                agentState.toolsDeny.add(groupIdToPattern(g.id));
+                            }
+                        }
+                        syncToolStateIntoSetupDraft();
+                        updateAgentToolEmptyHints();
+                        // 设置项区跟随工具勾选刷新（未勾的组不显示设置项）
+                        void renderAgentSettingsTree();
+                    });
+                    const name = document.createElement("span");
+                    name.className = "agent-cfg-row__name";
+                    name.textContent = g.id;
+                    const meta = document.createElement("span");
+                    meta.className = "agent-cfg-row__meta";
+                    meta.textContent = g.suspend ? "已挂起" : "";
+                    row.appendChild(cb);
+                    row.appendChild(name);
+                    row.appendChild(meta);
+                    toolsBox.appendChild(row);
+                }
+            }
+            if (toolsBox.children.length === 0) {
+                toolsBox.innerHTML = '<div class="config-item__desc">未扫描到任何工具组。</div>';
+            }
+        }
+
+        /* ② 技能树 */
+        if (skillsBox) {
+            skillsBox.innerHTML = "";
+            for (const s of opt.skills || []) {
+                const row = document.createElement("label");
+                row.className = "agent-cfg-row" + (s.status !== "ok" ? " agent-cfg-row--suspended" : "");
+                const cb = document.createElement("input");
+                cb.type = "checkbox";
+                cb.checked = agentState.skillsList.has(s.dir);
+                cb.disabled = s.status !== "ok";
+                if (s.status !== "ok") cb.title = "该技能已挂起，不可开启";
+                cb.addEventListener("change", () => {
+                    if (cb.checked) agentState.skillsList.add(s.dir);
+                    else agentState.skillsList.delete(s.dir);
+                    syncToolStateIntoSetupDraft();
+                    updateAgentToolEmptyHints();
+                });
+                const name = document.createElement("span");
+                name.className = "agent-cfg-row__name";
+                name.textContent = s.title ? `${s.dir}（${s.title}）` : s.dir;
+                row.appendChild(cb);
+                row.appendChild(name);
+                skillsBox.appendChild(row);
+            }
+            if (skillsBox.children.length === 0) {
+                skillsBox.innerHTML = '<div class="config-item__desc">未扫描到任何技能。</div>';
+            }
+        }
+
+        await renderAgentSettingsTree();
+        updateAgentToolEmptyHints();
+    }
+
+    /** 「一个都没勾」时的显式提示（避免用户误以为「没勾 = 不限」） */
+    function updateAgentToolEmptyHints() {
+        const te = document.getElementById("agent-tools-empty");
+        if (te) te.hidden = agentState.toolsAllow.size > 0;
+        const se = document.getElementById("agent-skills-empty");
+        if (se) se.hidden = agentState.skillsList.size > 0;
+    }
+
+    /** ③ 工具设置项：只渲染「已勾选工具组」的设置项 */
+    async function renderAgentSettingsTree() {
+        const box = document.getElementById("agent-toolsettings-tree");
+        if (!box) return;
+        const opt = agentState.options;
+        if (!opt) { box.innerHTML = ""; return; }
+        box.innerHTML = "";
+
+        const isGroupOn = (gid) => [...agentState.toolsAllow].some((p) => patternCoversGroup(p, gid));
+        const shown = (opt.toolGroups || []).filter(
+            (g) => isGroupOn(g.id) && (g.settings || []).length > 0,
+        );
+        // 目录级设置项：当该目录下至少有一个组被勾选时展示
+        const dirsWithGroups = new Map();
+        for (const g of opt.toolGroups || []) {
+            if (!isGroupOn(g.id)) continue;
+            const key = g.dirPath || "";
+            dirsWithGroups.set(key, true);
+        }
+        const shownDirs = (opt.toolDirs || []).filter(
+            (d) => dirsWithGroups.has(d.path) && (d.settings || []).length > 0,
+        );
+
+        if (shown.length === 0 && shownDirs.length === 0) {
+            box.innerHTML = '<div class="config-item__desc">勾选工具组后，这里会出现该组可配置的设置项。</div>';
+            return;
+        }
+
+        const addSettingRow = (groupId, s) => {
+            const wrap = document.createElement("div");
+            wrap.className = "agent-cfg-setting";
+            const label = document.createElement("span");
+            label.className = "agent-cfg-setting__label";
+            label.textContent = `${groupId ? groupId + " · " : ""}${s.name}`;
+            label.title = s.desc || s.name;
+
+            const input = document.createElement("input");
+            input.className = "agent-cfg-setting__input";
+            input.type = s.secret ? "password" : (s.kind === "number" ? "number" : "text");
+            const cur = (agentState.toolSettings[groupId] || {})[s.name];
+            input.value = cur === undefined ? "" : String(cur);
+            input.placeholder = s.secret ? "（留空 = 不修改）" : String(s.default ?? "");
+            input.addEventListener("input", () => {
+                const bag = agentState.toolSettings[groupId] || (agentState.toolSettings[groupId] = {});
+                const raw = input.value;
+                if (raw === "") { delete bag[s.name]; }
+                else if (s.kind === "boolean") bag[s.name] = (raw === "true");
+                else if (s.kind === "number") bag[s.name] = Number(raw);
+                else if (s.kind === "string_array") bag[s.name] = raw.split(",").map((x) => x.trim()).filter(Boolean);
+                else bag[s.name] = raw;
+                if (Object.keys(bag).length === 0) delete agentState.toolSettings[groupId];
+                syncToolStateIntoSetupDraft();
+            });
+
+            const def = document.createElement("span");
+            def.className = "agent-cfg-setting__default";
+            def.textContent = `默认 ${String(s.default)}`;
+
+            wrap.appendChild(label);
+            wrap.appendChild(input);
+            wrap.appendChild(def);
+            box.appendChild(wrap);
+        };
+
+        for (const d of shownDirs) {
+            const head = document.createElement("div");
+            head.className = "agent-cfg-row agent-cfg-row--dir";
+            head.innerHTML = `<span class="agent-cfg-row__name">${escapeHtml(d.path)}（目录项）</span>`;
+            box.appendChild(head);
+            for (const s of d.settings) addSettingRow(d.path, s);
+        }
+        for (const g of shown) {
+            const head = document.createElement("div");
+            head.className = "agent-cfg-row agent-cfg-row--dir";
+            head.innerHTML = `<span class="agent-cfg-row__name">${escapeHtml(g.id)}</span>`;
+            box.appendChild(head);
+            for (const s of g.settings) addSettingRow(g.id, s);
+        }
+    }
+
     /** 重画编辑浮层内容 */
     function renderAgentEditor() {
         const modal = document.getElementById("agent-editor-modal");
@@ -3984,6 +4372,8 @@
             else previewEl.textContent = JSON.stringify(p, null, 2);
         }
         modal.hidden = false;
+        // [工具/技能配置归位 setup.json] 同步三块结构化控件（工具 / 技能 / 设置项）
+        void renderAgentToolControls();
         if (pathEl) pathEl.focus();
     }
 
@@ -4193,7 +4583,16 @@
         const bodyEl = document.getElementById("agent-editor-body");
         if (bodyEl) bodyEl.addEventListener("input", () => { agentState.bodyDraft = bodyEl.value; });
         const setupEl = document.getElementById("agent-editor-setup");
-        if (setupEl) setupEl.addEventListener("input", () => { agentState.setupDraft = setupEl.value; });
+        if (setupEl) setupEl.addEventListener("input", () => {
+            agentState.setupDraft = setupEl.value;
+        });
+        if (setupEl) setupEl.addEventListener("blur", () => {
+            // [工具/技能配置归位 setup.json] 手工改完 JSON 后反向同步勾选控件
+            //   （输入过程中不动，避免重建 DOM 打断键盘输入）
+            agentState.setupDraft = setupEl.value;
+            parseSetupDraftIntoToolState();
+            void renderAgentToolControls();
+        });
         // 点遮罩关闭（与既有 modal 行为一致）
         modal.addEventListener("click", (ev) => { if (ev.target === modal) closeAgentEditor(); });
         document.addEventListener("keydown", (ev) => {

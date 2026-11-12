@@ -8,7 +8,7 @@
  *   ③ 通配不重复实现，一律复用 match.ts（S16 与 match.test.ts 的 W 系列互为印证）。
  */
 import { describe, expect, test } from "bun:test";
-import type { AgentRecord } from "../types";
+import type { AgentRecord, AgentSkillsMode } from "../types";
 import {
   filterSkillsForAgent,
   isSkillAllowedByPolicy,
@@ -44,10 +44,19 @@ const B = "examples/deploy";
 const C = "tools/read_file";
 
 describe("resolveSkillPolicy", () => {
-  test("S1 mode=all → unrestricted，且 list 被忽略", () => {
-    expect(resolveSkillPolicy("all", null).kind).toBe("unrestricted");
-    expect(resolveSkillPolicy("all", ["a"]).kind).toBe("unrestricted");
-    expect(resolveSkillPolicy("all", []).kind).toBe("unrestricted");
+  test("S1 mode=all 已被废除（D-1）：类型层已不允许，运行期传入也不会放宽", () => {
+    // ⚠️ 两层防线，逐层断言：
+    //   ① 类型层：`AgentSkillsMode` 已收窄为字面量 "allow"，下面这行**故意**用
+    //      `as` 逃逸才写得出来 —— 若哪天有人把 "all" 加回类型，这条注释就不再成立。
+    //   ② 运行期：resolveSkillPolicy 内部 `void mode`，只认 list。
+    //      即使上游塞进历史值，也**绝不退化成「不限制」**（安全边界不因脏输入放宽）。
+    const legacy = "all" as unknown as AgentSkillsMode;
+
+    const p = resolveSkillPolicy(legacy, null);
+    expect(p.kind).toBe("allowlist");
+    expect(p.patterns).toEqual([]);
+    // list 不再被忽略：传了 ["a"] 就是 ["a"]（旧口径会整块丢弃）
+    expect(resolveSkillPolicy(legacy, ["a"]).patterns).toEqual(["a"]);
   });
 
   test("S2 allow + 非空白名单 → allowlist，patterns 原样保留", () => {
@@ -91,10 +100,18 @@ describe("resolveSkillPolicy", () => {
 });
 
 describe("isSkillAllowedByPolicy / isSkillAllowedForAgent", () => {
-  test("S7 unrestricted 对任何技能都放行", () => {
-    const p = resolveSkillPolicy("all", null);
-    expect(isSkillAllowedByPolicy(p, skill(A))).toBe(true);
-    expect(isSkillAllowedByPolicy(p, skill("any/thing"))).toBe(true);
+  test("S7 已无「放行一切」的形态：空白名单对任何技能都不放行", () => {
+    // ⚠️ 旧的 S7 断言 unrestricted 全放行，其载体是已废除的 mode=all（D-1）。
+    //    现在**唯一**的「全开」表达是显式 ["*"]，所以这里改为并排断言两者：
+    const legacy = "all" as unknown as AgentSkillsMode;
+    const pEmpty = resolveSkillPolicy(legacy, null);
+    expect(isSkillAllowedByPolicy(pEmpty, skill(A))).toBe(false);
+    expect(isSkillAllowedByPolicy(pEmpty, skill("any/thing"))).toBe(false);
+
+    // 显式 ["*"] 才全开
+    const pStar = resolveSkillPolicy("allow", ["*"]);
+    expect(isSkillAllowedByPolicy(pStar, skill(A))).toBe(true);
+    expect(isSkillAllowedByPolicy(pStar, skill("any/thing"))).toBe(true);
   });
 
   test("S8 allowlist 精确模式只命中自身", () => {
@@ -157,13 +174,17 @@ describe("filterSkillsForAgent", () => {
     // 因此第 5 步必须先全局过滤，本函数不承担该职责（见文档铁律 2）
   });
 
-  test("S14【对照】mode=all 时不做任何收窄（等价于不接 agent 的现状）", () => {
+  test("S14【对照】显式 [\"*\"] 时不做任何收窄（等价于不接 agent 的现状）", () => {
+    // ⚠️ 旧版本用 mode="all" 表达「不接 agent」。D-1 废除该模式后，
+    //    唯一等价的表达是显式 ["*"]（「不接 agent」= 不设置白名单 = 全放行）。
     const globalOk = [usable(A), usable(C)];
-    const out = filterSkillsForAgent(agent({ skillsMode: "all", skillsAllow: null }), globalOk);
+    const out = filterSkillsForAgent(agent({ skillsMode: "allow", skillsAllow: ["*"] }), globalOk);
     expect(out.map((s) => s.dir)).toEqual(globalOk.map((s) => s.dir));
-    // 即使白名单写了不相关的内容也不生效
-    const out2 = filterSkillsForAgent(agent({ skillsMode: "all", skillsAllow: ["nope"] }), globalOk);
-    expect(out2.map((s) => s.dir)).toEqual(globalOk.map((s) => s.dir));
+
+    // 而**空白名单**（null）在新语义下是全禁，与上面形成对照 ——
+    //   这一对并排断言正是 BR-2 的核心：省略 ≠ 不限制。
+    const none = filterSkillsForAgent(agent({ skillsMode: "allow", skillsAllow: null }), globalOk);
+    expect(none).toEqual([]);
   });
 
   test("S15 空候选集 → 空输出（不崩、不隐式放行）", () => {

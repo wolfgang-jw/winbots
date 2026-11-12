@@ -23,12 +23,11 @@
 //    而下面立刻就要用 loadEnvJson()（顺序颠倒会撞 ERR_ENVJSON_NO_DEFAULTS）。
 import { CONFIG_KEY_SET } from "./configFile";
 import {
-  EnvJsonError, loadEnvJson, managedValues, maybeMigrateOnce, envJsonFilePath,
+  EnvJsonError, loadEnvJson, maybeMigrateOnce, envJsonFilePath,
   defaultLlmIndex, resolveDefaultLlmName,
   type EnvJson, type LlmGroup,
 } from "./envJson";
 import { DEFAULT_THINKING_MODE, THINKING_MODE_LABEL, type ThinkingMode } from "./thinkingMode";
-import { hasManagedPrefix } from "@/tools/paths";
 
 /**
  * [需求域 C / C-04] 思考相关字段的下发方式。
@@ -193,12 +192,12 @@ console.log(`  SSE_HEARTBEAT_MS:      ${env.SSE_HEARTBEAT_MS}`);
 // [需求域 T / T-06] 平台兜底：工具结果总长度上限（无敏感信息）
 console.log(`  TOOL_RESULT_MAX_CHARS: ${env.TOOL_RESULT_MAX_CHARS}（工具结果回灌前的截断上限）`);
 
-// [C-06-4 / 规范 §8.2 / §8.7] 工具域配置已全部下沉，本文件既不持有也不打印其取值。
-//   升级后的初始态是「全部关闭」（§8.2），必须显式提示「去哪里开」，
-//   否则用户会把「工具全没了」当成故障并回滚（§9.2 第一条风险）。
+// [C-06-4 / 规范 §8.2 / §8.7] 工具域配置已全部下沉到「每个 agent 的 setup.json」。
+//   本文件既不持有也不打印其取值；「哪些工具可用」由 agent 的 setup.json 显式列举决定，
+//   未列出（缺失 / null / 空数组）即「一个工具都没有」。提示语必须指对地方。
 console.log("-".repeat(60));
-console.log("  工具配置：已全部下沉到配置页（也可在 env.json 的 tools 块手写 TOOLON__* / TOOLSET__* / etc__tools__*）");
-console.log("  ⚠️  当前所有工具组均为「关闭」或「未开启」：请在配置页按 目录 → 工具组 逐级开启（保存即生效）。");
+console.log("  工具/技能配置：已下沉到 智能体 setup.json（配置页「编辑智能体」弹窗内可视化编辑）");
+console.log("  ⚠️  工具与技能「显式列举才可用」：未勾选 = 该 agent 没有任何可用工具/技能。");
 console.log("      每次请求的可见工具数与排除原因见日志 🧰 [T-VIS]；私有模块（_ 前缀）改动需重启进程。");
 console.log("  配置说明：docs/配置说明.md（JSON 不支持注释，说明文字都在这里）");
 console.log("=".repeat(60));
@@ -207,24 +206,12 @@ console.log("=".repeat(60));
  * [规范 §9.1] 热重载回执：routes/config.ts 原样回给配置页。
  *   applied = 系统项中**真正发生变化**的键名（迁移后不再有「注入进程环境」这一步）
  *   skipped = 因 skipKeys 跳过、或不在白名单内的键
- *   managed = tools 块里的全部托管键（字段保留以兼容前端；「不进进程环境」已恒成立）
+ *   managed = 恒为空数组（env.json 的 tools 块已废除，保留字段仅为兼容前端）
  */
 export interface EnvReloadResult {
   applied: string[];
   skipped: string[];
   managed: string[];
-}
-
-/** 名单外键的告警去重集合（同一键只提醒一次，避免每次保存刷屏） */
-const warnedReloadSkip = new Set<string>();
-
-/** [§9.1] 名单外键告警；**不输出取值原文**（§8.7） */
-function warnReloadSkipOnce(key: string): void {
-  if (warnedReloadSkip.has(key)) return;
-  warnedReloadSkip.add(key);
-  console.warn(
-    `⚠️  [env] ${key} 不在热重载白名单内（既非系统项，也非本次扫描注册的键），已跳过`,
-  );
 }
 
 /**
@@ -239,7 +226,8 @@ function warnReloadSkipOnce(key: string): void {
  *   2. skipKeys 内的键保持旧值（如 APP_PORT：端口已绑定、origin.ts 白名单已构造）。
  *
  * @param skipKeys    不参与热更、需重启才生效的键
- * @param allowedKeys 本次扫描注册的键（保留入参以兼容调用方；JSON 模式下只用于**报告** skipped）
+ * @param allowedKeys 保留入参以兼容调用方；**当前已不使用**（工具/技能键不再经过 env.json，
+ *                    原先「名单外键」提示的实现已随托管层一并删除）
  */
 export function reloadEnvExcluding(
   skipKeys: readonly string[] = [],
@@ -269,18 +257,10 @@ export function reloadEnvExcluding(
     if (cur[key] !== nxt[key]) applied.push(key);
   }
 
-  // ③ 托管键（tools 块）：字段语义保留，值 = tools 块里全部「命中托管前缀」的键
-  const managedKeys = [...managedValues(true).keys()].filter((k) => hasManagedPrefix(k));
-  managed.push(...managedKeys);
-
-  // ④ 名单外的键：仅当调用方显式给了 allowedKeys 时才报告（用于前端提示「手写键未生效」）
-  if (allowedKeys) {
-    const wl = new Set<string>(CONFIG_KEY_SET);
-    for (const k of allowedKeys) wl.add(k);
-    for (const k of managedKeys) {
-      if (!wl.has(k)) { skipped.push(k); warnReloadSkipOnce(k); }
-    }
-  }
+  // ③ 托管键（原 env.json 的 tools 块）：该层已整体废除，恒为空。
+  //    字段 `managed` 仍保留在返回值里（前端在用），只是不再有内容可报告。
+  //    连带：原先「名单外的手写键」检查只针对托管键，现在自然也失效 ——
+  //    工具/技能配置不再经过 env.json，手写错键不会在这里被提示（改由 setup 校验报错）。
 
   // ⑤ 就地更新单例（引用不变），skipKeys 保持旧值
   for (const k of skipKeys) nxt[k] = cur[k];

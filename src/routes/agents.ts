@@ -33,6 +33,12 @@ import {
 } from "@/agents";
 import { AGENTS_ROOT } from "@/agents/paths";
 import { loadEnvJson, foldLlmName } from "@/infra/envJson";
+// [工具/技能配置归位 setup.json] 编辑弹窗的「可配置项清单」数据源：
+//   只读工具 / 技能注册表（不读 env.json），与 config.ts 同口径走门面/scan。
+import { ensureToolRegistry } from "@/tools";
+import { getRegistry as getToolRegistry } from "@/tools/scan";
+import { ensureSkillRegistry, getSkillRegistry } from "@/skills";
+import type { SettingDef } from "@/infra/settings";
 
 const app = new Hono();
 
@@ -73,6 +79,8 @@ function toListItem(rec: AgentRecord) {
         skillsAllow: rec.skillsAllow,
         toolsAllow: rec.toolsAllow,
         toolsDeny: rec.toolsDeny,
+        // [工具/技能配置归位 setup.json] 工具设置项（每 agent 一份），供编辑弹窗回显
+        toolSettings: rec.toolSettings ?? {},
         maxRounds: rec.maxRounds,
         memoryEnabled: rec.memoryEnabled,
         systemBudget: rec.systemBudget,
@@ -136,6 +144,82 @@ app.get("/", async (c) => {
             ok: items.filter((x) => x.status === "ok").length,
             invalid: items.filter((x) => x.status === "invalid").length,
         },
+    });
+});
+
+/* ============================================================
+ * GET /api/agents/meta/options —— 「可配置项清单」（供编辑弹窗渲染勾选项）
+ *
+ * [工具/技能配置归位 setup.json] 为什么需要这个接口：
+ *   工具开关 / 工具设置项 / 技能开关不再有「全局一份」的来源，弹窗必须知道
+ *   「当前磁盘上到底有哪些目录 / 组 / 设置项 / 技能」才能画勾选树。
+ *   数据源只取**注册表**（工具 + 技能），**不读 env.json**。
+ *
+ * ⚠️ 必须注册在 `/:path{.+}` **之前**：否则 "meta/options" 会被当成 agent 路径吃掉。
+ * ⚠️ 只读、幂等；secret 项只给 default，不回显任何已存取值（本来也没有全局值）。
+ * ============================================================ */
+app.get("/meta/options", async (c) => {
+    await ensureToolRegistry();
+    await ensureSkillRegistry();
+    const treg = getToolRegistry();
+    const sreg = getSkillRegistry();
+
+    /* 注册键（etc__tools__local__file_root_dir / TOOLSET__a__b__x）→ 短键名。
+     * ⚠️ 不能对注册键用 pathSegments：那是按 "/" 切分的目录路径工具，
+     *    注册键的分隔符是 "__"，pathSegments 会把整串当成一段原样返回，
+     *    于是设置项标签显示成 etc__tools__local__file_root_dir（且回显取不到值）。 */
+    const settingShortName = (key: string) => key.split("__").slice(-1)[0];
+
+    const settingView = (d: SettingDef) => ({
+        kind: d.kind,
+        default: d.default,
+        desc: d.desc ?? null,
+        secret: d.secret === true,
+        options: d.options ? [...d.options] : null,
+        optionLabels: d.optionLabels ?? null,
+        min: d.min ?? null,
+        max: d.max ?? null,
+        dependsOn: d.dependsOn ?? null,
+    });
+
+    c.header("Cache-Control", "no-store");
+    return c.json({
+        ok: true,
+        toolVersion: treg.version,
+        skillVersion: sreg.version,
+        toolDirs: [...treg.dirs.values()]
+            .filter((d) => d.path !== "")
+            .map((d) => ({
+                path: d.path,
+                name: d.name,
+                depth: d.depth,
+                parent: d.path.includes("/") ? d.path.slice(0, d.path.lastIndexOf("/")) : "",
+                suspend: d.suspend ? { code: d.suspend.code, reason: d.suspend.reason } : null,
+                settings: [...d.settings.values()].map((s) => ({
+                    name: settingShortName(s.key),
+                    ...settingView(s.def),
+                })),
+            })),
+        toolGroups: [...treg.groups.values()].map((g) => ({
+            id: g.id,
+            dirPath: g.dirPath,
+            fileBase: g.fileBase,
+            visiblePrefix: g.visiblePrefix,
+            suspend: g.suspend ? { code: g.suspend.code, reason: g.suspend.reason } : null,
+            settings: [...g.settings.values()].map((s) => ({
+                name: settingShortName(s.key),
+                ...settingView(s.def),
+            })),
+        })),
+        skills: [...sreg.skills.values()].map((s) => ({
+            dir: s.dir,
+            name: s.name,
+            title: s.title,
+            summary: s.summary,
+            status: s.status,
+            suspend: s.suspend ? { code: s.suspend.code, reason: s.suspend.reason } : null,
+        })),
+        warnings: [...sreg.warnings],
     });
 });
 

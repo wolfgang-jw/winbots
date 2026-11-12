@@ -303,6 +303,9 @@ export function scanAgentsOnce(
       skillsAllow: s.skillsAllow,
       toolsAllow: s.toolsAllow,
       toolsDeny: s.toolsDeny,
+      // [FR-AGP-1] 工具设置项随 record 一起带出：运行期由 agents/toolConfig.ts
+      //   翻译成 AgentToolConfig（请求上下文），配置页由 toListItem 下发给弹窗。
+      toolSettings: s.toolSettings ?? {},
       maxRounds: s.maxRounds,
       memoryEnabled: s.memoryEnabled,
       systemBudget: s.systemBudget,
@@ -412,6 +415,8 @@ function invalidRecord(dir: string, abs: string, leaf: string, reason: string, u
     skillsAllow: null,
     toolsAllow: null,
     toolsDeny: [],
+    // 配置不可信的 agent：设置项给空（用默认值），工具由 denyAllToolFilter 全拒（BR-1）
+    toolSettings: {},
     maxRounds: null,
     memoryEnabled: true,
     systemBudget: SYSTEM_BUDGET_DEFAULT,

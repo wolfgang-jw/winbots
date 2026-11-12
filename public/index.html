@@ -7,6 +7,7 @@
     <title>Bots AI 对话</title>
     <!-- jQuery -->
     <script src="js/jquery-3.7.1.min.js"></script>
+
     <link rel="stylesheet" href="css/style.css">
 </head>
 
@@ -199,6 +200,40 @@
                 <div class="agent-editor__col">
                     <label class="agent-editor__label" for="agent-editor-setup">setup.json（模型 / 技能 / 工具 / 预算）</label>
                     <textarea id="agent-editor-setup" class="agent-editor__text agent-editor__text--mono" spellcheck="false"></textarea>
+                </div>
+            </div>
+            <!-- [工具/技能配置归位 setup.json] 弹窗内的工具配置 / 技能配置 / 工具设置项。
+                 ⚠️ 这三块与右侧 setup.json 文本框**双向同步**（结构化控件是唯一真相，
+                    文本框只做只读呈现 + 高级编辑）。未勾选 = 不可用；全空 = 无任何工具/技能。 -->
+            <div class="agent-editor__tools">
+                <div class="agent-editor__group" id="agent-tools-config">
+                    <div class="agent-editor__group-head">
+                        <span class="agent-editor__group-title">工具配置</span>
+                        <span class="agent-editor__group-hint">仅勾选的可用；不勾 = 该智能体无任何工具</span>
+                    </div>
+                    <div class="agent-editor__group-body" id="agent-tools-tree"></div>
+                    <div class="config-item__error" id="agent-tools-empty" hidden>
+                        当前未勾选任何工具 = 该智能体无任何工具可用
+                    </div>
+                </div>
+
+                <div class="agent-editor__group" id="agent-skills-config">
+                    <div class="agent-editor__group-head">
+                        <span class="agent-editor__group-title">技能配置</span>
+                        <span class="agent-editor__group-hint">仅勾选的可用；不勾 = 该智能体无任何技能</span>
+                    </div>
+                    <div class="agent-editor__group-body" id="agent-skills-tree"></div>
+                    <div class="config-item__error" id="agent-skills-empty" hidden>
+                        当前未勾选任何技能 = 该智能体无任何技能可用
+                    </div>
+                </div>
+
+                <div class="agent-editor__group" id="agent-toolsettings-config">
+                    <div class="agent-editor__group-head">
+                        <span class="agent-editor__group-title">工具设置项</span>
+                        <span class="agent-editor__group-hint">只对当前智能体生效；留空 = 用默认值</span>
+                    </div>
+                    <div class="agent-editor__group-body" id="agent-toolsettings-tree"></div>
                 </div>
             </div>
             <div class="agent-editor__preview" id="agent-editor-preview"></div>

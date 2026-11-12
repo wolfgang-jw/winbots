@@ -1,5 +1,25 @@
 {
   "uid": "ag_00000000",
   "name": "default",
-  "llm": "main"
+  "llm": "main",
+  "tools": {
+    "allow": [
+      "examples__*",
+      "internet__*",
+      "local__*"
+    ]
+  },
+  "toolSettings": {
+    "examples/analysis": {
+      "data_root_dir": "../working/analysis"
+    },
+    "internet/browser": {
+      "block_private_net": false,
+      "headless": false,
+      "max_sessions": 10
+    },
+    "local": {
+      "file_root_dir": "../working"
+    }
+  }
 }

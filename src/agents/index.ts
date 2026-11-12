@@ -6,7 +6,7 @@
  *    都对着同一个出口写，避免各自 import 内部文件、绕过单例。
  */
 export type {
-  AgentRecord, AgentRegistry, AgentSetup, AgentUid, AgentSkillsMode,
+  AgentRecord, AgentRegistry, AgentSetup, AgentUid, AgentSkillsMode, SettingScalar,
   SetupResult, SetupErrorCode,
 } from "./types";
 
@@ -22,9 +22,17 @@ export {
 
 export {
   parseAgentSetup,
-  SYSTEM_BUDGET_DEFAULT, MAX_ROUNDS_MIN, MAX_ROUNDS_MAX,
+  SYSTEM_BUDGET_DEFAULT, MAX_ROUNDS_MIN, MAX_ROUNDS_MAX, TOOL_GROUP_KEY_RE,
   type ParseSetupOpts,
 } from "./setup";
+
+// ── 「工具/技能配置归位 setup.json」新增（代码文档 4.2 / 4.3）──────────
+// 把 AgentRecord 翻译成请求级工具配置快照（AgentToolConfig）。
+// ⚠️ 只转发纯函数；注册表结构由调用方注入，避免 agents/ 依赖 tools/skills 的扫描器。
+export {
+  agentToolConfigOf,
+  type ToolGroupInfo, type ToolDirInfo,
+} from "./toolConfig";
 
 export { matchWildcard, matchesAny } from "./match";
 

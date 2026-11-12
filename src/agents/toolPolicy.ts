@@ -12,10 +12,11 @@
  *
  * 需求锚点：A2（每 agent 独立工具集合）、A10（清单与执行同口径）、C20（写操作边界）。
  *
- * ⚠️ 与 skillPolicy.ts 的**刻意不同**（裁决 D-4-1，见文档 §0.3）：
- *    技能侧：skills.mode 默认 allow（白名单）→ list 缺省(null) = 空名单 = 全禁；
- *    工具侧：tools.allow 缺省 = 不限制（需求 §3.1 明文）→ allow 缺省(null) = 全部允许。
- *    这是需求本身的不对称，**不要为了「一致」把它改掉**；T2 / T6 把两种语义并排钉死。
+ * ⚠️ **与 skillPolicy.ts 同口径**（需求 BR-1 / BR-2，「显式列举才可用」）：
+ *    技能侧：list 缺省(null) / [] = 空名单 = 全禁；
+ *    工具侧：allow 缺省(null) / [] = 空名单 = 全禁（**这是本次改造的行为变更**：
+ *            改造前 allow 缺省 = 不限制，裁决 D-4-1 已作废）。
+ *    想给 agent 全部工具，必须显式写通配模式（如 `local__*`），不能再靠省略字段。
  *
  * ⚠️ 依赖约束：本文件只允许 import `./match`（值）与 `./types`（仅 type）。
  *    **禁止** import `@/tools/*` 或 `@/infra/settings`：那会把全局口径复制出第二份，
@@ -39,19 +40,24 @@ export interface ToolRef {
   callName: string;
 }
 
-/** 策略裁决结果：把 setup 的 allow 压成一个可直接判断的形态 */
-export type ToolPolicy =
-  /** 不限制：全部工具放行（仅在 tools.allow 缺省时产生） */
-  | { kind: "unrestricted" }
-  /** 白名单：命中 allow 中任一模式才放行；**空数组 = 全拒绝**（降级路径用） */
-  | { kind: "allowlist"; patterns: readonly string[] };
+/**
+ * 策略裁决结果：把 setup 的 allow 压成一个可直接判断的形态。
+ *
+ * ⚠️ 已删除 `unrestricted` 变体（需求 BR-1）：allow 缺省 = 全禁，不再产生「不限制」。
+ *    删除这个变体是刻意的 —— 让编译器逼出所有残留的 `kind === "unrestricted"` 判断。
+ */
+export type ToolPolicy = {
+  /** 白名单：命中 allow 中任一模式才放行；**空数组 = 全拒绝** */
+  kind: "allowlist";
+  patterns: readonly string[];
+};
 
 /**
  * 把 setup 的 allow 裁决成 ToolPolicy（deny 不进来，见下）。
  *
- * 裁决表（文档 §0.3 D-4-1）：
- *   allow = null（未写）  → unrestricted：全部允许  ← 与技能侧 null 的语义**相反**
- *   allow = []（显式空）  → allowlist([])：全拒绝（降级路径 / 显式全关）
+ * 裁决表（需求 BR-1「显式列举才可用」，与技能侧同口径）：
+ *   allow = null（未写）  → allowlist([])：**全拒绝**（改造前是「不限制」，已变更）
+ *   allow = []（显式空）  → allowlist([])：全拒绝
  *   allow = [..]          → allowlist(..)
  *
  * 为什么 deny 不并进 policy：
@@ -59,11 +65,10 @@ export type ToolPolicy =
  *  （同一模式同时命中两边时该算什么说不清）。保留为两处数据、判定时先判 deny，
  *   与 §6.1 第 7 条逐字对应。
  *
- * @param allow setup.toolsAllow（null = 未写 allow = 不限制）
+ * @param allow setup.toolsAllow（null / [] 均 = 全禁）
  */
 export function resolveToolPolicy(allow: readonly string[] | null): ToolPolicy {
-  if (allow === null) return { kind: "unrestricted" };
-  return { kind: "allowlist", patterns: allow };
+  return { kind: "allowlist", patterns: allow ?? [] };
 }
 
 /**
@@ -82,8 +87,7 @@ export function denyAllPolicy(): ToolPolicy {
  *
  * 判定顺序（不可交换）：
  *   ① deny 命中 → 拒绝（deny 一票否决，§6.1 第 7 条）
- *   ② policy = unrestricted → 放行
- *   ③ policy = allowlist → 命中 allow 才放行（空数组 → 恒拒绝）
+ *   ② 命中 allow 才放行（空数组 → 恒拒绝；已无「不限制」分支）
  *
  * @param candidate 必须**已经**是「组可用 ∧ 工具自身启用」的工具；
  *                  本函数刻意不接受 groupState / isToolEnabled，避免复制全局口径。
@@ -94,7 +98,6 @@ export function isToolAllowedByPolicy(
   candidate: ToolRef,
 ): boolean {
   if (matchesAny(deny, candidate.visibleName)) return false;
-  if (policy.kind === "unrestricted") return true;
   return matchesAny(policy.patterns, candidate.visibleName);
 }
 
@@ -188,7 +191,7 @@ export function toolNotAllowedAgentUnavailable(): string {
  *      { toolsAllow: [], toolsDeny: [] } 表达，正好与正常路径共用一个类型。
  */
 export interface ToolFilter {
-  /** 同 setup.toolsAllow（null = 未写 = 不限制） */
+  /** 同 setup.toolsAllow（null / [] 均 = **全禁**；BR-1） */
   toolsAllow: readonly string[] | null;
   /** 同 setup.toolsDeny（[] = 无 deny） */
   toolsDeny: readonly string[];
@@ -204,6 +207,17 @@ export interface ToolFilter {
    *    禁止在 chat.ts 或单测里手写对象，否则「清单与执行同口径」又退化成口头约定。
    */
   allows: (candidate: ToolRef) => boolean;
+  /**
+   * 该 agent 本次「可用技能数」（D-16 方案②）。
+   *
+   * 元工具 skill__get_l2 是「读取技能 L2 手册」的唯一入口：没有技能时它毫无用处，
+   * 却仍会出现在模型可见清单里，与 BR-1「仅在配置中列出了的才可用」相悖。
+   * 因此改为**至少 1 个技能才追加**。
+   *
+   * 缺省（undefined）视为 0 → 不追加。方向是保守的：漏填只会少给元工具，
+   * 不会凭空空出一张工具面。
+   */
+  skillCount?: number;
 }
 
 /**
@@ -212,12 +226,20 @@ export interface ToolFilter {
  * ⚠️ policy 必须在**构造时算一次**：清单侧在组内循环里逐条调用 allows，
  *    若把 resolveToolPolicy 放进 allows 内部，就会变成「每个工具每轮重算一次」。
  */
-export function toolFilterOf(agent: Pick<AgentRecord, "toolsAllow" | "toolsDeny">): ToolFilter {
+export function toolFilterOf(
+  agent: Pick<AgentRecord, "toolsAllow" | "toolsDeny">,
+  /**
+   * 该 agent 本次可用技能数（D-16 方案②）：≥1 才把元工具 skill__get_l2 追加进清单。
+   * 省略 = 0 = 不追加。调用方（chat.ts / routes/skills.ts）在技能装配之后传入。
+   */
+  skillCount = 0,
+): ToolFilter {
   const policy = resolveToolPolicy(agent.toolsAllow);
   return {
     toolsAllow: agent.toolsAllow,
     toolsDeny: agent.toolsDeny,
     allows: (c) => isToolAllowedByPolicy(policy, agent.toolsDeny, c),
+    skillCount,
   };
 }
 
@@ -230,7 +252,9 @@ export function toolFilterOf(agent: Pick<AgentRecord, "toolsAllow" | "toolsDeny"
  *   （删 allows → 容器不可用；删 toolsAllow → 第 6 步无法从容器反查配置）。
  */
 export function denyAllToolFilter(): ToolFilter {
-  return { toolsAllow: [], toolsDeny: [], allows: () => false };
+  // skillCount: 0 —— 配置不可信的降级路径不追加元工具（D-16 方案②）：
+  //   降级时技能侧同样被全拒，给出「读技能手册」的入口只会让模型多绕一圈。
+  return { toolsAllow: [], toolsDeny: [], allows: () => false, skillCount: 0 };
 }
 
 /**

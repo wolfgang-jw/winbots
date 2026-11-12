@@ -9,8 +9,9 @@
  *
  * ⚠️ setup.json 的字段名以 setup.ts 的 parseAgentSetup **读取键**为唯一准绳：
  *      uid / name / title / description / llm
- *      / skills{ mode, list }      ← 注意是 list，不是 allow
- *      / tools{ allow, deny }
+ *      / skills{ mode, list }      ← 注意是 list，不是 allow；mode 只允许 "allow"
+ *      / tools{ allow, deny }      ← allow 缺失 / null / [] 均 = 全禁（BR-1）
+ *      / toolSettings{ "<dir>/<group>": { "<name>": 值 } }   ← 工具设置项（需求 D-2）
  *      / limits{ maxRounds }       ← 注意在 limits 下，不是顶层
  *      / memory{ enabled }
  *      / systemBudget
@@ -191,6 +192,15 @@ export function buildSetupJson(path: string, uid: string, setup: Partial<AgentSe
   const memoryEnabled = pick(setup.memoryEnabled, raw.memory?.enabled);
   // llm 同理：磁盘键名是 llm，内部字段名是 llmRef
   const llmRef = pick(setup.llmRef, raw.llm);
+  /**
+   * [FR-AGP-1] toolSettings：内部字段名与磁盘键名**同名**（`toolSettings`），
+   * 但前端的自由 JSON 编辑框也会直接贴磁盘形态，因此这里仍走 pick 归一。
+   *
+   * ⚠️ 这是本文件最容易「静默丢数据」的一处：`buildSetupJson` 是**白名单式重建**，
+   *    没在这里显式输出的键一律被丢弃 —— 前端保存一次，工具设置项就凭空消失。
+   *    由 write.test.ts 的往返用例（T-W13）守住。
+   */
+  const toolSettings = pick(setup.toolSettings, raw.toolSettings);
 
   const out: Record<string, unknown> = { uid, name: leaf };
 
@@ -212,6 +222,22 @@ export function buildSetupJson(path: string, uid: string, setup: Partial<AgentSe
       ...(toolsAllow !== undefined ? { allow: toolsAllow } : {}),
       ...(toolsDeny !== undefined ? { deny: toolsDeny } : {}),
     };
+  }
+
+  // toolSettings: { "<dir>/<group>": { "<name>": 值 } }
+  //   ⚠️ 空对象**不写**（等价于缺失），避免 `"toolSettings": {}` 这种噪声
+  //   ⚠️ 组与键都按字典序输出，保证同一份配置序列化结果稳定（便于 diff 与备份比对）
+  //   ⚠️ 本轮不做「值等于默认值即删键」的瘦身：这里拿不到默认值（需要工具注册表），
+  //      由前端在提交前决定是否省略（前端从 GET /api/agents/meta/options 拿到 default）
+  if (toolSettings && typeof toolSettings === "object" && Object.keys(toolSettings).length > 0) {
+    const sorted: Record<string, Record<string, unknown>> = {};
+    for (const g of Object.keys(toolSettings).sort()) {
+      const bag = (toolSettings as Record<string, Record<string, unknown>>)[g] ?? {};
+      const inner: Record<string, unknown> = {};
+      for (const k of Object.keys(bag).sort()) inner[k] = bag[k];
+      sorted[g] = inner;
+    }
+    out.toolSettings = sorted;
   }
 
   // limits: { maxRounds }  ← 在 limits 下

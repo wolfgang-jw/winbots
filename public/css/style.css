@@ -1908,6 +1908,34 @@ padding: 12px 16px;
     cursor: not-allowed;
 }
 
+/* [FR-UI-5] 次要按钮（取消 / 关闭）。
+ * ⚠️ 与 .approval-modal__submit 逐项对齐尺寸与排版（padding / border-radius /
+ *    font-size / font-weight 完全一致），只把「实心填充」换成「描边 + 浅底」，
+ *    使两个按钮看起来是同一套控件，而不是「自定义按钮 + 浏览器默认灰按钮」。
+ * ⚠️ #agent-editor-cancel / #llm-editor-cancel 一直用这个类，但此前 CSS 里没有定义，
+ *    所以显示为浏览器默认样式。现在两处弹窗同时获得正确样式（HTML 类名不变）。 */
+.approval-modal__cancel {
+    padding: 8px 20px;
+    border: 1px solid var(--gray-200);
+    border-radius: 20px;
+    background: var(--white);
+    color: var(--gray-700, #4a4a4a);
+    font-size: 0.84rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.approval-modal__cancel:hover {
+    background: var(--gray-50, #f7f7f7);
+    border-color: var(--gray-300, #d8d8d8);
+}
+
+.approval-modal__cancel:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
 .approval-modal__error {
     margin-top: 8px;
     font-size: 0.78rem;
@@ -2085,6 +2113,114 @@ body.approval-open { overflow: hidden; }
     white-space: pre-wrap; word-break: break-all;
 }
 .agent-editor__preview:empty { display: none; }
+
+/* ============================================
+   [工具/技能配置归位 setup.json] 弹窗内的工具/技能/设置项三块
+   结构：.agent-editor__tools > .agent-editor__group > __group-head + __group-body
+   交互：勾选树由 chat.js 的 renderAgentToolsTree / renderAgentSkillsTree /
+         renderAgentToolSettingsTree 生成（元素类名见下）。
+   ============================================ */
+.agent-editor__tools {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+    max-height: 34vh;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+
+.agent-editor__group {
+    border: 1px solid var(--gray-200);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background: var(--white);
+}
+
+.agent-editor__group-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px dashed var(--gray-200);
+}
+
+.agent-editor__group-title {
+    font-size: 0.84rem;
+    font-weight: 700;
+    color: var(--gray-700, #3a3a3a);
+}
+
+.agent-editor__group-hint {
+    font-size: 0.72rem;
+    color: var(--gray-600);
+}
+
+.agent-editor__group-body {
+    padding-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+/* 勾选行：目录 / 组 / 技能 / 设置项共用 */
+.agent-cfg-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 4px;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    border-radius: 4px;
+}
+.agent-cfg-row:hover { background: var(--gray-50, #f7f7f7); }
+.agent-cfg-row--dir > .agent-cfg-row__name { font-weight: 700; }
+.agent-cfg-row--suspended { opacity: 0.55; }
+.agent-cfg-row__name { word-break: break-all; }
+.agent-cfg-row__meta {
+    margin-left: auto;
+    font-size: 0.7rem;
+    color: var(--gray-600);
+    white-space: nowrap;
+}
+.agent-cfg-row input[type="checkbox"] { margin: 0; flex: 0 0 auto; }
+
+/* 设置项输入行 */
+.agent-cfg-setting {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    font-size: 0.78rem;
+}
+.agent-cfg-setting__label {
+    flex: 0 0 42%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--gray-700, #3a3a3a);
+}
+.agent-cfg-setting__input {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 3px 6px;
+    border: 1px solid var(--gray-300, #ccc);
+    border-radius: 4px;
+    font-size: 0.76rem;
+    font-family: inherit;
+}
+.agent-cfg-setting__default {
+    flex: 0 0 auto;
+    font-size: 0.68rem;
+    color: var(--gray-600);
+    max-width: 30%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 @media (max-width: 860px) {
     .agent-editor__cols { flex-direction: column; }

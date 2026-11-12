@@ -16,7 +16,7 @@
  */
 
 import { applyConfigChanges, parseEnvText, readEnvFile } from "./configFile";
-import { formatSettingValue, parseSettingValue, refreshManagedValues } from "./settings";
+import { formatSettingValue, parseSettingValue } from "./settings";
 import { getRegistry } from "@/tools/scan";
 
 /**
@@ -211,7 +211,9 @@ async function doMigrate(): Promise<boolean> {
     migrated = false;
     return false;
   }
-  refreshManagedValues(true);
+  // ['工具/技能配置归位 setup.json'] 不再有全局托管键缓存可刷：
+  //   工具/技能配置已迁到各 agent 的 setup.json（见 infra/toolConfigContext.ts）。
+  //   这里只做迁移写入，运行期每次请求按所绑 agent 的 record 构造上下文。
   console.log(
     `🚚 [migrate] 存量配置已分流：写入 ${res.written.length} 个新键、清除 ${res.deleted.length} 个旧行` +
     `${skipped.length > 0 ? `、跳过 ${skipped.length} 个` : ""}（备份 ${res.backupFile ?? "无"}）`,

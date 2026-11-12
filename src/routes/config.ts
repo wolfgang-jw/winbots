@@ -43,7 +43,7 @@ import {
 import { ensureToolRegistry } from "@/tools";
 import {
   currentSettingText, defaultValueText, formatSettingValue, parseSettingValue,
-  refreshManagedValues, isToggleOn, groupState,
+  isToggleOn, groupState,
   type SettingDef,
 } from "@/infra/settings";
 import { hasManagedPrefix, isSensitiveName, pathSegments, isReservedName } from "@/tools/paths";
@@ -415,8 +415,6 @@ router.get("/", async (c) => {
 
   const reg = getRegistry();
   const sreg = getSkillRegistry();
-  // [skill / C-21] 强制刷新取值缓存，避免「保存后仍显示旧值」
-  refreshManagedValues(true);
   const items = buildConfigItems(
     allRestartKeys(),
     envShadowedBySystem,
@@ -436,12 +434,11 @@ router.get("/", async (c) => {
     items,
     /** 扫描版本标识：PUT 必须原样带回（§9.3） */
     scanVersion: reg.version,
-    /** 工具区：按目录层级缩进的树（§11） */
-    toolTree: buildToolTree(reg),
-    skillTree: buildSkillTree(sreg),
-    skillScanVersion: sreg.version,
-    skillWarnings: sreg.warnings,
-    /** 底部遗留键区块的数据（§10.2） */
+    /* [工具/技能配置归位 setup.json] `toolTree` / `skillTree` / `skillScanVersion` /
+     * `skillWarnings` 已删除：工具开关、工具设置项、技能开关不再有「全局一份」的来源，
+     * 它们现在属于各 agent 的 setup.json，改由「智能体编辑」弹窗（GET /api/agents/meta/options）
+     * 读取与修改。本接口只保留系统项（env.json 的 app / log / stab / llm）。 */
+    /** 底部遗留键区块的数据（§10.2）：D-4 决定保留，供人工清理 _unmapped */
     orphanKeys: listOrphanKeysExcludingSkills(reg, sreg),
   });
 });
@@ -466,7 +463,6 @@ router.post("/refresh", async (c) => {
     const resR = applyConfigChanges({ changes: {}, deleteKeys: staleR, allowDeleteKeys: new Set(staleR) });
     if (resR.ok) {
       cleanedR.push(...resR.deleted);
-      refreshManagedValues(true);
     } else {
       console.warn("⚠️  [skill] 残留键清理失败：" + String(resR.error ?? ""));
     }
@@ -517,6 +513,29 @@ router.put("/", async (c) => {
 
   const writes: Record<string, string> = {};
   const deletes: string[] = [];
+  /* ③ [工具/技能配置归位 setup.json] dirToggles / groupToggles / settings / skillToggles / restore
+   *    —— 这五类字段已**整体迁移到各 agent 的 setup.json**（见代码文档 4.9②）。
+   *    出现即 400，且**不静默忽略**：静默忽略会让人以为「保存成功」，
+   *    实际改动一个字都没写进磁盘。前端（配置页）已删除这些控件，正常不会触发。
+   */
+  const MIGRATED_FIELDS = ["dirToggles", "groupToggles", "settings", "skillToggles", "restore"] as const;
+  const hitMigrated = MIGRATED_FIELDS.filter(
+    (f) => body[f] !== undefined && body[f] !== null,
+  );
+  if (hitMigrated.length > 0) {
+    return c.json(
+      {
+        ok: false,
+        code: "ERR_MIGRATED_TO_AGENT",
+        error:
+          `工具/技能配置（${hitMigrated.join(" / ")}）已迁移到各智能体的 setup.json，` +
+          "请在「智能体编辑」弹窗中修改该智能体的工具配置与技能配置。",
+        migratedFields: [...hitMigrated],
+      },
+      400,
+    );
+  }
+
   const invalid: Array<{ key: string; reason: string }> = [];
   const pushInvalid = (key: string, reason: string): void => { invalid.push({ key, reason }); };
 
@@ -551,140 +570,12 @@ router.put("/", async (c) => {
     }
   }
 
-  /* ③ 开关：先在「本次提交后的状态」上算 delta，再校验门禁 */
-  const delta = new Map<string, boolean>();
-  const prospectiveOn = (key: string): boolean =>
-    (delta.has(key) ? (delta.get(key) as boolean) : isToggleOn(key));
+  /* ③（已删除）：dirToggles / groupToggles / skillToggles 的处理已整体移除，
+   *   见上方 ERR_MIGRATED_TO_AGENT 拦截。这里不再计算 delta / prospectiveOn。 */
 
-  if (body.dirToggles !== undefined) {
-    const map = asObject(body.dirToggles);
-    if (!map) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "dirToggles 必须为对象" }, 400);
-    for (const [path, v] of Object.entries(map)) {
-      const dir = reg.dirs.get(path);
-      if (!dir || path === "") { pushInvalid(path, "未知目录节点"); continue; }
-      if (typeof v !== "boolean") { pushInvalid(path, "开关值必须为布尔"); continue; }
-      if (dir.suspend) { pushInvalid(path, "该目录加载失败，不可操作"); continue; }
-      if (v && !parentChainOn(reg, path, prospectiveOn)) {
-        pushInvalid(path, "上级目录已关闭，不能开启（父关时全部子孙关闭且不可操作）");
-        continue;
-      }
-      delta.set(dir.toggleKey, v);
-    }
-  }
-
-  if (body.groupToggles !== undefined) {
-    const map = asObject(body.groupToggles);
-    if (!map) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "groupToggles 必须为对象" }, 400);
-    for (const [gid, v] of Object.entries(map)) {
-      const g = reg.groups.get(gid);
-      if (!g) { pushInvalid(gid, "未知工具组"); continue; }
-      if (typeof v !== "boolean") { pushInvalid(gid, "开关值必须为布尔"); continue; }
-      if (g.suspend) { pushInvalid(gid, "该工具组已挂起（加载失败），不可开启"); continue; }
-      if (v && !parentChainOn(reg, `${g.dirPath}/x`, prospectiveOn)) {
-        // 后端独立复查（§3.5）：祖先目录在「提交后状态」下必须全开
-        pushInvalid(gid, "上级目录已关闭，不能开启该工具组");
-        continue;
-      }
-      delta.set(g.toggleKey, v);
-    }
-  }
-
-  /* [skill / §12.2、N-SK-5] 技能开关：键空间独立（SKILLON__），没有祖先继承（N-SK-6） */
-  if (body.skillToggles !== undefined) {
-    const mapS = asObject(body.skillToggles);
-    if (!mapS) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "skillToggles 必须为对象" }, 400);
-    const sregP = getSkillRegistry();
-    for (const [dir, v] of Object.entries(mapS)) {
-      const recS = sregP.skills.get(dir);
-      if (!recS) { pushInvalid(dir, "未知技能（不在本次扫描结果内，请点「刷新」后重试）"); continue; }
-      if (typeof v !== "boolean") { pushInvalid(dir, "开关值必须为布尔"); continue; }
-      // 挂起技能只允许「关」：关 = 删键（回到默认关闭），不涉及任何门禁放松
-      if (recS.status === "suspended" && v) { pushInvalid(dir, "该技能已挂起（声明不合法），不可开启"); continue; }
-      delta.set(recS.toggleKey, v);
-    }
-  }
-
-  /* ④ 设置项取值（写入端校验：类型 / 范围 / 枚举 / 成对约束） */
-  if (body.settings !== undefined) {
-    const map = asObject(body.settings);
-    if (!map) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "settings 必须为对象" }, 400);
-    for (const [key, raw] of Object.entries(map)) {
-      // [skill / N-2] 先工具、再 skill：SKILLSET__* 只在 skill 注册表里
-      const def = defOf(key);
-      if (!def) { pushInvalid(key, "未知或未声明的设置项"); continue; }
-
-      // §9.1「拒绝敏感名称」的写入期一道（R-11 定稿，纵深防御）：
-      //   扫描期已就该拦的拦过一次；这里防「声明被绕过 / 新增键忘了标 secret」。
-      //   只作用于工具设置项：唯一的系统密钥项 LLM_API_KEY 由 CONFIG_KEYS 的 type:"secret" 管。
-      if (isSensitiveName(key) && def.secret !== true) {
-        pushInvalid(key, "键名形似密钥，但该设置项未声明 secret: true；请在代码声明处补 secret（或改名）");
-        continue;
-      }
-
-      // 数组类型允许前端直接给数组；其余一律按字符串
-      const text = def.kind === "string_array" && Array.isArray(raw)
-        ? JSON.stringify(raw)
-        : String(raw ?? "").trim();
-      if (def.kind !== "string_array" && /[\r\n]/.test(text)) { pushInvalid(key, "值不能包含换行符"); continue; }
-
-      const parsed = parseSettingValue(def, text);
-      if (!parsed.ok) { pushInvalid(key, parsed.reason); continue; }
-
-      // §7.2 成对约束：依赖项取值不在允许集合内时，不允许把本项写成非默认值
-      if (def.dependsOn) {
-        // [skill / C-13] owner 也要兜底到 skill 注册表：settingOwners 只由工具扫描构建
-        const owner = reg.settingOwners.get(key) ?? skillSettingOwnerOf(key);
-        const sibling = owner ? [...owner.entries()].find(([n]) => n === def.dependsOn?.name) : undefined;
-        const siblingKey = sibling?.[1].key;
-        const siblingDef = sibling?.[1].def;
-        if (!siblingKey || !siblingDef) {
-          pushInvalid(key, `成对约束指向的设置项不存在：${def.dependsOn.name}`);
-          continue;
-        }
-        const pending = typeof map[siblingKey] === "string" ? (map[siblingKey] as string) : undefined;
-        const siblingText = pending ?? currentSettingText(siblingKey) ?? defaultValueText(siblingDef);
-        const siblingParsed = parseSettingValue(siblingDef, siblingText);
-        const siblingValue = siblingParsed.ok ? String(siblingParsed.value) : String(siblingDef.default);
-        if (!def.dependsOn.equals.includes(siblingValue)) {
-          pushInvalid(key, `该值仅在「${def.dependsOn.name}」为 ${def.dependsOn.equals.join(" / ")} 时有意义`);
-          continue;
-        }
-      }
-
-      const outText = formatSettingValue(def, parsed.value);
-      if (outText === defaultValueText(def)) deletes.push(key);   // §9.1：值等于默认值 → 删键
-      else writes[key] = outText;
-    }
-  }
-
-  /* ⑤ 恢复默认（显式删键；等价于把该项改回默认值） */
-  if (body.restore !== undefined) {
-    if (!Array.isArray(body.restore) || body.restore.some((x) => typeof x !== "string")) {
-      return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "restore 必须为字符串数组" }, 400);
-    }
-    for (const key of body.restore as string[]) {
-      // 设置项与开关都支持「恢复默认」：开关的默认值恒为 false（§8.2），删键即回到关闭
-      const isSetting = defOf(key) !== undefined;
-      const isToggle = key.startsWith("TOOLON__") && reg.registeredKeys.has(key);
-      if (!isSetting && !isToggle) { pushInvalid(key, "未知或未声明的设置项 / 开关"); continue; }
-      delete writes[key];
-      deletes.push(key);        // 删键 → 回到初始默认（关闭 / 声明里的默认值）
-    }
-  }
-
-  /* ⑥ 开关 delta 转写盘动作：默认值是常量 false（§8.2），所以「开 → 写 true / 关 → 删键」
-   *    正好等价于 §9.1 的「值等于默认值即删键」，不需要再查任何「生效默认值」。
+  /* ③/④/⑤/⑥（已删除）：工具设置项（settings）、开关 delta、restore 全部迁移到 setup.json，
+   *   已在上方由 ERR_MIGRATED_TO_AGENT 拦截。此处只剩系统项（changes / clear）走 env.json。
    */
-  for (const [key, on] of delta) {
-    if (on) {
-      writes[key] = "true";
-      const i = deletes.indexOf(key);
-      if (i >= 0) deletes.splice(i, 1);       // 同一次提交里既 restore 又显式开启 → 以开启为准
-    } else {
-      delete writes[key];
-      deletes.push(key);                      // 关 = 回到默认值 = 删键
-    }
-  }
 
   if (invalid.length > 0) {
     const fields: Record<string, string> = {};
@@ -715,9 +606,10 @@ router.put("/", async (c) => {
     return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: result.error || "写入 env.json 失败" }, 500);
   }
 
-  /* ⑧ 生效：先刷工具取值缓存（含「删键即恢复默认」），再热更进程内配置（白名单=系统项） */
-  refreshManagedValues(true);
-  // [§9.1] 白名单 = 系统项 ∪ 本次扫描注册键；托管键不进进程环境（由取值层读 env.json 的 tools 块）
+  /* ⑧ 生效：热更进程内配置（白名单=系统项）。
+   *   ⚠️ 不再有 refreshManagedValues()：工具/技能配置已不在 env.json，
+   *      也就没有「全局托管键缓存」可刷；每个请求按所绑 agent 的 record 构造上下文。
+   */
   const reload = HOT_RELOAD_ENABLED
     ? reloadEnvExcluding(["APP_PORT"], reg.registeredKeys)
     : { applied: [] as string[], skipped: [] as string[], managed: [] as string[] };
@@ -856,7 +748,6 @@ router.post("/llm", async (c) => {
   if (!w.ok) {
     return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: w.error || "写入 env.json 失败" }, 500);
   }
-  refreshManagedValues(true);
   return c.json({ ok: true, name, backupFile: w.backupFile });
 });
 
@@ -1031,7 +922,6 @@ router.put("/llm/:name", async (c) => {
     const reload = reloadEnvExcluding(["APP_PORT"]);
     hotApplied = reload.applied;
   }
-  refreshManagedValues(true);
 
   return c.json({
     ok: true,
@@ -1131,7 +1021,6 @@ router.delete("/llm/:name", async (c) => {
   if (!w.ok) {
     return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: w.error || "写入 env.json 失败" }, 500);
   }
-  refreshManagedValues(true);
   return c.json({ ok: true, name: target.name, remaining: next.llm.map((g) => g.name), backupFile: w.backupFile });
 });
 
@@ -1231,7 +1120,6 @@ router.delete("/orphans", async (c) => {
   if (unmappedTargets.length > 0) {
     deleted.push(...deleteUnmappedKeys(unmappedTargets));
   }
-  refreshManagedValues(true);
   return c.json({
     ok: true,
     deleted,

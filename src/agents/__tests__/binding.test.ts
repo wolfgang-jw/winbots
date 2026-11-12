@@ -135,8 +135,18 @@ describe("resolveBinding · 工具判据（degraded 不带 toolFilter）", () =>
         expect("toolFilter" in r).toBe(false);
     });
 
-    test("T-B10 bound 且 toolsAllow=null → allows 恒 true（D-4-1）", () => {
+    test("T-B10 bound 且 toolsAllow=null → allows 恒 false（BR-1：null = 全禁）", () => {
+        // ⚠️ 旧断言是「null → 恒 true（D-4-1 不限制）」，该裁决已作废。
+        //    改造后 null 与 [] 同义（全禁），与技能侧 BR-2 同口径。
         const r = resolveBinding("ag_00000001", null, reg([rec({ toolsAllow: null })]));
+        if (r.kind !== "bound") throw new Error("应 bound");
+        expect(r.toolFilter.allows({ visibleName: "local__fileRead__read_file", callName: "x" })).toBe(false);
+        expect(r.toolFilter.allows({ visibleName: "任意__不存在", callName: "y" })).toBe(false);
+    });
+
+    test("T-B10b bound 且 toolsAllow=[\"*\"] → allows 恒 true（显式全开）", () => {
+        // 「全开」现在只能显式表达；这条与 T-B10 并排，钉住「null ≠ 不限制」
+        const r = resolveBinding("ag_00000001", null, reg([rec({ toolsAllow: ["*"] })]));
         if (r.kind !== "bound") throw new Error("应 bound");
         expect(r.toolFilter.allows({ visibleName: "local__fileRead__read_file", callName: "x" })).toBe(true);
         expect(r.toolFilter.allows({ visibleName: "任意__不存在", callName: "y" })).toBe(true);
@@ -149,10 +159,11 @@ describe("resolveBinding · 工具判据（degraded 不带 toolFilter）", () =>
     });
 
     test("T-B11b deny 一票否决", () => {
+        // ⚠️ allow 用 ["*"] 而非 null：BR-1 后 null 全禁，deny 就测不出独立效果了
         const r = resolveBinding(
             "ag_00000001",
             null,
-            reg([rec({ toolsAllow: null, toolsDeny: ["local__fileRead__*"] })]),
+            reg([rec({ toolsAllow: ["*"], toolsDeny: ["local__fileRead__*"] })]),
         );
         if (r.kind !== "bound") throw new Error("应 bound");
         expect(r.toolFilter.allows({ visibleName: "local__fileRead__read_file", callName: "x" })).toBe(false);

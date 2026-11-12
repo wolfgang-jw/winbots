@@ -208,7 +208,9 @@ registerEnvJsonDefaults({
     sseHeartbeatMs: Number(defaultOf("SSE_HEARTBEAT_MS")),
     toolResultMaxChars: TOOL_RESULT_MAX_CHARS_DEFAULT,
   },
-  tools: {},
+  // ['工具/技能配置归位 setup.json'] 这里**不再有 `tools` 块**：
+  //   工具开关 / 工具设置项 / 技能开关已迁到各 agent 的 setup.json，
+  //   env.json 只剩全局运行参数（app / llm / log / stab）。
 });
 
 // ============================================
@@ -580,15 +582,23 @@ export function applyConfigChanges(req: ApplyRequest): ApplyResult {
     if (CONFIG_KEY_TO_JSON[k]) { deleteSystemPath(raw, k); systemDeleted.push(k); continue; }
   }
 
-  //   ⑦-b 托管键：写 = 覆盖；删 = 从 tools 移除
-  const rawTools = raw.tools;
-  const tools: Record<string, unknown> =
-    rawTools && typeof rawTools === "object" && !Array.isArray(rawTools)
-      ? { ...(rawTools as Record<string, unknown>) }
-      : {};
-  for (const [k, v] of Object.entries(managedChanges)) tools[k] = v;
-  for (const k of deleted) if (!CONFIG_KEY_TO_JSON[k]) delete tools[k];
-  raw.tools = tools;
+  //   ⑦-b 托管键：['工具/技能配置归位 setup.json'] 已无托管键来源
+  //   （env.json 的 tools 块被废除，工具/技能配置改在各 agent 的 setup.json）。
+  //   这里保留「若仍有非系统键要写/删，就落到 tools 块」的兼容分支，
+  //   但**不再无条件创建 `raw.tools`**：只有在确实有托管键变更时才写，
+  //   否则会把 `"tools": {}` 强行塞回新生成的 env.json。
+  const hasManaged = Object.keys(managedChanges).length > 0
+    || deleted.some((k) => !CONFIG_KEY_TO_JSON[k]);
+  if (hasManaged) {
+    const rawTools = raw.tools;
+    const tools: Record<string, unknown> =
+      rawTools && typeof rawTools === "object" && !Array.isArray(rawTools)
+        ? { ...(rawTools as Record<string, unknown>) }
+        : {};
+    for (const [k, v] of Object.entries(managedChanges)) tools[k] = v;
+    for (const k of deleted) if (!CONFIG_KEY_TO_JSON[k]) delete tools[k];
+    raw.tools = tools;
+  }
 
   //   ⑦-c 顶层 _unmapped：保留（不在这里改动；删除未识别键走 deleteUnmappedKeys，见 routes/config.ts）
 

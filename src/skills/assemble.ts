@@ -8,7 +8,11 @@
  *   · `assembleForRequestMulti()`          —— 新路径：多技能全量装配、L1 全注入、L2 由元工具按需取。
  *     chat.ts 走这一条。
  */
-import { isToggleOn } from "@/infra/settings";
+// ⚠️ 技能开关走技能侧取值函数（isSkillToggleOn），不是工具侧 isToggleOn：
+//   tool / skill 的开关集合在「每 agent 一份」的配置快照里是两个独立集合
+//   （见 @/infra/toolConfigContext 的 enabledToggles / enabledSkillToggles）。
+//   注入点的类型名仍保留 isToggleOn（AssembleDeps 的历史命名），默认实现已切到技能侧。
+import { isSkillToggleOn as isToggleOn } from "@/infra/settings";
 import { layer } from "./markdown";
 import { applySkillBudget } from "./budget";
 import { L1_MAX, L1_TOTAL_WARN, SKILL_NAME_PATTERN } from "./paths";

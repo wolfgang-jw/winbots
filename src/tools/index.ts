@@ -32,7 +32,7 @@
 import { env } from "@/infra/env";
 import { MAX_TOOL_ENTRIES } from "./paths";
 import { ensureRegistry, getRegistry, type Registry } from "./scan";
-import { groupState, refreshManagedValues } from "@/infra/settings";
+import { groupState } from "@/infra/settings";
 // [模块 5 · 第 4 步 / A10] 清单与执行的**同口径**判据容器。
 //   ⚠️ 必须是 `import type`：本文件在运行期不得依赖 agents/（工具子系统不认识 agent）。
 //      「谁来判定放行」完全在 chat.ts：它把 ToolFilter 传进来，
@@ -102,7 +102,10 @@ export interface Tool {
  *    存量迁移已上移到启动链（env.ts 模块顶层，见迁移文档 4.3.4），不再由请求边界触发。
  */
 export async function ensureToolRegistry(opts: { force?: boolean } = {}): Promise<void> {
-    refreshManagedValues();                        // env.json 变了就重读 tools 块（§7.4 取值源）
+    // ⚠️ 改造后这里**不再**刷新任何「全局托管值」缓存：工具开关 / 设置项已改为
+    //    每 agent 一份（setup.json），取值由请求上下文的 AsyncLocalStorage 承载
+    //    （见 @/infra/toolConfigContext 与 @/agents/toolConfig 的用法）。
+    //    因此本函数只剩「目录指纹校验 + 可重入扫描」这一件事。
     await ensureRegistry(opts);
 }
 
@@ -177,15 +180,25 @@ export function getToolDefinitions(opts?: ToolFilter): ToolDef[] {
     //    顺序颠倒 → 条目满时元工具被截掉 → L2 加载直接失效（本次最容易漏的一处）。
     //    它不计入 MAX_TOOL_ENTRIES：平台能力，不是用户可配工具。
     //    每次调用都新建 list，因此不存在「多次调用重复追加」的累积问题。
-    const metaDef: ToolDef = {
-        type: "function",
-        function: {
-            name: L2_TOOL_VISIBLE_NAME,
-            description: L2_TOOL_DESCRIPTION,
-            parameters: l2Tool.parameters,
-        },
-    };
-    list = [...list, metaDef];
+    //
+    // [D-16 方案②] 但「追加」有条件：**该 agent 至少有 1 个可用技能**才追加。
+    //   理由：skill__get_l2 的唯一用途是读技能 L2 手册；没有任何技能时它照旧出现在
+    //   清单里，等于给模型一张点了必然报错的入口，也与 BR-1「仅在配置中列出了的才可用」
+    //   相悖。技能数由调用方经 ToolFilter.skillCount 传入（chat.ts / routes/skills.ts）。
+    //   ⚠️ 缺省（无 opts 或未填 skillCount）= 0 = 不追加。这是刻意的保守方向：
+    //      漏传只会少给元工具，不会凭空空出一张工具面。
+    const hasSkill = (opts?.skillCount ?? 0) > 0;
+    if (hasSkill) {
+        const metaDef: ToolDef = {
+            type: "function",
+            function: {
+                name: L2_TOOL_VISIBLE_NAME,
+                description: L2_TOOL_DESCRIPTION,
+                parameters: l2Tool.parameters,
+            },
+        };
+        list = [...list, metaDef];
+    }
 
     // §8.7 一行可诊断日志：可见数量 + 被排除的组与原因（三种原因互相可区分）；不含任何取值
     const detail = excluded.length === 0
@@ -194,8 +207,11 @@ export function getToolDefinitions(opts?: ToolFilter): ToolDef[] {
     const selfOff = selfDisabled.length === 0
         ? ""
         : `｜组可用但组内工具全部未通过筛选：${selfDisabled.join("、")}`;
+    // [D-16 方案②] 元工具是否追加要进日志：排查「模型为什么没拿到 skill__get_l2」时，
+    //   光看「用户工具 N」看不出来，必须知道本次是「0 技能所以不追加」还是「被截掉了」。
+    const metaPart = hasSkill ? ` + 元工具 1` : ` + 元工具 0（该 agent 无可用技能）`;
     console.log(
-        `🧰 [T-VIS] 模型可见工具 ${list.length} 个（用户工具 ${userToolCount} + 元工具 1）` +
+        `🧰 [T-VIS] 模型可见工具 ${list.length} 个（用户工具 ${userToolCount}${metaPart}）` +
         `｜排除 ${excluded.length} 组：${detail}${selfOff}`,
     );
 

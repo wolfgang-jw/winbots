@@ -92,7 +92,18 @@ import {
     resolveLlm, type ResolvedLlm,
     // 【D-1】默认智能体的保留 uid：首问未选智能体时绑定它（需求 1）
     DEFAULT_AGENT_UID,
+    // ['工具/技能配置归位 setup.json'] AgentRecord → 请求级工具配置快照
+    agentToolConfigOf,
+    // [D-16 方案②] 判据容器类型：chat.ts 需要构造一个带 skillCount 的副本
+    type ToolFilter,
 } from "@/agents";
+// ['工具/技能配置归位 setup.json'] 请求级「当前 agent 工具配置」上下文。
+//   ⚠️ 任何会触发工具/技能取值（isToggleOn / readSetting / groupState / assemble）的代码
+//      都必须在 runWithAgentToolConfig(...) 内执行；漏一处 = 该处读到「全关」。
+import { runWithAgentToolConfig, emptyAgentToolConfig } from "@/infra/toolConfigContext";
+// 注册表结构：翻译 AgentRecord 时需要「有哪些目录/组/技能」
+import { getRegistry as getToolRegistry } from "@/tools/scan";
+import { getSkillRegistry as getSkillRegistryForCfg } from "@/skills";
 // [agent / 第 6 步 F3] env 不暴露 llm[]，合法 llm 名字集合必须从 env.json 直接取。
 // [agent / 第 7 步] 同一份 llm[] 也用于 agent 的 LLM 解析 —— 见 C2。
 // [BR-4 / BR-6] foldLlmName（名字比较口径）、resolveDefaultLlmName（默认组来源）
@@ -826,15 +837,55 @@ router.post("/stream", async (c) => {
             ),
         };
 
+        // ── [工具/技能配置归位 setup.json] 建立「本请求的 agent 工具配置」上下文 ──
+        //   ⚠️ 这是本次改造最关键的接线（代码文档 §4.2）：getToolDefinitions /
+        //      assembleForRequestMulti / executeTool 内部都会读 isToggleOn / readSetting /
+        //      groupState，而这些函数已改为从 AsyncLocalStorage 取「当前 agent 的配置快照」。
+        //      整段请求处理必须跑在这个上下文里，否则读到的是「全关」—— 工具与技能全部不可用。
+        //   ⚠️ 降级（degraded）与未绑定（unbound）给**空快照**（全关），与 denyAllToolFilter 同口径。
+        const toolReg = getToolRegistry();
+        const skillReg = getSkillRegistryForCfg();
+        const agentToolCfg = binding.kind === "bound"
+            ? agentToolConfigOf(
+                binding.agent,
+                [...toolReg.groups.values()].map((g) => ({
+                    id: g.id, dirPath: g.dirPath, fileBase: g.fileBase, visiblePrefix: g.visiblePrefix,
+                })),
+                [...toolReg.dirs.values()].map((d) => ({
+                    path: d.path, groups: [...d.groups], children: [...d.children],
+                })),
+                [...skillReg.skills.values()].map((s) => s.dir),
+            )
+            : emptyAgentToolConfig(boundAgentUid ?? "", "");
         // 工具定义快照（每次请求实时取，见 T-01）
+        // ⚠️ 工具定义快照必须在本上下文内取：getToolDefinitions → groupState
+        //    读的是「当前 agent 的组开关」，在上下文外恒为「全关」。
         // [skill / 升级版 §3.2] 装配在**请求边界**算一次、全请求复用；技能不再收窄工具面。
         // ✅ [skill / 升级 §1、§3.5] 工具面 = 全部可用工具 ∪ 元工具，**与开了哪些技能无关**；
         //    getToolDefinitions() 内部已按「祖先目录 AND 组开关 AND 工具自身条件」过滤，并已追加元工具。
         // [agent / 第 6 步] binding / agentToolFilter / agentSkillFilter 已在上方统一解析（第 7 步上移）。
 
-        const toolDefs = getToolDefinitions(agentToolFilter);
-        // ✅ [skill / 升级 §3.2] 多技能装配：仍是请求边界算一次、全请求复用（同一请求内不切换）。
-        const skillAssembly = assembleForRequestMulti(undefined, agentSkillFilter);
+        // ✅ [skill / 升级 §3.2] 多技能装配：请求边界算一次、全请求复用（同一请求内不切换）。
+        // ⚠️ [D-16 方案②] 顺序调整：**技能装配前移到 toolDefs 之前**。
+        //    元工具 skill__get_l2 只在「该 agent 至少 1 个可用技能」时追加，
+        //    所以算工具清单前必须先知道技能数（skillAssembly.skills.length）。
+        //    装配本身不读 toolDefs，调换无副作用。
+        const skillAssembly = runWithAgentToolConfig(
+            agentToolCfg,
+            () => assembleForRequestMulti(undefined, agentSkillFilter),
+        );
+
+        // [D-16 方案②] 把可用技能数带进判据容器：≥1 才追加元工具 skill__get_l2。
+        //   必须在 skillAssembly 装配之后、算 toolDefs 之前构造 —— 这是「工具清单依赖技能数」
+        //   的唯一依赖边。unbound（agentToolFilter 为 undefined）保持改造前口径：不接 agent、
+        //   不收窄、也不追加（undefined 透传）；degraded 已自带 skillCount: 0。
+        const toolFilterWithSkills: ToolFilter | undefined =
+            agentToolFilter === undefined
+                ? undefined
+                : { ...agentToolFilter, skillCount: skillAssembly.skills.length };
+        const toolDefs = runWithAgentToolConfig(agentToolCfg, () => getToolDefinitions(toolFilterWithSkills));
+        
+        /* [D-16] 旧的 skillAssembly 定义已上移到 toolDefs 之前，此处不留残骸。 */
 
         // [agent / 第 5 步 §3 + 第 6 步 A15] system 三段式装配：人设 → 技能声明 → 基础。
         //   人设来自**绑定时刻的快照**（binding.personaText），不是 AGENT.md 现读 —— A15「人设冻结」。
@@ -892,6 +943,11 @@ router.post("/stream", async (c) => {
         return c.body(
             new ReadableStream({
                 async start(controller) {
+                    // ⚠️ [工具/技能配置归位 setup.json] 整个流式处理体必须跑在 agentToolCfg 上下文内：
+                    //    工具轮次里 executeTool() 会实时复查 groupState / isToolEnabled（读设置项），
+                    //    这些值都从 AsyncLocalStorage 取「当前 agent 的配置」。ReadableStream 的 start()
+                    //    是**独立异步任务**，不继承外层 async 函数里的 store，故必须在此显式再包一层。
+                    return runWithAgentToolConfig(agentToolCfg, async () => {
                     const encoder = new TextEncoder();
                     // [Sprint 5.1 / US-LOG-3-FIX2] send 永不抛错：
                     //   客户端断开后 controller 已关闭，enqueue 会抛
@@ -1111,7 +1167,7 @@ router.post("/stream", async (c) => {
                                     // ✅ [升级 §5.2] 来源标识改为数组：本轮参与装配的全部技能。
                                     //    ⚠️ 仅展示与审计，**不参与任何权限判定**（N-SK-12 不变）。
                                     skills: skillAssembly.skillNames.length > 0 ? skillAssembly.skillNames : undefined,
-                                }, agentToolFilter); // [agent / 第 6 步 A10] 与 getToolDefinitions 同一判据
+                                }, toolFilterWithSkills); // [agent / 第 6 步 A10] 与 getToolDefinitions 同一判据（[D-16] 含 skillCount）
 
                                 // 推送「工具结果」事件
                                 send({
@@ -1311,9 +1367,14 @@ router.post("/stream", async (c) => {
                         } catch (closeErr) {
                             console.warn("⚠️ [Sprint 5.1] 关闭流失败（可能已关闭，忽略）:", closeErr);
                         }
-                    }
+                        // 下面这行 `}` 关闭 finally 块；
+                        // 再下面 `});` 关闭 runWithAgentToolConfig 的箭头函数（不可省：
+                        // ReadableStream.start 是独立异步任务，不继承外层 ALS store）。
+                        }
+                    });
                 },
             })
+
         );
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

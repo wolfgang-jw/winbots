@@ -2,18 +2,24 @@
  * src/infra/settings.ts
  * 动态取值层 + 工具配置门禁（规范 §7 / §8.3）。
  *
- * 取值顺序：env.json 的 tools 块（托管键） → 声明处默认值
- * 校验：写入端（routes/config.ts）与读取端（本文件）各校验一次（§3.4 双重校验）
+ * 取值顺序：**当前 agent 的配置快照**（见 ./toolConfigContext） → 声明处默认值
+ * 校验：写入端（智能体编辑弹窗 → POST /api/agents → setup.ts）与读取端（本文件）各校验一次
  * 告警：同一键只告警一次，且**不打印取值原文**（§8.7）
+ *
+ * ⚠️ 自「工具/技能配置归位 setup.json」改造起，取值来源从「env.json 的 tools 块（全局一份）」
+ *    改为「当前请求所绑 agent 的 setup.json（每 agent 一份）」。实现上的关键约定：
+ *      · 本文件的**函数签名与所有业务调用点一行未改**；
+ *      · 数据来源换成 AsyncLocalStorage 里的快照（currentAgentToolConfig()）；
+ *      · **无上下文** = 全关 / 声明里的默认值（保守降级，绝不放宽）。
+ *    详见 docs/工具技能配置归位setup与agent权限收紧-代码修改文档.md §4.2。
  *
  * 为什么不用 `Bun.env` 读：托管键**从不进进程环境**（§7.4），且「值等于默认值即删键」要求
  *   读到的是文件里的真实状态，而不是进程里累积的历史值。
- *   ⚠️ 迁移后这一条更强：env.json 根本不经过 Bun.env（方案 4.4）。
  */
 
 import { relative } from "path";
 import { fileURLToPath } from "url";
-import { managedValues } from "./envJson";
+import { currentAgentToolConfig } from "./toolConfigContext";
 import {
   DIR_SETTINGS_FILE, TOOLS_ROOT, dirSettingKey, groupSettingKey, pathSegments,
 } from "@/tools/paths";
@@ -103,47 +109,28 @@ export function defaultValueText(def: SettingDef): string {
 }
 
 /* ============================================================
- * 托管值缓存（来源 = env.json 的 tools 块，不进进程环境）
+ * 取值来源（当前 agent 的配置快照，不进进程环境）
  * ============================================================ */
 
-/**
- * 托管键缓存（工具配置的唯一取值来源）。
- *
- * ⚠️ 迁移后**不再自己维护**缓存与 stamp：全部委托给 envJson.managedValues()
- *    （它按 mtime+size 缓存 tools 块，与迁移前 statStamp 的语义逐字相同）。
- *    这里保留 `managed` 这个名字，是为了让下面所有读取点（currentSettingText / readSetting /
- *    isToggleOn / secretSettingValues）**一行都不用改**。
- */
-let managed: ReadonlyMap<string, string> = new Map();
-let loaded = false;
 const warned = new Set<string>();
 
 /**
- * 重新读取 env.json 的 tools 块（工具配置的唯一取值来源）。
- * @param force true = 忽略 mtime 缓存重新解析（保存配置后必须用 true，见 R-3）
- * @returns 是否真的重新解析了
+ * 当前上下文里的「托管键文本表」。
+ *
+ * ⚠️ 无上下文 → 空表：所有开关读到「未开启」、所有设置项回退声明里的默认值。
+ *    这是刻意的保守降级（BR-5 / AC-15）。若在业务请求里看到工具全不可用，
+ *    第一件要查的事就是「请求入口有没有包 runWithAgentToolConfig」。
+ * ⚠️ 不再有 `refreshManagedValues()`：配置来自内存里的 AgentRecord，
+ *    保存 agent 后不需要刷任何全局缓存（下次请求用新 record 构造上下文）。
  */
-export function refreshManagedValues(force = false): boolean {
-  const before = managed;
-  managed = managedValues(force);
-  const reloaded = force || !loaded || before !== managed;
-  loaded = true;
-  return reloaded;
+function currentSettings(): ReadonlyMap<string, string> {
+  return currentAgentToolConfig()?.settings ?? EMPTY_SETTINGS;
 }
+const EMPTY_SETTINGS: ReadonlyMap<string, string> = new Map<string, string>();
 
-/**
- * 确保缓存至少被解析过一次。
- * ⚠️ 不能只依赖调用方先调 refreshManagedValues()：否则在「扫描完成但还没走过请求边界」
- *    的路径上（例如用例直接调 readSetting），取值会静默落到默认值。
- */
-function ensureLoaded(): void {
-  if (!loaded) refreshManagedValues();
-}
-
-/** 当前文件中的原始文本（未解析）；配置页回显用 */
+/** 当前上下文里的原始文本（未解析）；配置页回显用 */
 export function currentSettingText(key: string): string | undefined {
-  ensureLoaded();
-  return managed.get(key);
+  return currentSettings().get(key);
 }
 
 function warnOnce(key: string, message: string): void {
@@ -164,8 +151,7 @@ export function readSetting<T>(key: string): T {
   if (!def) {
     throw new Error(`ERR_UNDECLARED_SETTING: 未声明的设置项 ${key}（不在本次扫描的注册表内）`);
   }
-  ensureLoaded();
-  const raw = managed.get(key);
+  const raw = currentSettings().get(key);
   if (raw === undefined) return def.default as unknown as T;
   const parsed = parseSettingValue(def, raw);
   if (!parsed.ok) {
@@ -207,11 +193,13 @@ export function readSettingSoft<T>(key: string, fallback: T): T {
  * ⚠️ 只枚举工具域；系统项（`LLM_API_KEY`）由调用方自己从 `env` 取 —— 系统项本来就允许平台读。
  */
 export function secretSettingValues(): string[] {
-  refreshManagedValues();
+  // ⚠️ [BR-5] 只返回**当前 agent 自己**的密钥：不再是「文件里所有 secret 项」。
+  //    A agent 的密钥不会出现在 B agent 的请求上下文里（上下文隔离由 ALS 保证）。
+  const bag = currentSettings();
   const out: string[] = [];
   for (const [key, def] of getRegistry().settingDefs) {
     if (def.secret !== true) continue;
-    const raw = managed.get(key);
+    const raw = bag.get(key);
     if (raw === undefined || raw === "") continue;
     // 只收「解析成功」的值：不合法值按 §7.4 已回退默认值，不该拿默认值去替换正文
     const parsed = parseSettingValue(def, raw);
@@ -222,25 +210,34 @@ export function secretSettingValues(): string[] {
 
 /* ============================================================
  * 开关与门禁（§8.2 / §8.3）
- *   取值顺序：`env.json` 的 `tools` 块里的显式值 → 初始默认 false（§8.2）。
- *   ⚠️ 没有「继承旧配置」这一层：旧启用开关在迁移时已被删除（§9.2），升级后的初始态与
- *      全新安装完全一致。这是规范的要求，理由与取舍见 §7.2。
+ *   取值顺序：**当前 agent 的配置快照**里是否包含该 toggleKey → 否则视为关闭。
+ *
+ *   ⚠️ 语义变更（需求 BR-1 / BR-2，「显式列举才可用」）：
+ *       · 工具与技能同口径：未列出 / null / [] → 全部不可用；
+ *       · 没有「全局总闸」这一层（env.json 的 tools 块已废除）；
+ *       · 无请求上下文（后台定时器 / 单测）→ 一律关闭。
  * ============================================================ */
 
 /**
- * 单个开关的生效值：`env.json` 的 `tools` 块里的显式值 → 初始默认 false（§8.2）。
+ * 单个开关的生效值：当前 agent 的配置快照里**显式包含**该 toggleKey 才为 true。
  * 目录根（key === ""）没有开关，恒为可用。
  */
 export function isToggleOn(key: string): boolean {
   if (key === "") return true;              // 根目录无开关
-  ensureLoaded();
-  const raw = managed.get(key);
-  if (raw === undefined) return false;      // §8.2：初始态全部关闭，没有「继承旧配置」这一层
-  const v = raw.trim().toLowerCase();
-  if (v === "true") return true;
-  if (v === "false") return false;
-  warnOnce(key, "开关取值不合法（应为 true / false），按「关闭」处理");
-  return false;
+  return currentAgentToolConfig()?.enabledToggles.has(key) ?? false;
+}
+
+/**
+ * 技能开关的生效值：与工具侧**分开取**（技能键是 SKILLON__，工具键是 TOOLON__）。
+ *
+ * ⚠️ 为什么技能不共用 `isToggleOn`：两套键空间本来就独立（N-SK-5），
+ *    而 `enabledToggles`（工具）与 `enabledSkillToggles`（技能）分别由
+ *    setup.json 的 `tools.allow` 与 `skills.list` 翻译而来，必须各取各的。
+ * ⚠️ `skills/assemble.ts` 的 `isToggleOn` 注入点应换成本函数（见 chat.ts / routes/skills.ts）。
+ */
+export function isSkillToggleOn(key: string): boolean {
+  if (key === "") return true;
+  return currentAgentToolConfig()?.enabledSkillToggles.has(key) ?? false;
 }
 
 /** 目录链（自身 + 全部祖先）是否全开 */
