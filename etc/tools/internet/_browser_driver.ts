@@ -97,6 +97,13 @@ export interface PageSignature {
 export interface LaunchOptions {
   headless: boolean;
   profileDir: string;
+  /**
+   * [FIX-LOCALHOST] 启动时定格的「阻断私网/回环」策略值。
+   * 请求层判定发生在 CDP 异步回调中（已脱离 ALS 上下文），若届时再 `B.get()` 会回退默认值
+   * （block_private_net 默认 true），使 setup.json 的 false 失效、localhost 被一律阻断。
+   * 因此由调用方在 launch 时把实时配置快照传进来，驱动只用这份快照。
+   */
+  blockPrivateNet?: boolean;
   /** 每个请求的判定回调（请求层拦截，BR-52） */
   judgeRequest?: (url: string) => Promise<{ allow: boolean; reason?: string }>;
   allowDownload: boolean;
@@ -1095,7 +1102,11 @@ class ChromiumDriver implements BrowserDriver {
       )
       .catch(() => undefined);
     // 粗粒度兜底：覆盖请求暂停事件覆盖不到的资源类型（WebSocket 等，已知缺口）
-    if (B.get<boolean>("block_private_net")) {
+    // [FIX-LOCALHOST] 用 launch 时的快照，而非此处的实时 B.get()：
+    //   enableTabPolicies 会在每个标签（含弹窗）异步初始化时调用，同样可能脱离 ALS 上下文，
+    //   回退默认 true 会把回环地址塞进 setBlockedURLs，浏览器直接显示 ERR_BLOCKED_BY_CLIENT。
+    const blockPrivateNet = this.launchOpts?.blockPrivateNet ?? B.get<boolean>("block_private_net");
+    if (blockPrivateNet) {
       await cdp
         .send(
           "Network.setBlockedURLs",

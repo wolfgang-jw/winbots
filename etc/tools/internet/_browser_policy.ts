@@ -266,10 +266,25 @@ async function resolveCached(host: string): Promise<string[] | null> {
 }
 
 /**
+ * 请求层判定时用到的策略快照（启动时定格）。
+ * [FIX-LOCALHOST] 请求层判定发生在 CDP 的 `Fetch.requestPaused` 异步回调里，
+ * 此时**已脱离原始请求的 ALS 上下文**，`B.get()` 会回退到声明默认值（block_private_net 默认 true），
+ * 导致 setup.json 里配的 `block_private_net:false` 在请求层失效、localhost/回环被一律阻断
+ * （浏览器表现为 ERR_BLOCKED_BY_CLIENT）。因此把策略值在 launch 时快照，请求层只用快照。
+ */
+export interface JudgePolicy {
+  /** 显式覆盖 block_private_net；undefined 时回退实时取值（兼容旧调用/单测） */
+  blockPrivateNet?: boolean;
+}
+
+/**
  * [BR-52] 逐个请求判定（判定顺序即设计 §10.1）。
  * data/blob/about 放行（页面内资源）；其余协议拒绝。
+ *
+ * [FIX-LOCALHOST] `policy.blockPrivateNet` 存在即以此为准（启动时快照），
+ * 避免异步回调用 ALS 取不到值时回退到错误的默认 true。
  */
-export async function judgeRequestUrl(raw: string): Promise<Verdict> {
+export async function judgeRequestUrl(raw: string, policy?: JudgePolicy): Promise<Verdict> {
   let u: URL;
   try {
     u = new URL(raw);
@@ -282,9 +297,12 @@ export async function judgeRequestUrl(raw: string): Promise<Verdict> {
 
   const host = u.hostname.toLowerCase();
 
+  // [FIX-LOCALHOST] 快照优先；快照缺省才回退实时取值（兼容旧调用/单测）
+  const blockPrivateNet = policy?.blockPrivateNet ?? B.get<boolean>("block_private_net");
+
   // IP 字面量：无需 DNS
   if (isIpLiteral(host)) {
-    if (B.get<boolean>("block_private_net") && isPrivateAddress(host)) return deny("ip_private");
+    if (blockPrivateNet && isPrivateAddress(host)) return deny("ip_private");
     return ALLOW;
   }
 
@@ -294,7 +312,7 @@ export async function judgeRequestUrl(raw: string): Promise<Verdict> {
   if (allow.length > 0 && !matchHostList(host, allow)) return deny("not_allowlisted");
 
   // 私有网段阻断：解析主机名后判定（DNS 重绑定只能尽力，登记为已知缺口）
-  if (B.get<boolean>("block_private_net")) {
+  if (blockPrivateNet) {
     const ips = await resolveCached(host);
     if (ips && ips.some((ip) => isPrivateAddress(ip))) return deny("dns_private");
   }

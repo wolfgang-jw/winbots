@@ -351,13 +351,20 @@ async function createSession(key: string): Promise<CreateResult> {
   registerProcessHooks();
   startSweeper();
 
+  // [FIX-LOCALHOST] 在 launch 这一刻把「阻断私网」策略定格：
+  //   请求层判定跑在 CDP 的 Fetch.requestPaused 异步回调里，此时 ALS 请求上下文已丢失，
+  //   回调内再 B.get() 会回退到声明默认值（block_private_net 默认 true），
+  //   使 setup.json 里的 false 失效、localhost/127.0.0.1 被一律拦成 ERR_BLOCKED_BY_CLIENT。
+  //   这里实时读一次并作为快照下传，回调只依赖这份快照。
+  const blockPrivateNet = B.get<boolean>("block_private_net");
   const launch = await driver.launch({
     headless: B.get<boolean>("headless"),
     profileDir,
     allowDownload: downloadAllowed(),
     allowUpload: uploadAllowed(),
+    blockPrivateNet,
     judgeRequest: async (url: string) => {
-      const v = await judgeRequestUrl(url);
+      const v = await judgeRequestUrl(url, { blockPrivateNet });
       return { allow: !v.blocked, reason: v.blocked ? reasonLabel(v.reason) : "" };
     },
     onBlockedRequest: (url, reason) => {
