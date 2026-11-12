@@ -186,7 +186,9 @@ function defaultOf(key: string): string {
  * 默认值来源唯一：CONFIG_KEYS[].defaultValue（方案 2.2-1）；此处只做「字符串 → 强类型」搬运。
  */
 registerEnvJsonDefaults({
-  app: { port: Number(defaultOf("APP_PORT")) },
+  // [BR-4] defaultLlm 的**注册值只是占位**：loadEnvJson 显式忽略它（缺失即保留空串，
+  //   由 assertRequired 抛错拒绝启动，D-1 选 (a)）。填 "main" 只为满足 EnvJson 类型。
+  app: { port: Number(defaultOf("APP_PORT")), defaultLlm: "main" },
   llm: [{
     name: "main",                                    // 第零章 P3：不用保留名 default
     base: defaultOf("LLM_API_BASE"),

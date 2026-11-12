@@ -187,6 +187,10 @@
                 <input type="text" id="agent-editor-path" class="agent-editor__path" placeholder="例：ops/devops" autocomplete="off">
             </div>
             <div class="config-item__error" id="agent-editor-error" hidden></div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="agent-editor-llm">LLM 组（必填；下拉优先于 setup.json 里的 llm 字段）</label>
+                <select id="agent-editor-llm" class="agent-editor__path"></select>
+            </div>
             <div class="agent-editor__cols">
                 <div class="agent-editor__col">
                     <label class="agent-editor__label" for="agent-editor-body">AGENT.md（人格正文）</label>
@@ -201,6 +205,57 @@
             <div class="skill-preview__footer">
                 <button type="button" class="approval-modal__cancel" id="agent-editor-cancel">取消</button>
                 <button type="button" class="approval-modal__submit" id="agent-editor-save">保存</button>
+            </div>
+        </div>
+    </div>
+    <!-- ==================== 历史视图（US-4.8） ==================== -->
+    <div class="approval-modal agent-editor-modal" id="llm-editor-modal" role="dialog" aria-modal="true"
+         aria-labelledby="llm-editor-title" hidden>
+        <div class="approval-modal__backdrop" data-llm-close="1"></div>
+        <div class="approval-modal__panel agent-editor__panel">
+            <div class="approval-modal__title" id="llm-editor-title">编辑 LLM 组</div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-name">组名（name，<b>不可修改</b>；新建时可填）</label>
+                <input type="text" id="llm-editor-name" class="agent-editor__path" autocomplete="off" placeholder="例：main">
+            </div>
+            <div class="config-item__error" id="llm-editor-error" hidden></div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-base">接口地址（base，必填）</label>
+                <input type="text" id="llm-editor-base" class="agent-editor__path" autocomplete="off" placeholder="https://api.deepseek.com">
+            </div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-model">模型（model，必填）</label>
+                <input type="text" id="llm-editor-model" class="agent-editor__path" autocomplete="off" placeholder="deepseek-chat">
+            </div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-key">密钥（key；编辑时留空 = 不修改，不回显原文）</label>
+                <input type="password" id="llm-editor-key" class="agent-editor__path" autocomplete="new-password">
+            </div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-thinkingMode">thinkingMode（none / effort / thinking / both；留空=默认）</label>
+                <select id="llm-editor-thinkingMode" class="agent-editor__path">
+                    <option value="">（默认）</option>
+                    <option value="none">none</option>
+                    <option value="effort">effort</option>
+                    <option value="thinking">thinking</option>
+                    <option value="both">both</option>
+                </select>
+            </div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-thinking">thinking（是否下发 thinking 字段）</label>
+                <select id="llm-editor-thinking" class="agent-editor__path">
+                    <option value="">（默认）</option>
+                    <option value="true">true</option>
+                    <option value="false">false</option>
+                </select>
+            </div>
+            <div class="agent-editor__pathrow">
+                <label class="agent-editor__label" for="llm-editor-reasoningEffort">reasoningEffort（如 high / low；留空=默认）</label>
+                <input type="text" id="llm-editor-reasoningEffort" class="agent-editor__path" autocomplete="off" placeholder="high">
+            </div>
+            <div class="skill-preview__footer">
+                <button type="button" class="approval-modal__cancel" id="llm-editor-cancel">取消</button>
+                <button type="button" class="approval-modal__submit" id="llm-editor-save">保存</button>
             </div>
         </div>
     </div>

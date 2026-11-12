@@ -95,7 +95,8 @@ import {
 } from "@/agents";
 // [agent / 第 6 步 F3] env 不暴露 llm[]，合法 llm 名字集合必须从 env.json 直接取。
 // [agent / 第 7 步] 同一份 llm[] 也用于 agent 的 LLM 解析 —— 见 C2。
-import { loadEnvJson } from "@/infra/envJson";
+// [BR-4 / BR-6] foldLlmName（名字比较口径）、resolveDefaultLlmName（默认组来源）
+import { loadEnvJson, foldLlmName, resolveDefaultLlmName } from "@/infra/envJson";
 import {
     generateSessionId,
     isValidSessionId,
@@ -444,13 +445,17 @@ router.post("/stream", async (c) => {
         //   ⚠️ 扫描失败**不能**让请求 500（A17）：ensureAgentRegistry 内部已 catch 扫描错误，
         //      但 loadEnvJson() 在 env.json 损坏时会抛错，必须在外面兜住。
         try {
-            const llmGroups = loadEnvJson().llm;
-            const llmNames = new Set(llmGroups.map((g) => g.name));
+            const envJson = loadEnvJson();
+            const llmGroups = envJson.llm;
+            // [BR-6] 名字集合按**折叠后**构建，与 resolveLlm 判据 3 / findLlmIndex 同口径。
+            //   只改 resolveLlm 而不改这里，setup 校验阶段就会判 unknown_llm，根本到不了 resolveLlm。
+            const llmNames = new Set(llmGroups.map((g) => foldLlmName(g.name)));
             await ensureAgentRegistry({
-                isKnownLlm: (n) => llmNames.has(n),
+                isKnownLlm: (n) => llmNames.has(foldLlmName(n)),
                 mintUid: true,   // 运行期允许补写 uid（D-J 一次性迁移）
-                // 【D-1】默认智能体的 llm 字段取 llm[0].name（需求文档 A-1.7）
-                defaultLlmName: llmGroups[0]?.name ?? null,
+                // [BR-4] 默认智能体的 llm 字段取**默认组名**（app.defaultLlm），不再取 llm[0].name；
+                //   保留原始大小写写入（折叠只用于比较）。
+                defaultLlmName: resolveDefaultLlmName(envJson),
             });
         } catch (e) {
             console.warn(
@@ -679,7 +684,32 @@ router.post("/stream", async (c) => {
         //      故本块整体上移到「请求构造」之前（仍在请求边界算一次，与 while 循环无关）。
         const binding = resolveBinding(boundAgentUid, boundPersonaSnapshot, getAgentRegistry());
         if (binding.kind === "degraded") {
-            // A17：降级**不报错、不中断**，只告警一次
+            /* [D-3] agent 的 LLM 引用失效 → 立即不可用并提示，**不走 A17 静默降级**。
+             *
+             * 为什么不沿用降级：降级后会用默认组的配置继续回答，用户看不出
+             * 「我选的 agent 其实没生效」。D-3 已拍板为「立即不可用并提示」。
+             *
+             * 与 BR-2 的分工：
+             *   - BR-2（下方 llmUnresolved）处理「agent 仍 bound，但 llm 名字没命中」
+             *     —— 正常流程不会出现（scan 阶段就判 invalid 了），属防御；
+             *   - 本处处理「agent 已被判 invalid（unknown_llm / 缺 llm），绑定降级」
+             *     —— 这才是会话已绑定后 agent 事后失效的真实路径。
+             */
+            if (binding.llmInvalid) {
+                console.warn(`❌ [agent] agent 的 LLM 引用失效，已拒绝本次请求：${binding.reason}`);
+                return c.json(
+                    {
+                        error:
+                            `该会话所选智能体的 LLM 引用已失效，本次请求已拒绝。` +
+                            `原因：${binding.reason}。` +
+                            `请到配置页修正该智能体的 LLM 引用，或补建对应 LLM 组；` +
+                            `如需继续使用其它智能体，请新建会话。`,
+                        code: "agent_llm_unresolved",
+                    },
+                    409,
+                );
+            }
+            // A17：其余降级**不报错、不中断**，只告警一次
             console.warn(`⚠️  [agent] ${binding.reason}`);
         }
         // A10：清单与执行必须同口径。降级时工具全拒（元工具除外，复用 denyAllToolFilter）。
@@ -713,22 +743,57 @@ router.post("/stream", async (c) => {
             thinkingMode: env.LLM_THINKING_MODE,
             fallback: false,
         };
+        /** [BR-2] agent 指名了 LLM 组但解析不到 → 本次请求必须拒绝（不得沿用 env 兜底值） */
+        let llmUnresolved = false;
         try {
-            const r = resolveLlm(loadEnvJson().llm, llmRefOfBinding);
+            const groups = loadEnvJson().llm;
+            const r = resolveLlm(groups, llmRefOfBinding);
             if (r) {
                 agentLlm = {
                     ...r,
                     // 缺省值单一来源（env.ts §3.2）：resolved 未给出时用 env 兜
                     thinkingMode: r.thinkingMode || env.LLM_THINKING_MODE,
                 };
+            } else {
+                /**
+                 * [BR-2] `resolveLlm` 返回 null 有两种成因，**必须分开处理**：
+                 *   a) `llm[]` 为空 → 环境级降级，沿用 env.LLM_* 是合法的（A17 精神）；
+                 *   b) agent **指名**了组但没命中 → 该 agent 的 LLM 失效，
+                 *      **不能**拿 env 兜底继续请求（那等于 BR-2 没生效）。
+                 *
+                 * 判据用 `llmRefOfBinding`：只有 bound 且写了 llm 才有值（见上文赋值）。
+                 * 未绑定会话（llmRefOfBinding === null）与「名字为空」的等价路径
+                 * 走的是 resolveLlm 判据 2，返回的是对象而非 null，天然不受影响（BR-3）。
+                 */
+                if (llmRefOfBinding !== null && llmRefOfBinding.trim() !== "" && groups.length > 0) {
+                    llmUnresolved = true;
+                }
             }
         } catch (e) {
+            // env.json 损坏导致 loadEnvJson 抛错：沿用 env 的扁平字段（A17：不中断会话）
             console.warn(
                 `⚠️  [llm] 解析失败，本轮沿用 env 的默认 LLM：` +
                 `${e instanceof Error ? e.message : String(e)}`,
             );
         }
+        if (llmUnresolved) {
+            // [BR-2] 请求前拒绝：该 agent 的 llm 指向了不存在的组，不回退、不静默。
+            console.warn(
+                `❌ [llm] agent「${boundAgentUid ?? "?"}」引用的 LLM 组「${llmRefOfBinding}」不存在，` +
+                `已拒绝本次请求（不回退到任何组）`,
+            );
+            return c.json(
+                {
+                    error:
+                        `该智能体引用的 LLM 组「${llmRefOfBinding}」在 env.json 的 llm[] 中不存在，` +
+                        `已拒绝本次请求。请到配置页修正该智能体的 LLM 引用，或补建对应 LLM 组。`,
+                    code: "agent_llm_unresolved",
+                },
+                409,
+            );
+        }
         if (agentLlm.fallback) {
+            // [BR-2] fallback 恒为 false（回退路径已删除）；保留分支仅为兼容既有日志格式。
             console.warn(
                 `⚠️  [llm] 本轮已回退到「${agentLlm.name ?? "(未命名)"}」（agent 指定的名字未找到）`,
             );

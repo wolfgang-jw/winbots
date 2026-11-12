@@ -21,7 +21,11 @@ export interface AgentSetup {
   name: string;
   title: string;
   description: string;
-  /** setup.json 的 llm，可空；非空时必须在注入的合法名字集合里 */
+  /**
+   * setup.json 的 llm。**解析期必填**（BR-1）：缺少 / 空串 / 指向不存在的组 → 该 agent invalid。
+   * 类型保留 `string | null`：`null` 仍表示「会话未绑定 agent」这一会话层语义
+   * （binding.ts 的 unbound 路径），**不代表**「agent 没写 llm」。
+   */
   llmRef: string | null;
   /**
    * 技能白名单模式（§3.1）。缺省 "allow"。

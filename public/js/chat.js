@@ -1201,7 +1201,10 @@
                         renderChatAgentOptions();
                     }
                     // [agent / R-1] 服务端 A14 锁定语义：已绑定会话收到不同 uid 返回 409
-                    if (errData.error === "agent_locked" || response.status === 409) {
+                    // ⚠️ 必须按 code 判别，不能按 status：409 还用于
+                    //    agent_llm_unresolved（LLM 引用失效，见 D-3），那条要原样展示错误文案，
+                    //    且**不能**锁死下拉（用户修好配置后应能继续用）。
+                    if (errData.code === "agent_locked") {
                         errorMsg = "本会话已绑定其他智能体，无法切换（请新建会话）";
                         state.chatAgentLocked = true;
                         // 回滚到服务端实际绑定的 uid，避免下拉停在一个未生效的值上
@@ -2043,6 +2046,24 @@
         preview: null,
     };
 
+    /**
+     * [FR-LLM-1~6] LLM 组列表状态。
+     *
+     * ⚠️ 与 configState 的「草稿-保存」模式**不同**：LLM 组是**即时保存**
+     *    （与上方 agent 区一致）。原因：env.json 的 llm[] 是多组数组，
+     *    而 configState 的扁平 items 只有一份、且只能落在默认组，
+     *    无法表达「第 N 组」。故这一区沿用 agent 区的范式，独立状态 + 即时落盘。
+     *    ⚠️ 页面上必须显式提示「本区改动即时生效」，避免用户以为要点底部保存。
+     */
+    const llmState = {
+        list: [],          // [{ name, base, model, thinkingMode, thinking, reasoningEffort, keyMask, hasKey, isDefault }]
+        defaultLlm: "",    // 默认组名（后端返回，前端不得按下标推断）
+        editing: null,     // 正在编辑的组名；null = 浮层关闭
+        loading: false,
+        error: "",
+        hint: "",
+    };
+
     async function loadConfigView() {
         const box = document.getElementById("config-form");
         if (!box) return;
@@ -2088,8 +2109,11 @@
         const groups = [...new Set((configState.items || []).map((it) => it.group))];
 
         box.innerHTML = groups.map((g) => {
+            // [FR-LLM-1] LLM 组改为独立列表（renderLlmSection），不再走扁平项
+            if (g === "llm") return "";
             const items = (configState.items || []).filter((it) => it.group === g);
             if (items.length === 0) return "";
+            // （LLM 组的独立列表由 renderLlmSection 渲染）
             return `
               <section class="config-section">
                 <h3 class="config-section__title">${escapeHtml(titles[g] || g)}</h3>
@@ -2101,10 +2125,11 @@
         // [C-11 / §11 / §10.2] 工具树与遗留键区块接在系统项之后
         box.insertAdjacentHTML(
             "beforeend",
-            renderToolSection() + renderSkillSection() + renderAgentSection() + renderOrphanSection(),
+            renderToolSection() + renderSkillSection() + renderLlmSection() + renderAgentSection() + renderOrphanSection(),
         );
         bindToolTreeEvents(box);
         bindSkillTreeEvents(box);
+        bindLlmSectionEvents(box);     // [FR-LLM-1~6] LLM 组列表
         bindAgentSectionEvents(box);   // [agent / 第 9 步] 第四段：智能体列表
 
         box.querySelectorAll("[data-config-key]").forEach((el) => {
@@ -3369,6 +3394,322 @@
     //    switchView("config") 会同步触发 renderAgentSection()，若在此处声明，
     //    首次以 ?view=config 加载时会撞上 const 的 TDZ 而抛 ReferenceError。
 
+    /* ============================================================
+     * [FR-LLM-1~6] LLM 组列表（即时保存，与 agent 区同范式）
+     *
+     *  数据源：GET  /api/config/llm            列表（不含密钥原文，只给掩码）
+     *  写操作：PUT  /api/config/llm/:name      按组名改（未命中 404，不回退）
+     *         DELETE /api/config/llm/:name    被引用 / 默认组 / 最后一组 → 拒绝
+     *  新建： 前端用「同名字段 + PUT 前先确认」不可行（PUT 只能改已存在的组），
+     *         故新建走「POST /api/config/llm」——见下方 llmCreate()。
+     * ============================================================ */
+
+    /** 第五段：LLM 组列表 */
+    function renderLlmSection() {
+        return `<section class="config-section" id="config-llm-section">
+          <h3 class="config-section__title">LLM 配置（<code>env.json</code> 的 <code>llm[]</code>；每个组可被不同 agent 引用）</h3>
+          <div class="config-item__desc" id="config-llm-stats">
+            本区改动<b>即时保存</b>（与下方智能体区一致），不需要点页面底部的保存按钮。
+          </div>
+          <div class="config-item__error" id="config-llm-fields" hidden></div>
+          <div class="agent-toolbar">
+            <button type="button" class="config-btn" id="config-llm-new">＋ 新建 LLM 组</button>
+            <button type="button" class="config-btn" id="config-llm-reload">🔄 刷新列表</button>
+            <span class="agent-toolbar__hint" id="config-llm-hint"></span>
+          </div>
+          <div id="config-llm-list"><div class="config-loading">加载中…</div></div>
+        </section>`;
+    }
+
+    function bindLlmSectionEvents(box) {
+        const newBtn = box.querySelector("#config-llm-new");
+        if (newBtn) newBtn.addEventListener("click", openLlmEditorNew);
+        const reloadBtn = box.querySelector("#config-llm-reload");
+        if (reloadBtn) reloadBtn.addEventListener("click", () => loadLlmList());
+        loadLlmList();
+    }
+
+    /** 拉取 LLM 组列表并重画 */
+    async function loadLlmList() {
+        const listBox = document.getElementById("config-llm-list");
+        if (!listBox) return;
+        llmState.loading = true;
+        listBox.innerHTML = '<div class="config-loading">加载中…</div>';
+        try {
+            const resp = await fetch("/api/config/llm", { cache: "no-store" });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            llmState.list = data.items || [];
+            llmState.defaultLlm = data.defaultLlm || "";
+            llmState.error = "";
+            renderLlmList(listBox);
+            updateLlmStatsText();
+        } catch (e) {
+            llmState.error = String(e.message || e);
+            listBox.innerHTML = `<div class="config-error">加载 LLM 组失败：${escapeHtml(llmState.error)}</div>`;
+        } finally {
+            llmState.loading = false;
+        }
+    }
+
+    /** 重画 LLM 组列表 */
+    function renderLlmList(listBox) {
+        if (!llmState.list || llmState.list.length === 0) {
+            listBox.innerHTML = `<div class="config-item__desc">
+              还没有任何 LLM 组。至少需要 1 组，否则智能体无法引用、服务也无法启动。
+            </div>`;
+            return;
+        }
+        /** 默认组指向不存在的组时后端返回空串：明确提示，而不是静默当成「没有默认组」 */
+        const defect = llmState.defaultLlm
+            ? ""
+            : `<div class="tool-node__warn">⚠️ 默认 LLM 组（<code>app.defaultLlm</code>）未设置或指向不存在的组，服务将无法启动。请检查 env.json 的 app 段。</div>`;
+
+        const rows = llmState.list.map((g) => {
+            const badge = g.isDefault
+                ? '<span class="config-badge config-badge--set">默认组</span>'
+                : "";
+            const keyBadge = g.hasKey
+                ? `<span class="config-badge">密钥已配置 ${escapeHtml(g.keyMask)}</span>`
+                : '<span class="config-badge config-badge--shadow">密钥未配置</span>';
+            const canDelete = !g.isDefault && llmState.list.length > 1;
+            return `
+              <div class="agent-row" data-llm-name="${escapeHtml(g.name)}">
+                <div class="agent-row__main">
+                  <div class="agent-row__title">
+                    <code>${escapeHtml(g.name)}</code>
+                    ${badge}${keyBadge}
+                  </div>
+                  <div class="agent-row__meta">
+                    模型 ${escapeHtml(g.model || "—")} ·
+                    接口 ${escapeHtml(g.base || "—")} ·
+                    thinkingMode ${escapeHtml(g.thinkingMode || "（默认）")} ·
+                    thinking ${g.thinking ? "开" : "关"} ·
+                    effort ${escapeHtml(g.reasoningEffort || "（默认）")}
+                  </div>
+                </div>
+                <div class="agent-row__actions">
+                  <button type="button" class="config-btn config-btn--sm" data-llm-edit="${escapeHtml(g.name)}">编辑</button>
+                  <button type="button" class="config-btn config-btn--sm config-btn--danger" data-llm-del="${escapeHtml(g.name)}"${canDelete ? "" : ' disabled title="默认组或最后一个组不可删除"'}>删除</button>
+                </div>
+              </div>`;
+        }).join("");
+
+        listBox.innerHTML = defect + rows;
+
+        listBox.querySelectorAll("[data-llm-edit]").forEach((btn) => {
+            btn.addEventListener("click", () => openLlmEditor(btn.dataset.llmEdit));
+        });
+        listBox.querySelectorAll("[data-llm-del]").forEach((btn) => {
+            btn.addEventListener("click", () => deleteLlmGroup(btn.dataset.llmDel));
+        });
+    }
+
+    function updateLlmStatsText() {
+        const el = document.getElementById("config-llm-stats");
+        if (!el) return;
+        const n = (llmState.list || []).length;
+        const d = llmState.defaultLlm ? `默认组 <code>${escapeHtml(llmState.defaultLlm)}</code>` : "默认组未设置";
+        el.innerHTML = `共 ${n} 个 LLM 组（${d}）。本区改动<b>即时保存</b>，不需要点页面底部的保存按钮。`;
+    }
+
+    function setLlmHint(text) {
+        const hint = document.getElementById("config-llm-hint");
+        if (hint) hint.textContent = text || "";
+        // 成功提示与错误提示互斥：写成功时必须清掉上一次的错误块，否则两条消息同时残留
+        if (text) {
+            const err = document.getElementById("config-llm-fields");
+            if (err) { err.hidden = true; err.textContent = ""; }
+        }
+    }
+
+    function showLlmError(text) {
+        // 报错时清掉上一次的成功提示，避免「已新建 X」与「保存失败」并排显示
+        const hintEl = document.getElementById("config-llm-hint");
+        if (hintEl) hintEl.textContent = "";
+        const modal = document.getElementById("llm-editor-modal");
+        const inModal = modal && !modal.hidden;
+        const p = document.getElementById("llm-editor-error");
+        const el = document.getElementById("config-llm-fields");
+        if (inModal) {
+            if (p) { p.hidden = false; p.textContent = text; }
+            if (el) { el.hidden = true; el.textContent = ""; }
+        } else {
+            if (el) { el.hidden = false; el.textContent = text; }
+            if (p) { p.hidden = true; p.textContent = ""; }
+        }
+    }
+
+    /** 打开编辑浮层（组名只读，FR-LLM-4 / AC-11） */
+    function openLlmEditor(name) {
+        const g = (llmState.list || []).find((x) => x.name === name);
+        if (!g) { showLlmError(`没有名为「${name}」的 LLM 组`); return; }
+        llmState.editing = name;
+        renderLlmEditor(g);
+    }
+
+    /** 新建：给一个空表单，name 可填 */
+    function openLlmEditorNew() {
+        llmState.editing = null;
+        renderLlmEditor(null);
+    }
+
+    function renderLlmEditor(g) {
+        const modal = document.getElementById("llm-editor-modal");
+        if (!modal) return;
+        const isNew = !g;
+        const titleEl = document.getElementById("llm-editor-title");
+        const nameEl = document.getElementById("llm-editor-name");
+        const baseEl = document.getElementById("llm-editor-base");
+        const modelEl = document.getElementById("llm-editor-model");
+        const modeEl = document.getElementById("llm-editor-thinkingMode");
+        const thinkingEl = document.getElementById("llm-editor-thinking");
+        const effortEl = document.getElementById("llm-editor-reasoningEffort");
+        const keyEl = document.getElementById("llm-editor-key");
+        const errEl = document.getElementById("llm-editor-error");
+
+        if (titleEl) titleEl.textContent = isNew ? "新建 LLM 组" : `编辑 LLM 组：${g.name}`;
+        if (errEl) { errEl.hidden = true; errEl.textContent = ""; }
+        // 组名：编辑态只读（AC-11 不支持改名）；新建态可填
+        if (nameEl) {
+            nameEl.value = isNew ? "" : g.name;
+            nameEl.readOnly = !isNew;
+            nameEl.disabled = !isNew;
+        }
+        if (baseEl) { baseEl.value = isNew ? "" : (g.base || ""); }
+        if (modelEl) { modelEl.value = isNew ? "" : (g.model || ""); }
+        if (modeEl) {
+            modeEl.value = isNew ? "" : (g.thinkingMode || "");
+        }
+        if (thinkingEl) { thinkingEl.value = isNew ? "" : String(g.thinking === true); }
+        if (effortEl) { effortEl.value = isNew ? "" : (g.reasoningEffort || ""); }
+        // 密钥：编辑态留空 = 不修改；新建态必填。都不回显原文（FR-LLM-3）
+        if (keyEl) {
+            keyEl.value = "";
+            keyEl.placeholder = isNew
+                ? "必填：该组的 API Key"
+                : (g.hasKey ? `已配置（${g.keyMask}）；留空表示不修改` : "未配置：请填写");
+        }
+
+        modal.hidden = false;
+        if (isNew && nameEl) nameEl.focus();
+    }
+
+    function closeLlmEditor() {
+        const modal = document.getElementById("llm-editor-modal");
+        if (modal) modal.hidden = true;
+        llmState.editing = null;
+    }
+
+    /** 保存：新建走 POST，编辑走 PUT（名称大小写不敏感由后端处理） */
+    async function saveLlmEditor() {
+        const val = (id) => {
+            const el = document.getElementById(id);
+            return el ? String(el.value) : "";
+        };
+        const name = val("llm-editor-name").trim();
+        const base = val("llm-editor-base").trim();
+        const model = val("llm-editor-model").trim();
+        const thinkingMode = val("llm-editor-thinkingMode");
+        const thinkingRaw = val("llm-editor-thinking");
+        const reasoningEffort = val("llm-editor-reasoningEffort").trim();
+        const key = val("llm-editor-key").trim();
+        const isNew = !llmState.editing;
+
+        if (!name) { showLlmError("请填写组名"); return; }
+        if (!base) { showLlmError("接口地址（base）不能为空"); return; }
+        if (!model) { showLlmError("模型名（model）不能为空"); return; }
+        if (isNew && !key) { showLlmError("新建 LLM 组必须填写密钥"); return; }
+
+        const payload = { base, model };
+        if (thinkingMode !== "") payload.thinkingMode = thinkingMode;
+        if (thinkingRaw === "true" || thinkingRaw === "false") payload.thinking = thinkingRaw === "true";
+        if (reasoningEffort !== "") payload.reasoningEffort = reasoningEffort;
+        if (key !== "") payload.key = key;      // 编辑态留空 = 不修改
+
+        try {
+            let resp;
+            if (isNew) {
+                resp = await fetch("/api/config/llm", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ name, ...payload }),
+                });
+            } else {
+                resp = await fetch(`/api/config/llm/${encodeURIComponent(llmState.editing)}`, {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+            }
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) throw new Error(data.error || ("HTTP " + resp.status));
+            closeLlmEditor();
+            await loadLlmList();
+            const what = (data.changed || []).join("、") || "已保存";
+            setLlmHint(isNew ? `已新建 ${name}` : `已保存 ${data.name || llmState.editing}（${what}）`);
+        } catch (e) {
+            showLlmError(`保存失败：${String(e.message || e)}`);
+        }
+    }
+
+    /** 删除：默认组 / 最后一组 / 被 agent 引用 → 后端拒绝并把原因展示出来 */
+    async function deleteLlmGroup(name) {
+        const okConfirm = await WinbotsConfirm({
+            source: "delete-llm",
+            title: "确认删除 LLM 组",
+            message: `将删除 LLM 组「${name}」。\n\n若有智能体正在引用它，删除会被拒绝。`,
+            okText: "删除",
+            cancelText: "取消",
+            danger: true,
+        });
+        if (!okConfirm) return;
+        try {
+            const resp = await fetch(`/api/config/llm/${encodeURIComponent(name)}`, { method: "DELETE" });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) {
+                const agents = Array.isArray(data.agents) && data.agents.length > 0
+                    ? `\n引用它的智能体：${data.agents.map((a) => `${a.name}（${a.path}）`).join("、")}`
+                    : "";
+                throw new Error(`${data.error || ("HTTP " + resp.status)}${agents}`);
+            }
+            await loadLlmList();
+            setLlmHint(`已删除 ${name}`);
+        } catch (e) {
+            showLlmError(`删除失败：${String(e.message || e)}`);
+        }
+    }
+
+    /** 绑定 LLM 编辑浮层内的按钮（只在启动时绑一次） */
+    function bindLlmEditorModal() {
+        const modal = document.getElementById("llm-editor-modal");
+        if (!modal) return;
+        const cancelBtn = document.getElementById("llm-editor-cancel");
+        if (cancelBtn) cancelBtn.addEventListener("click", closeLlmEditor);
+        const saveBtn = document.getElementById("llm-editor-save");
+        if (saveBtn) saveBtn.addEventListener("click", saveLlmEditor);
+        modal.addEventListener("click", (ev) => { if (ev.target === modal) closeLlmEditor(); });
+        const backdrop = modal.querySelector("[data-llm-close]");
+        if (backdrop) backdrop.addEventListener("click", closeLlmEditor);
+        document.addEventListener("keydown", (ev) => {
+            if (ev.key === "Escape" && !modal.hidden) closeLlmEditor();
+        });
+    }
+
+    /** 供智能体区取 LLM 组名清单（下拉用）：未加载则先拉一次 */
+    async function ensureLlmList() {
+        if (llmState.list && llmState.list.length > 0) return llmState.list;
+        try {
+            const resp = await fetch("/api/config/llm", { cache: "no-store" });
+            const data = await resp.json();
+            if (resp.ok && data.ok) {
+                llmState.list = data.items || [];
+                llmState.defaultLlm = data.defaultLlm || "";
+            }
+        } catch { /* 失败就返回空：下拉会显示「（无可用组）」 */ }
+        return llmState.list || [];
+    }
+
     /** 第四段：智能体列表 */
     function renderAgentSection() {
         const c = agentState.counts || { total: 0, ok: 0, invalid: 0 };
@@ -3455,7 +3796,9 @@
                   </div>
                   <div class="agent-row__meta">
                     uid ${escapeHtml(a.uid)} ·
-                    LLM ${escapeHtml(a.llmRef || "（默认）")} ·
+                    LLM ${a.llmRef
+                        ? escapeHtml(a.llmRef)
+                        : '<span class="config-badge config-badge--shadow">未引用（无效）</span>'} ·
                     技能 ${a.skillsMode === "all" ? "全部" : `白名单 ${(a.skillsAllow || []).length} 项`} ·
                     工具 ${a.toolsAllow === null ? "不限" : `${(a.toolsAllow || []).length} 项`} ·
                     轮次 ${escapeHtml(rounds)} ·
@@ -3543,10 +3886,18 @@
      * @returns {Promise<string>} 格式化的 setup.json 文本
      */
     async function buildNewAgentSetupDraft() {
+        // [FR-AGT-4 / BR-1] 预填的 llm 必须满足「必填」：默认组名兜底（不再留空串）
+        const defaultLlm = await (async () => {
+            try {
+                const list = await ensureLlmList();
+                if (llmState.defaultLlm) return llmState.defaultLlm;
+                return list.length > 0 ? list[0].name : "";
+            } catch { return ""; }
+        })();
         const fallback = () => JSON.stringify({
             title: "",
             description: "",
-            llm: "",
+            llm: defaultLlm,
             skills: { mode: "allow", list: [] },
             tools: { allow: null, deny: [] },
             limits: { maxRounds: null },
@@ -3579,8 +3930,10 @@
              */
             const rec = data.record || {};
             const fill = (k, v) => { if (!(k in obj)) obj[k] = v; };
-            // llmRef 为 null 表示「跟随全局 llm[0]」，草稿里不写该键，保持同样语义
+            // [FR-AGT-4 / BR-1] llm 必填：优先继承默认智能体的引用，
+            //   否则用配置页的默认组名兜底（不再写 null / 空串）。
             if (rec.llmRef) fill("llm", rec.llmRef);
+            else if (defaultLlm) fill("llm", defaultLlm);
             fill("skills", rec.skillsMode === "all"
                 ? { mode: "all", list: [] }
                 : { mode: "allow", list: Array.isArray(rec.skillsAllow) ? rec.skillsAllow : [] });
@@ -3622,6 +3975,8 @@
         }
         if (bodyEl) bodyEl.value = agentState.bodyDraft;
         if (setupEl) setupEl.value = agentState.setupDraft;
+        /* [FR-AGT-3] LLM 必选下拉：填充当前 LLM 组清单，并尽量与 setupDraft 里的 llm 对齐 */
+        void fillAgentLlmSelect();
         if (previewEl) {
             const p = agentState.preview;
             if (!p) previewEl.textContent = "";
@@ -3630,6 +3985,51 @@
         }
         modal.hidden = false;
         if (pathEl) pathEl.focus();
+    }
+
+    /**
+     * [FR-AGT-3] 填充 agent 浮层的 LLM 下拉。
+     *
+     * 语义：下拉**优先于** textarea 里的 llm 字段（保存时以它为准，见 saveAgentEditor）。
+     * 初始选中顺序：
+     *   ① setupDraft 里已写的 llm（大小写不敏感匹配）
+     *   ② 否则默认组（llmState.defaultLlm）
+     *   ③ 否则第一组
+     * 组清单为空时给出「（无可用 LLM 组）」并禁用保存按钮的提示。
+     */
+    async function fillAgentLlmSelect() {
+        const sel = document.getElementById("agent-editor-llm");
+        if (!sel) return;
+        const list = await ensureLlmList();
+        const draftLlm = (() => {
+            try {
+                const obj = JSON.parse(agentState.setupDraft || "{}");
+                return typeof obj.llm === "string" ? obj.llm.trim() : "";
+            } catch { return ""; }
+        })();
+        const fold = (s) => String(s ?? "").trim().replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+        if (!list || list.length === 0) {
+            sel.innerHTML = '<option value="">（无可用 LLM 组，请先在 LLM 配置区新建）</option>';
+            sel.value = "";
+            return;
+        }
+        sel.innerHTML = list.map((g) => {
+            const marks = g.isDefault ? "（默认组）" : "";
+            return `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}${marks}</option>`;
+        }).join("");
+
+        let want = "";
+        if (draftLlm) {
+            const hit = list.find((g) => fold(g.name) === fold(draftLlm));
+            if (hit) want = hit.name;
+        }
+        if (!want && llmState.defaultLlm) {
+            const hit = list.find((g) => fold(g.name) === fold(llmState.defaultLlm));
+            if (hit) want = hit.name;
+        }
+        if (!want) want = list[0].name;
+        sel.value = want;
     }
 
     /** 关闭编辑浮层 */
@@ -3657,16 +4057,34 @@
                 showAgentError(`setup.json 不是合法 JSON：${String(e.message || e)}`);
                 return;
             }
-            // 空串的 llm 会被 parseAgentSetup 判 invalid_setup（它要求非空字符串）。
-            // 这里当成「不指定 llm」剔除，避免用户忘了填就保存失败。
-            if (setupObj && typeof setupObj === "object" && "llm" in setupObj
-                && (setupObj.llm === "" || setupObj.llm === null)) {
-                delete setupObj.llm;
+            // [FR-AGT-3 / BR-1] llm 已改为**必填**：前端不再静默剔除空值，
+            //   而是明确报错并阻止提交（否则后端会返回 invalid_setup，提示反而不够直观）。
+            if (setupObj && typeof setupObj === "object") {
+                const llmVal = setupObj.llm;
+                if (llmVal === undefined || llmVal === null
+                    || (typeof llmVal === "string" && llmVal.trim() === "")) {
+                    showAgentError("setup.json 缺少 llm（必填）：请填写该智能体要引用的 LLM 组名");
+                    return;
+                }
             }
             // 同理：limits.maxRounds 为 null / 空串时整个 limits 剔除
             if (setupObj && setupObj.limits && typeof setupObj.limits === "object"
                 && (setupObj.limits.maxRounds === null || setupObj.limits.maxRounds === "")) {
                 delete setupObj.limits;
+            }
+        }
+
+        /* [FR-AGT-3] 下拉优先于 textarea 里的 llm：保存前用它强制覆盖。
+         * ⚠️ setupText 为空（只改 AGENT.md）时不注入，否则会凭空写出一份 setup.json。 */
+        {
+            const llmSel = document.getElementById("agent-editor-llm");
+            const llmFromSelect = llmSel && llmSel.value ? String(llmSel.value).trim() : "";
+            if (llmFromSelect !== "") {
+                if (setupObj === undefined) setupObj = {};
+                if (setupObj && typeof setupObj === "object") setupObj.llm = llmFromSelect;
+            } else if (setupObj !== undefined) {
+                showAgentError("请选择该智能体要引用的 LLM 组（必填）");
+                return;
             }
         }
 
@@ -3785,5 +4203,7 @@
 
     /* [agent / 第 9 步] 编辑浮层的按钮只在启动时绑一次（DOM 已就绪） */
     bindAgentEditorModal();
+    /* [FR-LLM-1~6] LLM 编辑浮层同理 */
+    bindLlmEditorModal();
 
 })();

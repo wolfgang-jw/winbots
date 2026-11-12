@@ -1,4 +1,5 @@
 {
   "uid": "ag_00000000",
-  "name": "default"
+  "name": "default",
+  "llm": "main"
 }

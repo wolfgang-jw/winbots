@@ -22,7 +22,16 @@ import {
 } from "@/infra/configFile";
 // [迁移文档 4.9.3 / 第零章 P1] refresh 的残留键清理要读「env.json 的 tools 块 ∪ 顶层 _unmapped」，
 //   不再有 .env 文本可解析（readEnvFile / parseEnvText 已在 4.6.2 删除）。
-import { listJsonCandidateKeys, readUnmapped } from "@/infra/envJson";
+import {
+  listJsonCandidateKeys, readUnmapped,
+  LLM_NAME_RE, foldLlmName, eqLlmName, findLlmIndex, resolveDefaultLlmName,
+  loadEnvJson, saveEnvJson, readEnvJsonRaw,
+  type EnvJson, type LlmGroup,
+} from "@/infra/envJson";
+// [POST /api/config/llm] thinkingMode 的解析与 coerceLlmGroup 同源（零依赖模块）
+import { parseThinkingMode } from "@/infra/thinkingMode";
+// [FR-LLM-6] 删除 LLM 组前要检查「是否有 agent 引用它」——注册表是唯一权威来源
+import { ensureAgentRegistry, type AgentRecord } from "@/agents";
 import {
   getRegistry, listOrphanKeys, SUSPEND_LABEL,
   type DirRecord, type GroupRecord, type Registry,
@@ -37,7 +46,7 @@ import {
   refreshManagedValues, isToggleOn, groupState,
   type SettingDef,
 } from "@/infra/settings";
-import { hasManagedPrefix, isSensitiveName, pathSegments } from "@/tools/paths";
+import { hasManagedPrefix, isSensitiveName, pathSegments, isReservedName } from "@/tools/paths";
 import type { SettingEntry } from "@/tools/scan";
 // [skill / §12.1] 技能注册表：只走门面（§1.2「只 import 门面」），不直连 skills/scan.ts
 import {
@@ -733,6 +742,418 @@ router.put("/", async (c) => {
     degraded: result.degraded === true ? "写入未使用原子重命名（已回退为覆盖写）" : undefined,
   });
 });
+
+/* ============================================================
+ * [FR-LLM-1~6 / BR-6] LLM 组管理：GET / PUT / DELETE /api/config/llm
+ *
+ * ⚠️ 这三条路由**不走** applyConfigChanges：它按扁平键名白名单遍历 CONFIG_KEYS，
+ *    `llm[2].model` 没有对应键名（第 2 组起根本不在映射表里）。
+ *    这里统一走 readEnvJsonRaw() → 改目标组 → saveEnvJson()，
+ *    并依赖 serializeEnvJson 的「按 name 取基底」保证其他组（含未知字段）不丢（BR-5）。
+ * ⚠️ 组名定位一律大小写不敏感（foldLlmName / findLlmIndex，BR-6），**未命中不回退**。
+ * ============================================================ */
+
+/** LLM 组的对前端视图（**不含 key 原文**，FR-LLM-3） */
+interface LlmGroupView {
+  name: string;
+  base: string;
+  model: string;
+  thinkingMode: string;
+  thinking: boolean;
+  reasoningEffort: string;
+  /** 密钥掩码（无值时 "****"） */
+  keyMask: string;
+  hasKey: boolean;
+  /** 是否默认组（后端判定，前端不得按下标推断，FR-LLM-5） */
+  isDefault: boolean;
+}
+
+function llmGroupView(g: LlmGroup, defaultName: string): LlmGroupView {
+  return {
+    name: g.name,
+    base: g.base,
+    model: g.model,
+    thinkingMode: g.thinkingMode ?? "",
+    thinking: g.thinking === true,
+    reasoningEffort: g.reasoningEffort ?? "",
+    keyMask: maskSecret(g.key ?? ""),
+    hasKey: typeof g.key === "string" && g.key !== "",
+    isDefault: eqLlmName(g.name, defaultName),
+  };
+}
+
+/**
+ * [FR-LLM-6 新增] `POST /api/config/llm` —— 新建一个 LLM 组。
+ *
+ * 文档原只列 GET/PUT/DELETE（因为 PRD 把"新增"写进了配置页功能需求）。
+ * 但 PUT 的语义是「按已存在的组名改」，无法表达新增，故补一条 POST。
+ * 校验：name 合法（LLM_NAME_RE + 非保留名）、**折叠后不重名**（BR-6 约束 1）、
+ *       base/model/key 非空。
+ */
+router.post("/llm", async (c) => {
+  let body: Record<string, unknown>;
+  try {
+    body = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    return c.json({ ok: false, code: "ERR_ILLEGAL_CHARS", error: "请求体不是合法 JSON" }, 400);
+  }
+
+  const str = (k: string): string => (typeof body[k] === "string" ? (body[k] as string).trim() : "");
+  const name = str("name");
+  const base = str("base");
+  const model = str("model");
+  const key = str("key");
+
+  if (!name) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "组名不能为空" }, 400);
+  if (!LLM_NAME_RE.test(name)) {
+    return c.json(
+      { ok: false, code: "ERR_INVALID_NAME", error: `组名不合法：须匹配 ${LLM_NAME_RE}` },
+      400,
+    );
+  }
+  // 与 coerceLlmGroup 同口径：保留名一律拒绝（第零章 P3）
+  if (isReservedName(name)) {
+    return c.json(
+      { ok: false, code: "ERR_INVALID_NAME", error: `「${name}」是保留名，不能作为 LLM 组名` },
+      400,
+    );
+  }
+  if (!base) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "接口地址（base）不能为空" }, 400);
+  if (!model) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "模型名（model）不能为空" }, 400);
+  if (!key) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "密钥（key）不能为空" }, 400);
+
+  let envObj: EnvJson;
+  try {
+    envObj = loadEnvJson();
+  } catch (e) {
+    return c.json(
+      { ok: false, code: "ERR_ENV_INVALID", error: e instanceof Error ? e.message : String(e) },
+      500,
+    );
+  }
+
+  // BR-6 约束 1：拒绝「折叠后重名」（否则 main 与 Main 可共存，按名查找行为不确定）
+  if (findLlmIndex(envObj, name) >= 0) {
+    return c.json(
+      { ok: false, code: "ERR_LLM_DUPLICATE", error: `已存在同名 LLM 组（不区分大小写）：${name}` },
+      409,
+    );
+  }
+
+  const group: LlmGroup = { name, base, key, model };
+  const mode = str("thinkingMode");
+  if (mode) {
+    // 与 coerceLlmGroup 同口径：非法值回退 none，而不是把任意字符串塞进类型
+    group.thinkingMode = parseThinkingMode(mode);
+  }
+  if (typeof body.thinking === "boolean") group.thinking = body.thinking;
+  const effort = str("reasoningEffort");
+  if (effort) group.reasoningEffort = effort;
+
+  const next: EnvJson = JSON.parse(JSON.stringify(envObj));
+  next.llm.push(group);
+  const w = saveEnvJson(next);
+  if (!w.ok) {
+    return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: w.error || "写入 env.json 失败" }, 500);
+  }
+  refreshManagedValues(true);
+  return c.json({ ok: true, name, backupFile: w.backupFile });
+});
+
+router.get("/llm", async (c) => {
+  let j: EnvJson;
+  try {
+    j = loadEnvJson();
+  } catch (e) {
+    return c.json(
+      { ok: false, code: "ERR_ENV_INVALID", error: e instanceof Error ? e.message : String(e) },
+      500,
+    );
+  }
+  // 默认组名：字段缺失/指向不存在组时，resolveDefaultLlmName / eqLlmName 不应让列表打不开，
+  //   故这里宽松处理（拿不到就当没有默认组），真正的致命判定在启动期（D-1）。
+  let defaultName = "";
+  try {
+    defaultName = resolveDefaultLlmName(j);
+  } catch {
+    defaultName = "";
+  }
+  c.header("Cache-Control", "no-store");
+  return c.json({
+    ok: true,
+    items: j.llm.map((g) => llmGroupView(g, defaultName)),
+    /** 默认组名（原样大小写）；无有效默认组时为空串，前端据此提示"配置有误" */
+    defaultLlm: j.llm.some((g) => eqLlmName(g.name, defaultName)) ? defaultName : "",
+  });
+});
+
+router.put("/llm/:name", async (c) => {
+  const pathName = c.req.param("name") ?? "";
+
+  let body: Record<string, unknown>;
+  try {
+    body = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    return c.json({ ok: false, code: "ERR_ILLEGAL_CHARS", error: "请求体不是合法 JSON" }, 400);
+  }
+
+  // ① 定位目标组（大小写不敏感，未命中 404，**不回退**到默认组）
+  let envObj: EnvJson;
+  try {
+    envObj = loadEnvJson();
+  } catch (e) {
+    return c.json(
+      { ok: false, code: "ERR_ENV_INVALID", error: e instanceof Error ? e.message : String(e) },
+      500,
+    );
+  }
+  const idx = findLlmIndex(envObj, pathName);
+  if (idx < 0) {
+    return c.json(
+      { ok: false, code: "ERR_LLM_NOT_FOUND", error: `没有名为「${pathName}」的 LLM 组` },
+      404,
+    );
+  }
+  const current = envObj.llm[idx] as LlmGroup;
+
+  // ② 请求体带 name 且与路径参数折叠后不等 → 拒绝（改名不支持，FR-LLM-4）
+  if (body.name !== undefined && body.name !== null) {
+    if (typeof body.name !== "string" || !eqLlmName(body.name, current.name)) {
+      return c.json(
+        {
+          ok: false,
+          code: "ERR_LLM_RENAME_FORBIDDEN",
+          error: `LLM 组名不支持修改（路径「${current.name}」与请求体「${String(body.name)}」不一致）`,
+        },
+        400,
+      );
+    }
+  }
+
+  // ③ 逐字段收集变更
+  const strField = (
+    key: string,
+    allowEmpty: boolean,
+  ): { ok: true; value?: string; changed: boolean } | { ok: false; reason: string } => {
+    const v = body[key];
+    if (v === undefined || v === null) return { ok: true, changed: false };
+    if (typeof v !== "string") return { ok: false, reason: `${key} 必须是字符串` };
+    const t = v.trim();
+    if (!allowEmpty && t === "") return { ok: false, reason: `${key} 不能为空` };
+    return { ok: true, value: t, changed: t !== (current as unknown as Record<string, string>)[key] };
+  };
+
+  const fields: Record<string, string> = {};
+  const changed: string[] = [];
+
+  for (const key of ["base", "model"] as const) {
+    const r = strField(key, false);
+    if (!r.ok) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: r.reason }, 400);
+    if (r.changed && r.value !== undefined) { fields[key] = r.value; changed.push(key); }
+  }
+  // 密钥：缺省 / 空串 = 不修改（留空语义与配置页历史行为一致）；非空 = 覆盖
+  if (body.key !== undefined && body.key !== null) {
+    if (typeof body.key !== "string") {
+      return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "key 必须是字符串" }, 400);
+    }
+    if (body.key.trim() !== "") {
+      fields.key = body.key.trim();
+      changed.push("key");
+    }
+  }
+
+  // thinkingMode / reasoningEffort：允许显式空串表示「回退默认值」
+  for (const key of ["thinkingMode", "reasoningEffort"] as const) {
+    const r = strField(key, true);
+    if (!r.ok) return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: r.reason }, 400);
+    if (r.changed && r.value !== undefined) { fields[key] = r.value; changed.push(key); }
+  }
+
+  // thinking：布尔
+  if (body.thinking !== undefined && body.thinking !== null) {
+    if (typeof body.thinking !== "boolean") {
+      return c.json({ ok: false, code: "ERR_INVALID_VALUE", error: "thinking 必须是布尔值" }, 400);
+    }
+    if (body.thinking !== current.thinking) { fields.thinking = String(body.thinking); changed.push("thinking"); }
+  }
+
+  if (changed.length === 0) {
+    return c.json({ ok: false, code: "ERR_EMPTY_CHANGES", error: "没有实际改动（key 留空视为不修改）" }, 400);
+  }
+
+  // ④ 落盘：直接改原始对象再 saveEnvJson（serializeEnvJson 按 name 取基底保留未知字段）
+  const raw = readEnvJsonRaw();
+  if (!raw || !Array.isArray(raw.llm)) {
+    return c.json({ ok: false, code: "ERR_ENV_INVALID", error: "env.json 的 llm 结构异常" }, 500);
+  }
+  const rawIdx = findLlmIndex({ ...envObj, llm: raw.llm as unknown as LlmGroup[] }, current.name);
+  if (rawIdx < 0) {
+    return c.json({ ok: false, code: "ERR_LLM_NOT_FOUND", error: "目标组在原始文件中消失，请刷新后重试" }, 409);
+  }
+  const rawGroup = (raw.llm as Record<string, unknown>[])[rawIdx] as Record<string, unknown>;
+  for (const k of changed) {
+    if (k === "thinking") rawGroup.thinking = body.thinking;   // 布尔，不做字符串化
+    else rawGroup[k] = fields[k];
+  }
+
+  // 用「规整后的对象」落盘：saveEnvJson 的 obj 是规整结果，raw 只用于保留未知字段/备注。
+  //   这里把改动同步回 envObj，保证 obj 与 raw 一致。
+  const next: EnvJson = JSON.parse(JSON.stringify(envObj));
+  const target = next.llm[idx] as LlmGroup & Record<string, unknown>;
+  for (const k of changed) {
+    if (k === "thinking") {
+      target.thinking = body.thinking as boolean;
+    } else if (k === "thinkingMode" || k === "reasoningEffort") {
+      // 空串 = 「回退默认值」= 删掉该字段（瘦身口径：值等于默认值即不写）
+      const v = fields[k];
+      if (v === "" || v === undefined) delete target[k];
+      else if (k === "thinkingMode") target.thinkingMode = parseThinkingMode(v);
+      else target.reasoningEffort = v;
+      // raw 侧同样删除空串键，避免 serializeEnvJson 以 raw 为基底时把它带回来
+      if ((v === "" || v === undefined) && rawGroup) delete rawGroup[k];
+    } else {
+      (target as unknown as Record<string, string>)[k] = fields[k] as string;
+    }
+  }
+  // 让 serializeEnvJson 用改过的 raw（含 unknown 字段）做基底
+  const w = saveEnvJson(next, { raw: raw as Record<string, unknown> });
+
+  if (!w.ok) {
+    return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: w.error || "写入 env.json 失败" }, 500);
+  }
+
+  // ⑤ 生效：改到默认组会影响 env.LLM_*，必须热更一次（APP_PORT 恒跳过）
+  const isDefaultGroup = eqLlmName(current.name, (() => {
+    try { return resolveDefaultLlmName(next); } catch { return ""; }
+  })());
+  let hotApplied: string[] = [];
+  if (isDefaultGroup) {
+    const reload = reloadEnvExcluding(["APP_PORT"]);
+    hotApplied = reload.applied;
+  }
+  refreshManagedValues(true);
+
+  return c.json({
+    ok: true,
+    name: current.name,
+    /** 本次变更摘要（不依赖 reloadEnvExcluding 的 applied：非默认组的改动不在其中） */
+    changed,
+    hotApplied,
+    needRestart: false,
+    isDefault: isDefaultGroup,
+    backupFile: w.backupFile,
+  });
+});
+
+router.delete("/llm/:name", async (c) => {
+  const pathName = c.req.param("name") ?? "";
+
+  let envObj: EnvJson;
+  try {
+    envObj = loadEnvJson();
+  } catch (e) {
+    return c.json(
+      { ok: false, code: "ERR_ENV_INVALID", error: e instanceof Error ? e.message : String(e) },
+      500,
+    );
+  }
+  const idx = findLlmIndex(envObj, pathName);
+  if (idx < 0) {
+    return c.json(
+      { ok: false, code: "ERR_LLM_NOT_FOUND", error: `没有名为「${pathName}」的 LLM 组` },
+      404,
+    );
+  }
+  const target = envObj.llm[idx] as LlmGroup;
+
+  // ① D-2：只剩 1 组时不允许删（0 组 = 所有 agent 必然无效的崩溃态）
+  if (envObj.llm.length <= 1) {
+    return c.json(
+      {
+        ok: false,
+        code: "ERR_LLM_LAST_GROUP",
+        error: "至少需要保留 1 个 LLM 组：不允许删除最后一个组",
+      },
+      400,
+    );
+  }
+
+  // ② 默认组受保护（改默认组后才能删）
+  let defaultName = "";
+  try { defaultName = resolveDefaultLlmName(envObj); } catch { defaultName = ""; }
+  if (eqLlmName(target.name, defaultName)) {
+    return c.json(
+      {
+        ok: false,
+        code: "ERR_LLM_IS_DEFAULT",
+        error: `「${target.name}」是默认 LLM 组，不能直接删除：请先把 app.defaultLlm 改为其他组`,
+      },
+      400,
+    );
+  }
+
+  // ③ 引用检查：任何 agent 的 llmRef 指向它 → 拒绝并返回引用清单（FR-LLM-6）
+  let referencing: AgentRecord[] = [];
+  try {
+    const reg = await ensureAgentRegistry({
+      ...scanDepsForLlm(),
+    });
+    referencing = [...reg.agents.values()].filter(
+      (r) => typeof r.llmRef === "string" && r.llmRef !== "" && eqLlmName(r.llmRef, target.name),
+    );
+  } catch (e) {
+    // 注册表不可用时保守拒绝：宁可不删，也不能删掉正在被引用的组
+    return c.json(
+      {
+        ok: false,
+        code: "ERR_AGENT_REGISTRY_UNAVAILABLE",
+        error: `无法检查 agent 引用（${e instanceof Error ? e.message : String(e)}），已保守拒绝删除`,
+      },
+      503,
+    );
+  }
+  if (referencing.length > 0) {
+    return c.json(
+      {
+        ok: false,
+        code: "ERR_LLM_IN_USE",
+        error: `「${target.name}」正被 ${referencing.length} 个智能体引用，不能删除`,
+        agents: referencing.map((r) => ({ uid: r.uid, name: r.name, path: r.path, llmRef: r.llmRef })),
+      },
+      409,
+    );
+  }
+
+  // ④ 删除并落盘
+  const next: EnvJson = JSON.parse(JSON.stringify(envObj));
+  next.llm = next.llm.filter((_, i) => i !== idx);
+  const w = saveEnvJson(next);
+  if (!w.ok) {
+    return c.json({ ok: false, code: "ERR_WRITE_FAILED", error: w.error || "写入 env.json 失败" }, 500);
+  }
+  refreshManagedValues(true);
+  return c.json({ ok: true, name: target.name, remaining: next.llm.map((g) => g.name), backupFile: w.backupFile });
+});
+
+/**
+ * [FR-LLM-6] 删除前的注册表刷新用 deps。
+ * 与 routes/agents.ts 的 scanDeps 同口径（[BR-6] 折叠），但**不**补写 uid：
+ * 配置页的删除动作不应顺手改 agent 文件。
+ */
+function scanDepsForLlm() {
+  const names = new Set<string>();
+  try {
+    for (const g of loadEnvJson().llm ?? []) {
+      if (g && typeof g.name === "string" && g.name !== "") names.add(foldLlmName(g.name));
+    }
+  } catch {
+    /* ignore */
+  }
+  return {
+    isKnownLlm: (n: string) => names.size === 0 || names.has(foldLlmName(n)),
+    mintUid: false,
+  };
+}
 
 /* ============================================================
  * DELETE /api/config/orphans —— 遗留键独立删除（§10.2）

@@ -34,6 +34,73 @@ const KEEP_BACKUPS = 20;
 /** LLM 组名规则（方案 3.1；第零章 P3：另需排除 RESERVED_NAMES） */
 export const LLM_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
 
+/**
+ * [BR-6] LLM 组名**比较口径**的唯一实现：ASCII 折叠（仅折叠 A-Z）+ trim。
+ *
+ * ⚠️ 不用 `toLowerCase()`：它会做 Unicode 大小写映射（`İ` → `i̇`、`K` → `k`），
+ *    与「ASCII 折叠」约定不符，且会让 `llm[]` 里两个不同名字折叠成同一个。
+ * ⚠️ 折叠**只用于比较**，不用于存储：`app.defaultLlm` 与 `setup.json` 的 `llm`
+ *    都保留用户书写时的原始大小写（见代码修改文档 4.5a 约束 2）。
+ */
+export function foldLlmName(s: string): string {
+  return String(s ?? "").trim().replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
+}
+
+/** [BR-6] 两个 LLM 组名是否相同（大小写不敏感的 ASCII 折叠比较） */
+export function eqLlmName(a: string, b: string): boolean {
+  return foldLlmName(a) === foldLlmName(b);
+}
+
+/**
+ * [BR-4] 读出「默认 LLM 组名」：唯一来源是 `app.defaultLlm`。
+ *
+ * @returns 组名（已 trim，保留原始大小写）
+ * @throws  EnvJsonError —— 字段缺失 / 非字符串 / 空串（D-1 选 (a)：拒绝启动），
+ *          或字段存在但指向 `llm[]` 中不存在的组（同样拒绝启动）。
+ *          调用方若只想「读读看」（如配置页列表），请自行 try/catch。
+ */
+export function resolveDefaultLlmName(raw: EnvJson): string {
+  const app = raw.app as unknown as Record<string, unknown>;
+  const name = app?.defaultLlm;
+  if (typeof name !== "string" || name.trim() === "") {
+    const available = raw.llm.map((g) => g.name).join(", ") || "(llm[] 为空)";
+    throw new EnvJsonError(
+      "env.json 缺少必需项：app.defaultLlm（默认 LLM 组名）",
+      undefined, undefined,
+      `请在 app 段补 "defaultLlm": "<组名>"，可选值：${available}。` +
+      "（升级后默认组必须显式指定，不再按下标取 llm[0] —— 见 docs/配置说明.md）",
+    );
+  }
+  return name.trim();
+}
+
+/**
+ * [BR-6] 按名字定位 `llm[]` 下标（大小写不敏感）。未命中返回 -1（**永不回退到 0**）。
+ */
+export function findLlmIndex(env: EnvJson, name: string): number {
+  const want = foldLlmName(name);
+  if (want === "") return -1;
+  return env.llm.findIndex((g) => foldLlmName(g.name) === want);
+}
+
+/**
+ * [BR-4] 取默认组的**下标**；字段缺失/指向不存在组时抛 EnvJsonError。
+ * 这是全仓「默认组是谁」的唯一判定入口。
+ */
+export function defaultLlmIndex(env: EnvJson): number {
+  const name = resolveDefaultLlmName(env);
+  const i = findLlmIndex(env, name);
+  if (i < 0) {
+    const available = env.llm.map((g) => g.name).join(", ") || "(llm[] 为空)";
+    throw new EnvJsonError(
+      `env.json 的 app.defaultLlm 指向不存在的 LLM 组：「${name}」`,
+      undefined, undefined,
+      `可选值：${available}。请把 app.defaultLlm 改成其中一个组名（不区分大小写）。`,
+    );
+  }
+  return i;
+}
+
 /** env.json 绝对路径（读取用，勿改） */
 export function envJsonFilePath(): string { return envJsonPath; }
 /** 备份目录（读取用，勿改） */
@@ -64,8 +131,15 @@ export interface LlmGroup {
 }
 
 export interface EnvJson {
-  app: { port: number };
-  /** 至少 1 项；迁移阶段 env.LLM_* 恒取 [0]（方案 3.2「llm[0] 的语义」） */
+  /**
+   * [BR-4] `defaultLlm` = 默认 LLM 组名（**唯一来源**，不再按下标取 `llm[0]`）。
+   *
+   * 它是持久化字段，但**不是**扁平配置项：不进 CONFIG_KEY_TO_JSON、不进配置页控件、
+   * 不进 `pruneDefaults` 的 strip 范围（strip 只删「值等于默认值」的已识别字段，
+   * defaultLlm 恒有值且必须落盘，否则重启即报错）。
+   */
+  app: { port: number; defaultLlm: string };
+  /** 至少 1 项；「默认组」由 app.defaultLlm 指定（BR-4），找不到即配置错误 */
   llm: LlmGroup[];
   log: { enabled: boolean; file: string; maxRows: number };
   stab: { maxToolRounds: number; sseHeartbeatMs: number; toolResultMaxChars: number };
@@ -296,23 +370,30 @@ function coerceLlmGroup(raw: unknown, i: number, fallback: LlmGroup): LlmGroup {
 }
 
 /**
- * 必需项断言（与 env.ts 的 REQUIRED_VARS 同口径，仅 llm[0] 三项）：
- *   · 文件不存在           → 抛错（提示从 env.example.json 复制）
- *   · 文件存在但关键项为空 → 抛错（列出缺哪些 JSON 路径）
- *   · app.port 缺失        → **不抛**：回填 CONFIG_KEYS 默认值（见 4.1.4 的 📌）
+ * 必需项断言（与 env.ts 的 REQUIRED_VARS 同口径，仅**默认组**三项）：
+ *   · 文件不存在             → 抛错（提示从 env.example.json 复制）
+ *   · 关键项为空             → 抛错（列出缺哪些 JSON 路径）
+ *   · app.defaultLlm 缺失/指向不存在的组 → 抛错（D-1 选 (a)：拒绝启动）
+ *   · app.port 缺失          → **不抛**：回填 CONFIG_KEYS 默认值（见 4.1.4 的 📌）
+ *
+ * ⚠️ [BR-4] 本函数判的是**默认组**的 base/key/model，不是 `llm[0]`。
+ *    默认组的判定在 `defaultLlmIndex()` 内完成，字段缺失会直接抛错 ——
+ *    这正是 D-1「缺字段拒绝启动」的落点（加载期，而非运行期）。
  */
 function assertRequired(v: EnvJson, existed: boolean): EnvJson {
   if (!existed) {
     throw new EnvJsonError(
       `未找到 env.json（预期路径：${envJsonPath}）`, undefined, undefined,
-      "请把项目根目录的 env.example.json 复制为 env.json，填入 llm[0].key 后重启。",
+      "请把项目根目录的 env.example.json 复制为 env.json，填入默认组的 key 后重启。",
     );
   }
-  const g = v.llm[0] as LlmGroup;
+  const idx = defaultLlmIndex(v);                 // 缺失 / 指向不存在组 → 抛 EnvJsonError
+  const g = v.llm[idx] as LlmGroup;
+  const at = `llm[${idx}]（默认组 ${g.name}）`;
   const missing: string[] = [];
-  if (!g.base) missing.push("llm[0].base");
-  if (!g.key) missing.push("llm[0].key");
-  if (!g.model) missing.push("llm[0].model");
+  if (!g.base) missing.push(`${at}.base`);
+  if (!g.key) missing.push(`${at}.key`);
+  if (!g.model) missing.push(`${at}.model`);
   if (missing.length > 0) {
     throw new EnvJsonError(
       `env.json 缺少必需项：${missing.join(", ")}`, undefined, undefined,
@@ -348,7 +429,23 @@ export function loadEnvJson(): EnvJson {
   }
 
   // ② 分组对象（app / log / stab）
-  const app = coerceGroup(raw.app, def.app, "app");
+  const app = coerceGroup(raw.app, def.app, "app") as EnvJson["app"];
+  /**
+   * [BR-4 / D-1(a)] `app.defaultLlm` **不做默认值回填**：
+   *   `coerceGroup` 会按 def 回填缺失字段，而 def.app.defaultLlm 是占位值，
+   *   回填就等于「悄悄兜底到某个组」，正是 D-1 明确拒绝的行为。
+   *   这里显式判类型并**保留缺失态**（保留为空串），由 assertRequired 抛错。
+   *   ⚠️ 不能用 delete —— EnvJson.app 的静态类型要求 defaultLlm 是 string。
+   */
+  const rawDefault = (raw.app as Record<string, unknown> | undefined)?.defaultLlm;
+  if (typeof rawDefault === "string") {
+    app.defaultLlm = rawDefault.trim();
+  } else {
+    if (rawDefault !== undefined && rawDefault !== null) {
+      warnOnce("app.defaultLlm", "必须是字符串，已按「缺失」处理（启动时将报错）");
+    }
+    app.defaultLlm = "";
+  }
   const log = coerceGroup(raw.log, def.log, "log");
   const stab = coerceGroup(raw.stab, def.stab, "stab");
 
@@ -516,21 +613,35 @@ export function deleteUnmappedKeys(keys: readonly string[]): string[] {
  * 瘦身：值为默认值的字段**不写进文件**（§9.1「值等于默认值即删键」在 JSON 下的等价实现）。
  * 只在 saveEnvJson() 内部调用（只有它知道默认值）。
  *
- * ⚠️ `llm[0].base/key/model` **不瘦身**：它们是必需项，瘦掉后用户在文件里看不见，
+ * ⚠️ `llm[*].base/key/model` **不瘦身**：它们是必需项，瘦掉后用户在文件里看不见，
  *    排查「我的 key 到底设了没」无从下手；而写入默认占位值更危险。
+ * ⚠️ [BR-4] `app.defaultLlm` **不参与 strip**：它不是扁平配置项，且必须落盘。
+ *    若被 strip 掉，下次启动就会因「缺少 app.defaultLlm」拒绝启动。
+ * ⚠️ [BR-5] 本函数只处理**已识别字段**。未知字段不在 `out.llm[*]` 的类型里，
+ *    自然不会被删；它们的保留由 serializeEnvJson 的「按 name 取原对象做基底」负责。
  */
 function pruneDefaults(obj: EnvJson, def: EnvJson): EnvJson {
   const out = structuredClone(obj);
   const strip = (o: Record<string, unknown>, d: Record<string, unknown>): void => {
     for (const [k, dv] of Object.entries(d)) if (o[k] === dv) delete o[k];
   };
+  // app：只 strip port；defaultLlm 单独保护（见上）
+  const keptDefault = out.app.defaultLlm;
   strip(out.app as unknown as Record<string, unknown>, def.app as unknown as Record<string, unknown>);
+  out.app.defaultLlm = keptDefault;
   strip(out.log as unknown as Record<string, unknown>, def.log as unknown as Record<string, unknown>);
   strip(out.stab as unknown as Record<string, unknown>, def.stab as unknown as Record<string, unknown>);
 
-  const g = out.llm[0];
+  /**
+   * [BR-4] llm 段瘦身对**所有组**生效（F2 原先只处理 llm[0]）。
+   * ⚠️ 默认值基底仍恒取 `def.llm[0]`：`baseDefaults()` 的 llm 段是**静态默认值**，
+   *    与「默认组是哪一组」无关。若改成「取 defaultLlm 对应组」，就会出现
+   *    「默认值来源依赖配置内容」的循环，且默认组改名会悄悄改变瘦身结果。
+   */
   const dg = def.llm[0];
-  if (g && dg) {
+  if (!dg) return out;
+  for (const g of out.llm) {
+    if (!g) continue;
     if (g.thinkingMode === dg.thinkingMode) delete g.thinkingMode;
     if (g.thinking === dg.thinking) delete g.thinking;
     if (g.reasoningEffort === dg.reasoningEffort) delete g.reasoningEffort;
@@ -562,11 +673,36 @@ export function serializeEnvJson(
 
   // ② 系统项：固定顺序。只输出「实际有值」的字段（瘦身后被删掉的字段自然不出现）
   out.app = { ...(body.app as unknown as Record<string, unknown>) };
+  /**
+   * [BR-5 / D3] 保留 `llm[]` 元素的**未知字段**。
+   *
+   * 做法：以**原文件里同名组**的对象为基底合并，而不是从零构造。
+   *   · 未知字段（用户手写的 `_comment` / 将来新增的键）随基底一起留下；
+   *   · 已识别字段一律以 `body`（本次规整结果）为准覆盖；
+   *   · 三个可选字段仍是「有值则写、无值则删」，保持既有瘦身行为。
+   *
+   * ⚠️ **必须按 name 对齐，严禁按下标对齐**：删组会让 `body.llm` 与 `raw.llm`
+   *    顺序错位，按下标取基底会**把 A 组的未知字段写到 B 组上**（串组）。
+   * ⚠️ 名字比较用 eqLlmName（BR-6，大小写不敏感），与 resolveLlm / findLlmIndex 同口径。
+   *    `name` 本身**按 body 的原样写入**，不折叠 —— 折叠只用于比较，不用于存储。
+   * ⚠️ raw 为 null（首次创建 env.json）时退化为从零构造。
+   */
+  const rawGroups: unknown[] = Array.isArray(raw?.llm) ? (raw!.llm as unknown[]) : [];
   out.llm = body.llm.map((g) => {
-    const e: Record<string, unknown> = { name: g.name, base: g.base, key: g.key, model: g.model };
-    if (g.thinkingMode !== undefined) e.thinkingMode = g.thinkingMode;
-    if (g.thinking !== undefined) e.thinking = g.thinking;
-    if (g.reasoningEffort !== undefined) e.reasoningEffort = g.reasoningEffort;
+    const src = rawGroups.find(
+      (x): x is Record<string, unknown> =>
+        !!x && typeof x === "object" && !Array.isArray(x)
+        && typeof (x as Record<string, unknown>).name === "string"
+        && eqLlmName((x as Record<string, unknown>).name as string, g.name),
+    );
+    const e: Record<string, unknown> = src ? { ...src } : {};
+    e.name = g.name;
+    e.base = g.base;
+    e.key = g.key;
+    e.model = g.model;
+    if (g.thinkingMode !== undefined) e.thinkingMode = g.thinkingMode; else delete e.thinkingMode;
+    if (g.thinking !== undefined) e.thinking = g.thinking; else delete e.thinking;
+    if (g.reasoningEffort !== undefined) e.reasoningEffort = g.reasoningEffort; else delete e.reasoningEffort;
     return e;
   });
   out.log = { ...(body.log as unknown as Record<string, unknown>) };

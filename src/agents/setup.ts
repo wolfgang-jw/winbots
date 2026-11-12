@@ -112,21 +112,26 @@ export function parseAgentSetup(raw: string, opts: ParseSetupOpts): SetupResult 
   const title = typeof o.title === "string" ? o.title : "";
   const description = typeof o.description === "string" ? o.description : "";
 
-  /* ⑤ llm：可选；出现时必须在合法集合里（【X-3】注入判定） */
-  let llmRef: string | null = null;
-  if (o.llm !== undefined && o.llm !== null) {
-    if (typeof o.llm !== "string" || o.llm.trim() === "") {
-      return { ok: false, code: "invalid_setup", reason: bad("llm", "非空字符串", o.llm) };
-    }
-    llmRef = o.llm.trim();
-    if (!opts.isKnownLlm(llmRef)) {
-      // §3.2：不静默回退默认组（与「引用不存在的工具就挂起」同原则）
-      return {
-        ok: false,
-        code: "unknown_llm",
-        reason: `llm「${llmRef}」未在 env.json 的 llm[] 中定义`,
-      };
-    }
+  /* ⑤ llm：**必填**（BR-1）；且必须在合法集合里（【X-3】注入判定 / BR-6 大小写不敏感） */
+  let llmRef: string;
+  if (o.llm === undefined || o.llm === null) {
+    return {
+      ok: false,
+      code: "invalid_setup",
+      reason: "缺少 llm（必填）：必须引用 env.json 的 llm[] 中已定义的组名",
+    };
+  }
+  if (typeof o.llm !== "string" || o.llm.trim() === "") {
+    return { ok: false, code: "invalid_setup", reason: bad("llm", "非空字符串", o.llm) };
+  }
+  llmRef = o.llm.trim();
+  if (!opts.isKnownLlm(llmRef)) {
+    // §3.2：不静默回退默认组（与「引用不存在的工具就挂起」同原则）
+    return {
+      ok: false,
+      code: "unknown_llm",
+      reason: `llm「${llmRef}」未在 env.json 的 llm[] 中定义`,
+    };
   }
 
   /* ⑥ skills：{ mode, list } */

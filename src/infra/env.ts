@@ -24,6 +24,7 @@
 import { CONFIG_KEY_SET } from "./configFile";
 import {
   EnvJsonError, loadEnvJson, managedValues, maybeMigrateOnce, envJsonFilePath,
+  defaultLlmIndex, resolveDefaultLlmName,
   type EnvJson, type LlmGroup,
 } from "./envJson";
 import { DEFAULT_THINKING_MODE, THINKING_MODE_LABEL, type ThinkingMode } from "./thinkingMode";
@@ -79,9 +80,14 @@ export interface EnvConfig {
 /**
  * 由 EnvJson 映射到 EnvConfig（**字段名与迁移前逐字相同**，故所有调用方零改动）。
  * 映射关系见 envJson.ts 的 CONFIG_KEY_TO_JSON（方案三章 3.2 的表格）。
+ *
+ * ⚠️ [BR-4] `LLM_*` 的取值来源从「`llm[0]`」改为「**默认组**（app.defaultLlm 指定）」。
+ *    默认组缺失 / 指向不存在的组 → defaultLlmIndex 抛 EnvJsonError，
+ *    这里**不 catch**：启动期由 dieOnConfig 退出（D-1 选 (a)），
+ *    热更期由 reloadEnvExcluding 兜住并保留旧值。
  */
 function toEnvConfig(j: EnvJson): EnvConfig {
-  const g = j.llm[0] as LlmGroup;      // 迁移阶段恒取 [0]（方案 3.2「llm[0] 的语义」）
+  const g = j.llm[defaultLlmIndex(j)] as LlmGroup;   // 默认组（找不到即抛错，不回退下标 0）
   return {
     APP_PORT: j.app.port,
 
@@ -167,6 +173,8 @@ console.log("=".repeat(60));
 console.log("✅ 配置校验通过（env.json）");
 console.log("-".repeat(60));
 console.log(`  APP_PORT:              ${env.APP_PORT}`);
+// [BR-4] 默认组名必须可见：它是 LLM_* 的取值来源，排查「改了不生效」时先看这一行
+console.log(`  LLM 默认组:            ${resolveDefaultLlmName(initialJson)}（LLM_* 的取值来源）`);
 console.log(`  LLM_API_BASE:          ${env.LLM_API_BASE}`);
 console.log(`  LLM_MODEL:             ${env.LLM_MODEL}`);
 console.log(`  LLM_API_KEY:           ${env.LLM_API_KEY ? "******" : "未设置"}`);

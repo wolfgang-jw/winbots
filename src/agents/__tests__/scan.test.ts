@@ -26,11 +26,24 @@ afterEach(() => {
 const KNOWN_LLM = (n: string): boolean => n === "main";
 const DEPS: ScanDeps = { isKnownLlm: KNOWN_LLM, mintUid: false };
 
-/** 造一个 agent 目录 */
+/**
+ * 造一个 agent 目录。
+ *
+ * [BR-1] llm 已成必填：本文件大量用例关心的是「其它字段的校验」，
+ *   若每个都手写 llm 会让用例变吵。故对**对象型** setup 自动补 `llm: "main"`
+ *   （只补缺、不覆盖）。想验证「缺 llm → invalid」的用例显式传
+ *   `{ llm: undefined }` —— `"llm" in setup` 为 true，不会被补。
+ */
 function makeAgent(path: string, setup: Record<string, unknown> | string, body?: string): void {
   const abs = join(root, path);
   mkdirSync(abs, { recursive: true });
-  const text = typeof setup === "string" ? setup : JSON.stringify(setup, null, 2);
+  let text: string;
+  if (typeof setup === "string") {
+    text = setup;
+  } else {
+    const obj = "llm" in setup ? setup : { ...setup, llm: "main" };
+    text = JSON.stringify(obj, null, 2);
+  }
   writeFileSync(join(abs, "setup.json"), text, "utf-8");
   if (body !== undefined) writeFileSync(join(abs, "AGENT.md"), body, "utf-8");
 }
@@ -245,6 +258,27 @@ describe("scanAgentsOnce", () => {
     const rec = reg.agents.get("ag_00000051");
     expect(rec?.status).toBe("invalid");
     expect(rec?.invalidReason).toContain("unknown_llm");
+  });
+
+  test("A13 [BR-1] 缺 llm → invalid（缘由 invalid_setup，不再是「合法可空」）", () => {
+    // "llm" in setup 为 true（值是 undefined），makeAgent 不会再自动补
+    makeAgent("nollm", { uid: "ag_00000052", name: "nollm", llm: undefined });
+    const reg = scan();
+    const rec = reg.agents.get("ag_00000052");
+    expect(rec?.status).toBe("invalid");
+    expect(rec?.invalidReason).toContain("invalid_setup");
+    expect(rec?.invalidReason).toContain("llm");
+    expect(reg.byPath.has("nollm")).toBe(false);
+  });
+
+  test("A14 [BR-6] 注入方折叠后，llm 写 MAIN 的 agent 仍 ok", () => {
+    makeAgent("upper", { uid: "ag_00000053", name: "upper", llm: "MAIN" });
+    const foldKnown = (n: string): boolean => n.trim().toLowerCase() === "main";
+    const reg = scan({ isKnownLlm: foldKnown, mintUid: false });
+    const rec = reg.agents.get("ag_00000053");
+    expect(rec?.status).toBe("ok");
+    // 存储保留原大小写（BR-6 约束 2）
+    expect(rec?.llmRef).toBe("MAIN");
   });
 
   test("补充：点开头的文件/目录被忽略，不进指纹", () => {

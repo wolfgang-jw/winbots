@@ -66,14 +66,12 @@ describe("resolveLlm / T-L2 ~ T-L3 等价路径", () => {
     });
 });
 
-describe("resolveLlm / T-L4 未命中回退", () => {
-    test("回退到第一组、fallback=true、告警一次且含该名字", () => {
+describe("resolveLlm / T-L4 未命中【BR-2：不再回退】", () => {
+    test("返回 null（不回退到第一组、不告警）", () => {
         const w = spyWarn();
         const r = resolveLlm(groups(), "nope", w.fn);
-        expect(r!.name).toBe("main");
-        expect(r!.fallback).toBe(true);
-        expect(w.calls).toHaveLength(1);
-        expect(w.calls[0]).toContain("nope");
+        expect(r).toBeNull();
+        expect(w.calls).toHaveLength(0);
     });
 });
 
@@ -125,15 +123,38 @@ describe("resolveLlm / T-L9 名字前后空格", () => {
     });
 });
 
-describe("resolveLlm / T-L10 首组无名字时的告警文案", () => {
-    test("第一组 name 为 undefined 时告警不崩，且用 (未命名)", () => {
+describe("resolveLlm / T-L10 首组无名字时【BR-2：未命中即 null】", () => {
+    test("第一组 name 为 undefined 时，未命中返回 null，不抛不告警", () => {
         const w = spyWarn();
         const noName: LlmGroup = { name: undefined as unknown as string, base: "b", key: "k", model: "m" };
         const r = resolveLlm([noName], "missing", w.fn);
-        expect(r!.fallback).toBe(true);
-        expect(r!.name).toBeNull();
-        expect(w.calls).toHaveLength(1);
-        expect(w.calls[0]).toContain("(未命名)");
+        expect(r).toBeNull();
+        expect(w.calls).toHaveLength(0);
+    });
+});
+
+describe("resolveLlm / T-L13 [BR-6] 名字大小写不敏感", () => {
+    test("组名 main，llmRef 写 MAIN / Main / ' main ' 均命中 main", () => {
+        for (const v of ["MAIN", "Main", " main ", "mAiN"]) {
+            const r = resolveLlm(groups(), v);
+            expect(r).not.toBeNull();
+            expect(r!.name).toBe("main");
+            expect(r!.fallback).toBe(false);
+        }
+    });
+
+    test("组名本身是大写时，小写 llmRef 也能命中", () => {
+        const up = [g({ name: "Main", base: "https://up" })];
+        const r = resolveLlm(up, "main");
+        expect(r!.name).toBe("Main");
+        expect(r!.base).toBe("https://up");
+    });
+
+    test("折叠只折叠 A-Z：İ 不会被折成 i", () => {
+        const odd: LlmGroup[] = [g({ name: "İd", base: "https://dot" })];
+        expect(resolveLlm(odd, "id")).toBeNull();
+        // 原文仍可精确命中
+        expect(resolveLlm(odd, "İd")!.base).toBe("https://dot");
     });
 });
 

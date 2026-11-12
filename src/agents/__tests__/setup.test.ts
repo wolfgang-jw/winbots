@@ -86,7 +86,7 @@ describe("parseAgentSetup", () => {
   });
 
   test("S7 缺 uid 且 mintUid=null → invalid_setup", () => {
-    const r = parseAgentSetup(JSON.stringify({ name: "devops" }), opts({ mintUid: null }));
+    const r = parseAgentSetup(JSON.stringify({ name: "devops", llm: "main" }), opts({ mintUid: null }));
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe("invalid_setup");
@@ -95,7 +95,7 @@ describe("parseAgentSetup", () => {
 
   test("S8 缺 uid 且 mintUid 有值 → ok 且 uid 已写入", () => {
     const r = parseAgentSetup(
-      JSON.stringify({ name: "devops" }),
+      JSON.stringify({ name: "devops", llm: "main" }),
       opts({ mintUid: "ag_00000001" }),
     );
     expect(r.ok).toBe(true);
@@ -105,14 +105,14 @@ describe("parseAgentSetup", () => {
 
   test("S9 maxRounds 钳制到 1–32", () => {
     const hi = parseAgentSetup(
-      JSON.stringify({ uid: "ag_00000001", name: "devops", limits: { maxRounds: 999 } }),
+      JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "main", limits: { maxRounds: 999 } }),
       opts(),
     );
     expect(hi.ok).toBe(true);
     if (hi.ok) expect(hi.data.maxRounds).toBe(32);
 
     const lo = parseAgentSetup(
-      JSON.stringify({ uid: "ag_00000001", name: "devops", limits: { maxRounds: 0 } }),
+      JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "main", limits: { maxRounds: 0 } }),
       opts(),
     );
     expect(lo.ok).toBe(true);
@@ -121,12 +121,12 @@ describe("parseAgentSetup", () => {
 
   test("S10 systemBudget<=0 报错；memory 缺省为 true", () => {
     const bad = parseAgentSetup(
-      JSON.stringify({ uid: "ag_00000001", name: "devops", systemBudget: 0 }),
+      JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "main", systemBudget: 0 }),
       opts(),
     );
     expect(bad.ok).toBe(false);
 
-    const ok = parseAgentSetup(JSON.stringify({ uid: "ag_00000001", name: "devops" }), opts());
+    const ok = parseAgentSetup(JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "main" }), opts());
     expect(ok.ok).toBe(true);
     if (ok.ok) {
       expect(ok.data.memoryEnabled).toBe(true);
@@ -140,13 +140,13 @@ describe("parseAgentSetup", () => {
 
   test("补充：uid 格式非法 → invalid_setup；BOM 可解析", () => {
     const badUid = parseAgentSetup(
-      JSON.stringify({ uid: "AG_00000001", name: "devops" }),
+      JSON.stringify({ uid: "AG_00000001", name: "devops", llm: "main" }),
       opts(),
     );
     expect(badUid.ok).toBe(false);
 
     const bom = parseAgentSetup(
-      "\uFEFF" + JSON.stringify({ uid: "ag_00000001", name: "devops" }),
+      "\uFEFF" + JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "main" }),
       opts(),
     );
     expect(bom.ok).toBe(true);
@@ -168,9 +168,42 @@ describe("parseAgentSetup", () => {
 
   test("补充：多层路径的 name 必须等于叶子名", () => {
     const r = parseAgentSetup(
-      JSON.stringify({ uid: "ag_00000001", name: "devops" }),
+      JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "main" }),
       opts({ path: "ops/devops" }),
     );
     expect(r.ok).toBe(true);
+  });
+
+  /* [BR-1] llm 由「可选」改为「必填」—— 以下 4 条守住新语义 */
+  test("S11 缺 llm → invalid_setup，原因含 llm（BR-1）", () => {
+    const r = parseAgentSetup(
+      JSON.stringify({ uid: "ag_00000001", name: "devops" }),
+      opts(),
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe("invalid_setup");
+    expect(r.reason).toContain("llm");
+  });
+
+  test("S12 llm 为 null / 空串 / 非字符串 → invalid_setup（BR-1）", () => {
+    for (const v of [null, "", "   ", 42, {}, []]) {
+      const r = parseAgentSetup(
+        JSON.stringify({ uid: "ag_00000001", name: "devops", llm: v }),
+        opts(),
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe("invalid_setup");
+    }
+  });
+
+  test("S13 llm 大小写不敏感由注入方决定：MAIN 在 KNOWN 折叠后可通过（BR-6）", () => {
+    const foldKnown = (n: string): boolean => n.trim().toLowerCase() === "main";
+    const r = parseAgentSetup(
+      JSON.stringify({ uid: "ag_00000001", name: "devops", llm: "MAIN" }),
+      opts({ isKnownLlm: foldKnown }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.data.llmRef).toBe("MAIN");   // 保留原大小写，不折叠存储
   });
 });

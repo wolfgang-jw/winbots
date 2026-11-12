@@ -32,7 +32,7 @@ import {
     type ScanDeps,
 } from "@/agents";
 import { AGENTS_ROOT } from "@/agents/paths";
-import { loadEnvJson } from "@/infra/envJson";
+import { loadEnvJson, foldLlmName } from "@/infra/envJson";
 
 const app = new Hono();
 
@@ -40,19 +40,21 @@ const app = new Hono();
  * 公共：扫描 deps 与记录整形
  * ============================================================ */
 
-/** 构造扫描 deps：合法 llm 名字集合来自 env.json 的 llm[].name */
+/** 构造扫描 deps：合法 llm 名字集合来自 env.json 的 llm[].name（[BR-6] 折叠口径） */
 function scanDeps(): ScanDeps {
+    // [BR-6] 集合按**折叠后**构建，与 resolveLlm / findLlmIndex 同口径；
+    //   否则 setup.json 写 "MAIN" 会在这里被判 unknown_llm，而运行期却能解析到 main。
     const names = new Set<string>();
     try {
         for (const g of loadEnvJson().llm ?? []) {
-            if (g && typeof g.name === "string" && g.name !== "") names.add(g.name);
+            if (g && typeof g.name === "string" && g.name !== "") names.add(foldLlmName(g.name));
         }
     } catch {
         /* env.json 不可用时视为「没有任何合法 llm」，llmRef 会被判 unknown_llm */
     }
     return {
         // 名字集合为空时放行（等价于不校验），避免 env.json 缺失导致整批 agent 变 invalid
-        isKnownLlm: (n: string) => names.size === 0 || names.has(n),
+        isKnownLlm: (n: string) => names.size === 0 || names.has(foldLlmName(n)),
         mintUid: false, // 【关键】读写接口不允许悄悄改写磁盘上的 uid
     };
 }
@@ -201,16 +203,16 @@ app.post("/", async (c) => {
         return c.json({ ok: false, error: "body 与 setup 至少要提供一个" }, 400);
     }
 
-    // llmRef 合法性由这里注入（write.ts 不读配置）
+    // llmRef 合法性由这里注入（write.ts 不读配置）；[BR-6] 折叠口径与 scanDeps 一致
     const names = new Set<string>();
     try {
         for (const g of loadEnvJson().llm ?? []) {
-            if (g && typeof g.name === "string" && g.name !== "") names.add(g.name);
+            if (g && typeof g.name === "string" && g.name !== "") names.add(foldLlmName(g.name));
         }
     } catch {
         /* ignore */
     }
-    const isKnownLlm = (n: string) => names.size === 0 || names.has(n);
+    const isKnownLlm = (n: string) => names.size === 0 || names.has(foldLlmName(n));
 
     const res = upsertAgent(
         {

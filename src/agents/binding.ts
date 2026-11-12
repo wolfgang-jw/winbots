@@ -50,7 +50,40 @@ export type BindingResolution =
       llmRef: string | null;
     }
   /** 降级：目录被删 / setup 损坏 / uid 重复 → 按未绑定装配，但工具全拒（元工具除外，A17） */
-  | { kind: "degraded"; reason: string; personaText: string };
+  | { kind: "degraded"; reason: string; personaText: string; /**
+   * [D-3 / BR-2] 降级是否由「LLM 引用失效」引起。
+   *
+   * 为 true 时**不能**沿用 A17 的「静默降级继续回答」：那样等于用户以为在用
+   * agent A，实际上跑的是默认组配置。chat.ts 见此标记直接 409 并提示。
+   *
+   * 判据只看 invalidReason 前缀，不看其它成因：
+   *   unknown_llm:  → llm 指向不存在的组
+   *   invalid_setup: 且原因为缺 llm / llm 非字符串 → 必填缺失（BR-1）
+   * 目录被删 / 正文为空 / uid 重复等一律 false，保持既有降级语义。
+   */
+  llmInvalid?: boolean };
+
+/**
+ * [D-3] 判断 invalidReason 是否由 LLM 引用问题引起。
+ *
+ * 只认两种前缀，其余（invalid_body / uid 重复 / 目录问题）一律 false：
+ *   - `unknown_llm:`    → setup llm 指向了 env.json llm[] 里不存在的组
+ *   - `invalid_setup:` 且正文提到 llm → 缺 llm 或 llm 类型/空值非法（BR-1）
+ *
+ * ⚠️ 不按字符串相等判断：scan.ts 拼装 invalidReason 时会带上前缀后的说明文本，
+ *    这里用 startsWith / includes 以兼容文案微调。
+ */
+function isLlmInvalidReason(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  if (reason.startsWith("unknown_llm:")) return true;
+  if (!reason.startsWith("invalid_setup:")) return false;
+  /* 用 \bllm\b 而不是 includes("llm")：
+   *   invalid_setup 的文案形如 `invalid_setup: llm 必须是…` / `缺少 llm（必填）…`，
+   *   而其它字段的文案不会出现独立的 llm 词。用词边界可避免「systemLlmFoo」这类
+   *   含 llm 子串的字段名把无关错误误判成 LLM 失效（那会错误地 409）。
+   */
+  return /\bllm\b/i.test(reason);
+}
 
 /**
  * 解析会话的绑定。
@@ -102,10 +135,17 @@ export function resolveBinding(
   }
   // 情形 3：记录在但状态非法（setup 损坏 / uid 重复）
   if (rec.status !== "ok") {
+    // [D-3] LLM 引用失效必须拒绝而非降级：见 BindingResolution 上该字段的说明
+    const llmInvalid = isLlmInvalidReason(rec.invalidReason);
     return {
       kind: "degraded",
-      reason: `agent ${rec.path} 当前不可用（${rec.invalidReason ?? "配置非法"}），已降级`,
+      // llmInvalid 时给一份「不说已降级」的原因：调用方会据此直接拒绝请求，
+      // 文案里再出现「已降级」会与「请求已拒绝」自相矛盾。
+      reason: llmInvalid
+        ? `agent ${rec.path} 的 LLM 引用失效（${rec.invalidReason ?? "配置非法"}）`
+        : `agent ${rec.path} 当前不可用（${rec.invalidReason ?? "配置非法"}），已降级`,
       personaText: personaSnapshot ?? "",
+      llmInvalid,
     };
   }
   // 情形 4：正常
