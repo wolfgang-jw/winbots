@@ -50,11 +50,13 @@ import {
   DESC_ACT,
   DESC_CLOSE,
   DESC_EXTRACT,
+  DESC_NETLOG,
   DESC_OBSERVE,
   DESC_OPEN,
   SCHEMA_ACT,
   SCHEMA_CLOSE,
   SCHEMA_EXTRACT,
+  SCHEMA_NETLOG,
   SCHEMA_OBSERVE,
   SCHEMA_OPEN,
 } from "./_browser_schemas";
@@ -585,6 +587,254 @@ async function runExtractTool(args: Record<string, unknown>, ctx?: ToolContext):
 }
 
 // ============================================================
+// [新增] netlog：抓包读取
+// ============================================================
+
+/**
+ * 读取抓包缓冲（**只读**：不触发快照、不 bump 代次、不分配 ref，与 observe/extract 同口径）。
+ *
+ * 为什么单列一个工具而不是塞进 extract：
+ *   ① extract 的语义是「读 DOM」，抓包读的是「网络层」，混淆会让模型以为 ref 会变；
+ *   ② 抓包参数（afterSeq/types/contains）与 extract 的（selector/offset）完全不同；
+ *   ③ 只读工具不参与 act 的校验流水线，独立门面可以避免污染 BR-11「唯一动作入口」。
+ */
+async function runNetlogTool(args: Record<string, unknown>, ctx?: ToolContext): Promise<Envelope> {
+  if (!isBrowserGroupOn()) {
+    return failEnvelope("tool_disabled", "浏览器工具已禁用，本次未执行");
+  }
+
+  const s = getSession(ctx?.sessionId);
+  if (!s) {
+    return failEnvelope(
+      "session_not_found",
+      "当前会话不存在（可能已被 close，或因空闲超时被回收）",
+    );
+  }
+
+  const d = s.driver;
+  if (typeof d.netLog !== "function") {
+    return failEnvelope("internal_error", "当前浏览器驱动不支持抓包（驱动未实现 netLog）");
+  }
+
+  // ---- 入参本地校验（0 次浏览器操作；非法即拒） ----
+  const tabRaw = args.tab;
+  let tabIndex = 0;
+  if (tabRaw !== undefined && tabRaw !== null && tabRaw !== "") {
+    const n = Number(tabRaw);
+    if (!Number.isInteger(n) || n < 1) {
+      return failEnvelope(
+        "invalid_request",
+        `tab 必须是 ≥1 的标签序号（收到 ${String(tabRaw)}）；省略表示当前活跃标签`,
+      );
+    }
+    tabIndex = n;
+  }
+
+  const typesRaw = args.types;
+  let types: string[] = [];
+  if (typesRaw !== undefined && typesRaw !== null) {
+    if (Array.isArray(typesRaw)) {
+      types = typesRaw.map((t) => String(t).trim().toLowerCase()).filter((t) => t.length > 0);
+    } else if (typeof typesRaw === "string" && typesRaw.trim()) {
+      types = typesRaw
+        .split(",")
+        .map((t) => t.trim().toLowerCase())
+        .filter((t) => t.length > 0);
+    } else {
+      return failEnvelope("invalid_request", "types 必须是字符串数组（如 [\"xhr\",\"fetch\"]）或逗号分隔字符串");
+    }
+    if (types.length > 12) {
+      return failEnvelope("invalid_request", `types 最多 12 项（收到 ${types.length} 项）`);
+    }
+  }
+
+  const contains = typeof args.contains === "string" ? args.contains.trim() : "";
+  if (contains.length > 200) {
+    return failEnvelope("invalid_request", `contains 过长（${contains.length} 字符），上限 200`);
+  }
+
+  const onlyFailed = args.only_failed === true || args.only_failed === "true";
+
+  const afterSeqRaw = args.after_seq;
+  let afterSeq = 0;
+  if (afterSeqRaw !== undefined && afterSeqRaw !== null && afterSeqRaw !== "") {
+    const n = Number(afterSeqRaw);
+    if (!Number.isInteger(n) || n < 0) {
+      return failEnvelope("invalid_request", `after_seq 必须为非负整数（收到 ${String(afterSeqRaw)}）`);
+    }
+    afterSeq = n;
+  }
+
+  const limitRaw = args.limit;
+  let limit = 50;
+  if (limitRaw !== undefined && limitRaw !== null && limitRaw !== "") {
+    const n = Number(limitRaw);
+    if (!Number.isInteger(n) || n < 1 || n > 300) {
+      return failEnvelope("invalid_request", `limit 必须是 1–300 的整数（收到 ${String(limitRaw)}）`);
+    }
+    limit = n;
+  }
+
+  const clear = args.clear === true || args.clear === "true";
+  const withBodyOf = typeof args.body_of === "string" ? args.body_of.trim() : "";
+  if (withBodyOf.length > 80) {
+    return failEnvelope("invalid_request", `body_of 过长（${withBodyOf.length} 字符），上限 80`);
+  }
+  // 只接受 CDP 请求 id 的字符集（形如 "1234.56" 或 32 位十六进制）。
+  // 不校验的话，id 里带 】、换行或控制字符会破坏下面 bodySection 的文本结构。
+  if (withBodyOf && !/^[A-Za-z0-9._:-]+$/.test(withBodyOf)) {
+    return failEnvelope(
+      "invalid_request",
+      `body_of 含非法字符（只允许字母、数字、. _ : -），收到 ${JSON.stringify(withBodyOf.slice(0, 40))}`,
+    );
+  }
+
+  try {
+    return await runSerial(s, async () => {
+      const r = await d.netLog!({
+        tabIndex: tabIndex > 0 ? tabIndex : undefined,
+        types,
+        contains,
+        onlyFailed,
+        afterSeq,
+        limit,
+        clear,
+      });
+      if (!r.ok) {
+        const code: BrowserErrorCode = r.kind === "closed" ? "session_not_found" : "internal_error";
+        return failEnvelope(code, `读取抓包缓冲失败：${r.reason}`);
+      }
+
+      const page = r.value;
+
+      // 可选：顺带取某条请求的响应正文
+      let bodySection = "";
+      let bodyMeta: { id: string; length: number; truncated: boolean } | null = null;
+      if (withBodyOf) {
+        if (typeof d.responseBody !== "function") {
+          bodySection = `\n\n【响应正文 ${withBodyOf}】当前驱动不支持按下标取正文。`;
+        } else {
+          const b = await d.responseBody(withBodyOf);
+          if (!b.ok) {
+            bodySection = `\n\n【响应正文 ${withBodyOf}】取正文失败：${b.reason}`;
+          } else if (b.value.omitted && b.value.body.length === 0) {
+            // 完全没给出正文（二进制 / 非文本）：omitted 本身就是说明
+            bodySection = `\n\n【响应正文 ${withBodyOf}】${b.value.omitted}`;
+          } else {
+            const len = b.value.body.length;
+            const cut = b.value.omitted.length > 0;
+            // 显式标出长度与是否被截断：否则模型只能自己数 text 里的字符，判断不了完整性
+            bodySection =
+              `\n\n【响应正文 ${withBodyOf}】（${b.value.base64 ? "base64" : "文本"}，` +
+              `${len} 字符${cut ? "，已截断" : "，完整"}）` +
+              `${cut ? `\n说明：${b.value.omitted}` : ""}\n${b.value.body}`;
+            bodyMeta = { id: withBodyOf, length: len, truncated: cut };
+          }
+        }
+      }
+
+      // ---- 结果整形：表格式摘要 + 结构化字段 ----
+      const lines: string[] = [];
+      if (page.buffered === 0) {
+        lines.push(
+          "抓包缓冲为空。若页面已经加载过，通常是抓包在页面加载之后才开始——" +
+            "请先触发一次动作（click / press Enter 等）或 nav，再调用本工具。",
+        );
+      } else {
+        lines.push(
+          `共 ${page.entries.length} 条（缓冲 ${page.buffered} 条，游标 ${page.cursor}` +
+            `${page.dropped ? "，已截断/游标被环覆盖" : ""}）` +
+            (page.tabs.length > 0 ? `；有记录标签：${page.tabs.join(",")}` : ""),
+        );
+        for (let i = 0; i < page.entries.length; i++) {
+          const e = page.entries[i];
+          const at = i + 1;
+          const status = e.failed
+            ? `失败(${e.failed})`
+            : e.status > 0
+              ? `${e.status}${e.statusText ? ` ${e.statusText}` : ""}`
+              : "进行中";
+          const rt = e.resourceType || "?";
+          // URL 截断：data: URL 与带长 query 的接口能轻易到几千字符，不截会撑爆结果
+          const urlShown = e.url.length > 300 ? `${e.url.slice(0, 300)}…（共 ${e.url.length} 字符）` : e.url;
+          lines.push(
+            `${at}. [${rt}] ${e.method} ${urlShown} → ${status}` +
+              `${e.mimeType ? `｜${e.mimeType}` : ""}${e.requestBody ? `｜body=${e.requestBody.length}字` : ""}` +
+              `\n   id=${e.id}${e.requestBodyOmit ? `｜${e.requestBodyOmit}` : ""}`,
+          );
+        }
+        lines.push(
+          "提示：要看某条请求的响应正文，用 body_of 传它的 id；增量读取用 after_seq=" + page.cursor + "。",
+        );
+      }
+
+      const text = lines.join("\n") + bodySection;
+      // ⚠️ 回灌体积控制：meta 会整体进结果文本，300 条 × (头 + body) 足以撑爆平台长度上限。
+      //   因此这里只回灌「判定所需的最小字段」，完整头部/请求体只保留在文本摘要里。
+      //   头部尤其危险：60 条 × 40 头 × 160 字符 ≈ 384KB，会直接超出平台结果上限、导致结果被截断。
+      //   所以「带头部的条目数」单独收紧到最近 10 条，且头部字段更严地裁。
+      const META_MAX_ENTRIES = 60;
+      const META_BODY_MAX = 300;
+      const HEAD_ENTRY_MAX = 10;
+      const HEAD_MAX = 12;
+      const HEAD_VAL_MAX = 120;
+      const trimHeaders = (h: Record<string, string>): Record<string, string> => {
+        const out: Record<string, string> = {};
+        let n = 0;
+        for (const [k, v] of Object.entries(h)) {
+          if (n++ >= HEAD_MAX) break;
+          out[k] = v.length > HEAD_VAL_MAX ? `${v.slice(0, HEAD_VAL_MAX)}…` : v;
+        }
+        return out;
+      };
+      const metaEntriesLen = Math.min(page.entries.length, META_MAX_ENTRIES);
+      const metaEntries = page.entries.slice(-META_MAX_ENTRIES).map((e, i) => {
+        // 只有最近 HEAD_ENTRY_MAX 条带头部；更早的只给一句提示，避免 meta 膨胀。
+        // ⚠️ i 是 slice(-META_MAX_ENTRIES) 之后的相对下标（0..N-1），
+        //   不能用「总长度-1」来算距离，否则 entries > 60 时距离恒 > 10 → 所有条目都不给头部。
+        const allowHeaders = metaEntriesLen - i <= HEAD_ENTRY_MAX;
+        return {
+          id: e.id,
+          method: e.method,
+          url: e.url.length > 500 ? `${e.url.slice(0, 500)}…` : e.url,
+          resourceType: e.resourceType,
+          status: e.status,
+          mimeType: e.mimeType,
+          failed: e.failed,
+          // 工具描述承诺返回请求头/响应头，此前漏了回灌（模型完全看不到头部）。
+          requestHeaders: allowHeaders ? trimHeaders(e.requestHeaders) : {},
+          responseHeaders: allowHeaders ? trimHeaders(e.responseHeaders) : {},
+          headersOmitted: allowHeaders ? "" : "仅最近 10 条返回头部",
+          // 请求体只留前缀，避免大表单把 meta 撑爆
+          requestBody:
+            e.requestBody.length > META_BODY_MAX
+              ? `${e.requestBody.slice(0, META_BODY_MAX)}…（共 ${e.requestBody.length} 字）`
+              : e.requestBody,
+          requestBodyOmit: e.requestBodyOmit,
+        };
+      });
+
+      return ok(withTail(text), {
+        tool: "internet.browser.netlog",
+        session: s.prefix,
+        count: page.entries.length,
+        buffered: page.buffered,
+        cursor: page.cursor,
+        truncated: page.dropped,
+        tabs: page.tabs,
+        metaEntriesOmitted: Math.max(0, page.entries.length - META_MAX_ENTRIES),
+        entries: metaEntries,
+        // body_of 的元信息：给的正文有多长、是否被截断（仅当成功取到正文时出现）
+        ...(bodyMeta ? { body: bodyMeta } : {}),
+      });
+    });
+  } catch (err) {
+    if (err instanceof SessionBusyError) return busyEnvelope();
+    return failEnvelope("internal_error", `读取抓包缓冲时发生未预期异常：${errText(err)}`);
+  }
+}
+
+// ============================================================
 // close
 // ============================================================
 
@@ -727,6 +977,20 @@ export const tools: Tool[] = [
         return await runExtractTool(args, ctx);
       } catch (err) {
         return failEnvelope("internal_error", `读取内容工具内部错误：${errText(err)}`);
+      }
+    },
+  },
+  {
+    // [新增] 第 6 个工具：抓包（只读）。BR-01 原文写「恰为 5 个」，本工具使工具面 5 → 6，需同步修 BR-01 口径
+    name: "netlog",
+    description: DESC_NETLOG,
+    parameters: SCHEMA_NETLOG,
+    enabled: () => isBrowserGroupOn(),
+    handler: async (args, ctx) => {
+      try {
+        return await runNetlogTool(args, ctx);
+      } catch (err) {
+        return failEnvelope("internal_error", `抓包工具内部错误：${errText(err)}`);
       }
     },
   },
@@ -904,5 +1168,19 @@ export const settings: Record<string, SettingDef> = {
         min: 0,
         max: 100,
         desc: "逐字输入的时间间隔（毫秒）。",
+    },
+    netlog_capacity: {
+        kind: "number",
+        default: 300,
+        min: 10,
+        max: 2000,
+        desc: "抓包环形缓冲条数上限。超出后丢弃最旧的条目（只影响 netlog 的读取，不影响页面行为）。",
+    },
+    netlog_body_max_chars: {
+        kind: "number",
+        default: 4000,
+        min: 200,
+        max: 24000,
+        desc: "netlog 用 body_of 取响应正文时的字符上限（硬上限 24000）；超出只保留前缀并注明。",
     },
 };

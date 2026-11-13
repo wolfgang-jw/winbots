@@ -320,6 +320,26 @@ LLM_MODEL=deepseek-chat
 - **端点 404（检索）或一直解析不出正文**：启动日志里会打印 `INTERNET 检索端点` / `INTERNET 抓取端点` 两行，先核对它们是否与供应商文档一致（DeepSeek 官方为 `/v1/tools/search`、`/v1/tools/fetch`）。若确认配错，改 `INTERNET_DEEPSEEK_SEARCH_PATH` / `INTERNET_DEEPSEEK_FETCH_PATH` 即可，无需改代码。
   > 提示：检索返回 **404 不等于「没搜到」**（无结果是 `200` + 空列表）。检索报 404 时请优先怀疑端点配置，而不是换检索词。
 
+### Q9：通用 HTTP 工具（`internet__http__request`）怎么开启？返回 `blocked_by_policy` 怎么办？
+
+- **工具组**：`internet/http`，唯一工具 `request`（模型可见名 `internet__http__request`）。
+- **怎么开**：开关**不在 `.env` 里**，而是写在目标 agent 的 `setup.json` 的 `tools.allow` 中
+  （或在配置页「编辑智能体」弹窗里勾选）。任一种写法都算整组开启：
+  `TOOLON__internet__http` / `internet__http` / `internet__http__*`。
+  > `tools.allow` 缺失或为空 = **全部禁用**，此时该工具不会出现在模型视野里。
+- **改了要不要重启**：`http.ts` 是入口文件，改动**免重启**；但它依赖目录声明文件
+  `internet/_settings.ts`（私有模块），**该文件的增删改都需要重启一次**。
+- **返回 `blocked_by_policy`**：被目录设置项拦下了。两项都在 `internet` 目录节点下：
+  - `etc__tools__internet__blocked_hosts`：禁止访问的主机名（空 = 不限制）；
+  - `etc__tools__internet__block_private_net`：是否阻断内网 / 回环地址，**默认 `true`**。
+    需要访问内网接口时改为 `false`（注意这是 SSRF 风险面，仅在可信环境放开）。
+- **返回 `invalid_request` 且文案含「本次未发出任何网络请求」**：参数在本地就被拒了
+  （url 非法 / 方法不支持 / GET 带请求体 / body 超限等），**请求没有发出去**，按提示改参数即可。
+- **正文太长只看到一段**：结果里有「正文区间 / 全文长度 / 下一段偏移」，用同一地址加
+  `offset=<下一段偏移>` 再次调用即可续读；每次续读都会**重新发起一次请求**（本工具不暂存正文）。
+- **超时**：`TOOLSET__internet__http__timeout_ms`（默认 20000ms）；本工具**不重试**，
+  非幂等方法重试会产生重复副作用。
+
 ---
 
 ## 🗑 六、卸载

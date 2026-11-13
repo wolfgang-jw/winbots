@@ -24,6 +24,14 @@ import { bringWindowToFront, type ForegroundResult } from "./_browser_foreground
 // [REQ-browser BR-16～BR-26] 标签中心：注册 / 附着 / 切换 / 关闭 / 编号 / 目标事件
 //   NB-01：这些逻辑写在 _browser_targets.ts，驱动只留转发方法与「按活跃标签解析会话 id」
 import { TargetHub, type TabBrief, type TabOp, type TabsSnapshot } from "./_browser_targets";
+// [新增] 抓包：缓冲与条目整形逻辑集中在 _browser_netlog.ts（NB-01：驱动不再增长）
+import {
+  NetCapture,
+  entryFromRequestWillBeSent,
+  applyResponse,
+  isTextual,
+  type NetEntry,
+} from "./_browser_netlog";
 
 // ============================================================
 // 类型：事实与失败类别
@@ -183,6 +191,48 @@ export interface BrowserDriver {
   switchTarget?(sel: number | "prev" | "next"): Promise<TabOp<{ index: number; count: number; targetId: string }>>;
   /** [REQ-browser BR-23] 关闭当前标签并回退（`targetId` = 回退后的活动标签） */
   closeTarget?(): Promise<TabOp<{ closedIndex: number; index: number; count: number; targetId: string }>>;
+  /**
+   * [新增] 抓包：取已缓冲的网络请求（只读）。
+   * 追加方法、可选实现：假驱动未实现时 `netlog` 返回 internal_error，
+   * 其余 5 个工具完全不受影响（NB-03：接口只允许追加，不改既有签名）。
+   */
+  netLog?(o: NetLogOptions): Promise<DriverResult<NetLogPage>>;
+  /**
+   * [新增] 抓包：按需拉某条请求的响应正文（只读）。
+   * 与 netLog 分开是刻意的：正文可能很大，只在模型明确要看时拉一次。
+   */
+  responseBody?(requestId: string): Promise<DriverResult<{ body: string; base64: boolean; omitted: string }>>;
+}
+
+/** [新增] 抓包读取选项 */
+export interface NetLogOptions {
+  /** 只看某个标签（1 起序号）；缺省 = 当前活跃标签 */
+  tabIndex?: number;
+  /** 只看这些资源类型（如 ["xhr","fetch","document"]）；空 = 全部 */
+  types?: string[];
+  /** 只看 URL 含该子串（大小写不敏感）的条目 */
+  contains?: string;
+  /** 只看状态码 ≥ 400 的失败条目 */
+  onlyFailed?: boolean;
+  /** 增量游标：返回比它更新的条目（0 = 全部） */
+  afterSeq?: number;
+  /** 最多返回多少条（默认 50，上限见实现） */
+  limit?: number;
+  /** 是否清空缓冲（读取前清） */
+  clear?: boolean;
+}
+
+/** [新增] 抓包读取结果 */
+export interface NetLogPage {
+  entries: NetEntry[];
+  /** 缓冲总条数 */
+  buffered: number;
+  /** 最近的游标值（下次增量读取用 afterSeq） */
+  cursor: number;
+  /** 是否因游标落在已覆盖区间而退化为「返回全部」 */
+  dropped: boolean;
+  /** 当前抓包覆盖的标签序号（缓冲里出现过的） */
+  tabs: number[];
 }
 
 /**
@@ -776,6 +826,13 @@ class ChromiumDriver implements BrowserDriver {
   private readonly sidOf = new Map<string, string>();
   /** [REQ-browser BR-17] 标签中心：注册/附着/切换/关闭/编号/目标事件（逻辑在 _browser_targets.ts） */
   private hub: TargetHub | null = null;
+  /**
+   * [新增] 抓包状态：每驱动（= 每会话）一份。
+   * 事件在 CdpConnection 上到达，只有驱动层收得到，所以状态挂在这里而不是 Session。
+   */
+  private net: NetCapture | null = null;
+  /** [新增] requestId → 命中条目的弱引用式索引（按标签分发响应体时用） */
+  private readonly netByRequest = new Map<string, NetEntry>();
 
   // ---------- 基础收发 ----------
 
@@ -1014,8 +1071,60 @@ class ChromiumDriver implements BrowserDriver {
     cdp.on("Inspector.detached", () => this.markClosed("调试会话被浏览器断开"));
     cdp.on("__closed__", () => this.markClosed(cdp.reasonOfClose || "连接已关闭"));
 
+    // ⑤ [新增] 抓包：订阅 Network 域事件。
+    //   ⚠️ 顺序与 P-32 同理：监听必须先于 Network.enable（在 initTab→enableTabPolicies 里下发），
+    //      否则开抓那一刻在途的请求无人接收，首屏请求会整批丢失。
+    this.installNetCapture(cdp);
+
     this.child?.once("exit", (code) => {
       this.markClosed(`浏览器进程已退出（code=${String(code ?? "")}）`);
+    });
+  }
+
+  /**
+   * [新增] 注册抓包事件监听（只订阅，不发命令；Network.enable 在 enableTabPolicies 里逐标签下发）。
+   * 刻意不用 onAny：onAny 拿不到「哪些事件属于哪个标签」的语义差异，且会把所有域的事件都灌进来。
+   */
+  private installNetCapture(cdp: CdpConnection): void {
+    if (!this.net) {
+      // 用 getSoft：installPolicies 可能在脱离 ALS 上下文时被调用（与 block_private_net 同一风险），
+      // 严格读会抛 ERR_UNDECLARED_SETTING，导致 launch 直接失败。
+      const cap = Math.max(10, Math.min(2000, Number(B.getSoft<number>("netlog_capacity", 300)) || 300));
+      this.net = new NetCapture(cap);
+    }
+    const net = this.net;
+
+    cdp.on("Network.requestWillBeSent", (params, sid) => {
+      const entry = entryFromRequestWillBeSent(params, sid ?? "", Date.now());
+      if (!entry) return;
+      // 同一 requestId 会因重定向再发一次：此时覆盖为新条目（保留最新一跳的 URL/方法）
+      net.ring.push(entry);
+      this.netByRequest.set(entry.id, entry);
+    });
+
+    cdp.on("Network.responseReceived", (params, sid) => {
+      const requestId = typeof params.requestId === "string" ? params.requestId : "";
+      if (!requestId) return;
+      const entry = this.netByRequest.get(requestId);
+      if (!entry) return;
+      applyResponse(entry, params, Date.now());
+      // 早期条目可能缺 sid（重定向链），以实际事件为准
+      if (sid && !entry.targetSessionId) entry.targetSessionId = sid;
+    });
+
+    cdp.on("Network.loadingFinished", (params) => {
+      const requestId = typeof params.requestId === "string" ? params.requestId : "";
+      const entry = requestId ? this.netByRequest.get(requestId) : undefined;
+      if (entry && !entry.endedAt) entry.endedAt = Date.now();
+    });
+
+    cdp.on("Network.loadingFailed", (params) => {
+      const requestId = typeof params.requestId === "string" ? params.requestId : "";
+      const entry = requestId ? this.netByRequest.get(requestId) : undefined;
+      if (!entry) return;
+      entry.failed = typeof params.errorText === "string" ? params.errorText : "加载失败";
+      entry.endedAt = Date.now();
+      // 被策略阻断（Fetch.failRequest → BlockedByClient）也在这里体现，便于模型区分
     });
   }
 
@@ -1026,6 +1135,9 @@ class ChromiumDriver implements BrowserDriver {
     // [REQ-browser BR-26] 连接断开即释放事件订阅：否则目标事件回调会挂在已失效的连接上
     this.hub?.dispose();
     this.hub = null;
+    // [新增] 抓包缓冲随连接一起丢弃（requestId 已失效，留着只会误导）
+    this.net?.ring.clear();
+    this.netByRequest.clear();
     this.launchOpts?.onDisconnected?.(reason);
   }
 
@@ -1092,6 +1204,27 @@ class ChromiumDriver implements BrowserDriver {
     await cdp
       .send("Page.setInterceptFileChooserDialog", { enabled: true }, sessionId, 5_000)
       .catch(() => undefined);
+
+    // [新增] 抓包：Network.enable 同样**页面级**，必须逐标签开（与 Fetch.enable 同一个坑）。
+    //   放在 Fetch.enable 之前无所谓，但必须在 installNetCapture 之后（监听先于命令）。
+    //   显式给 maxPostDataSize：否则 CDP 默认不在 requestWillBeSent 里带 postData，
+    //   模型的「请求体」字段会永远为空。
+    if (this.net) {
+      await cdp
+        .send(
+          "Network.enable",
+          {
+            maxTotalBufferSize: 10_000_000,
+            maxResourceBufferSize: 2_000_000,
+            maxPostDataSize: 64 * 1024,
+          },
+          sessionId,
+          10_000,
+        )
+        .then(() => this.net?.markEnabled(sessionId))
+        .catch(() => undefined);
+    }
+
     if (!this.launchOpts?.judgeRequest) return;
     await cdp
       .send(
@@ -1805,6 +1938,127 @@ class ChromiumDriver implements BrowserDriver {
   async sleep(ms: number): Promise<DriverResult<void>> {
     await sleepMs(ms);
     return { ok: true, value: undefined };
+  }
+
+  // ---------- [新增] 抓包读取（只读） ----------
+
+  /** tabIndex（1 起）→ 该标签的扁平会话 id；缺省取活跃标签 */
+  private sidOfTabIndex(tabIndex: number | undefined): string {
+    if (!tabIndex || tabIndex < 1) {
+      return this.targetId ? (this.sidOf.get(this.targetId) ?? this.sid) : this.sid;
+    }
+    const ids = [...this.sidOf.entries()];
+    const hit = ids[tabIndex - 1];
+    return hit ? hit[1] : this.sid;
+  }
+
+  /** 标签序号（1 起）；未知返回 0（该请求发出时所在标签已关闭 / 未登记） */
+  private tabIndexBySid(sid: string): number {
+    if (!sid) return 0;
+    const ids = [...this.sidOf.entries()];
+    for (let i = 0; i < ids.length; i++) {
+      if (ids[i][1] === sid) return i + 1;
+    }
+    return 0;
+  }
+
+  async netLog(o: NetLogOptions): Promise<DriverResult<NetLogPage>> {
+    const net = this.net;
+    if (!net || this.closed) {
+      return { ok: false, kind: "closed", reason: this.closeReason || "会话已关闭或未启用抓包" };
+    }
+    try {
+      if (o.clear) {
+        net.ring.clear();
+        this.netByRequest.clear();
+      }
+
+      const wantSid = this.sidOfTabIndex(o.tabIndex);
+      const types = (o.types ?? []).map((t) => t.toLowerCase()).filter((t) => t.length > 0);
+      const needle = (o.contains ?? "").toLowerCase();
+
+      const { list, dropped } = net.ring.since(Math.max(0, Math.trunc(o.afterSeq ?? 0)));
+      let filtered = list;
+      // tabIndex 缺省 = 活跃标签；显式 tabIndex 也必须按 sid 过滤（否则会把别的标签的请求一起返回）
+      if (wantSid) filtered = filtered.filter((e) => !e.targetSessionId || e.targetSessionId === wantSid);
+      if (types.length > 0) filtered = filtered.filter((e) => types.includes(e.resourceType.toLowerCase()));
+      if (needle) filtered = filtered.filter((e) => e.url.toLowerCase().includes(needle));
+      if (o.onlyFailed) filtered = filtered.filter((e) => e.status >= 400 || e.failed.length > 0);
+
+      const limit = Math.max(1, Math.min(300, Math.trunc(o.limit ?? 50) || 50));
+      const truncatedCount = Math.max(0, filtered.length - limit);
+      const picked = truncatedCount > 0 ? filtered.slice(filtered.length - limit) : filtered;
+
+      const tabs = [
+        ...new Set(
+          net.ring
+            .all()
+            .map((e) => this.tabIndexBySid(e.targetSessionId))
+            .filter((n) => n > 0),
+        ),
+      ].sort((a, b) => a - b);
+
+      return {
+        ok: true,
+        value: {
+          entries: picked.map((e) => ({ ...e })),
+          buffered: net.ring.size,
+          cursor: net.ring.cursor,
+          dropped: dropped || truncatedCount > 0,
+          tabs,
+        },
+      };
+    } catch (err) {
+      return this.fail(err);
+    }
+  }
+
+  async responseBody(
+    requestId: string,
+  ): Promise<DriverResult<{ body: string; base64: boolean; omitted: string }>> {
+    const cdp = this.cdp;
+    if (!cdp) return { ok: false, kind: "closed", reason: this.closeReason || "会话已关闭" };
+    const entry = this.netByRequest.get(requestId);
+    if (!entry) {
+      return { ok: false, kind: "not_found", reason: "该请求已不在缓冲中（已被环覆盖或已清空）" };
+    }
+    if (!entry.endedAt) {
+      return { ok: false, kind: "not_found", reason: "该请求尚未结束，正文还不可取" };
+    }
+    if (!isTextual(entry.mimeType)) {
+      return {
+        ok: true,
+        value: { body: "", base64: false, omitted: `非文本响应（${entry.mimeType || "未知类型"}），不取正文` },
+      };
+    }
+    // ⚠️ 必须用请求**自己那个标签**的 sessionId：切标签后活跃 sid 已变，
+    //   用 cmd() 会向另一个标签要正文，CDP 会报「No resource with given identifier」（或更糟：拿到别人的）。
+    const sid = entry.targetSessionId;
+    if (!sid) {
+      return { ok: false, kind: "not_found", reason: "无法确定该请求所属标签（会话信息缺失）" };
+    }
+    try {
+      const res = await cdp.send("Network.getResponseBody", { requestId }, sid, 15_000);
+      const body = typeof res.body === "string" ? res.body : "";
+      const base64 = res.base64Encoded === true;
+      if (base64) {
+        return { ok: true, value: { body: "", base64: true, omitted: "二进制响应，不提供正文" } };
+      }
+      const keep = Math.max(200, Math.min(24_000, Number(B.get<number>("netlog_body_max_chars")) || 4_000));
+      if (body.length > keep) {
+        return {
+          ok: true,
+          value: {
+            body: body.slice(0, keep),
+            base64: false,
+            omitted: `正文过长（${body.length} 字符），只保留前 ${keep} 字符`,
+          },
+        };
+      }
+      return { ok: true, value: { body, base64: false, omitted: "" } };
+    } catch (err) {
+      return this.fail(err);
+    }
   }
 }
 
