@@ -138,6 +138,8 @@ export interface BrowserDriver {
   bodyText(): Promise<DriverResult<string>>;
   assignRefs(pairs: Array<{ id: string; ref: string }>): Promise<DriverResult<number>>;
   locateByRef(ref: string): Promise<DriverResult<string>>;
+  /** [selector 定位] 按 CSS 选择器定位；命中多个且 index=0 时返回 not_found（歧义） */
+  locateBySelector(sel: string, index: number): Promise<DriverResult<string>>;
   locateByAnchor(a: ElementAnchor): Promise<DriverResult<string>>;
   scrollIntoView(id: string): Promise<DriverResult<boolean>>;
   boxOf(id: string): Promise<DriverResult<Rect & { visible: boolean }>>;
@@ -318,6 +320,10 @@ const PAGE_LIB = `(function () {
     //   注：content / rawOf / elByAnchor 都是函数声明，在本 IIFE 作用域内已提升，此处可直接引用；
     //       它们只调用 norm / cut / visible / roleOf / anchorOf / byRef 等纯函数，不碰 ids/seq/__wbCount。
     if (typeof window.__wb.content !== 'function') window.__wb.content = content;
+    // [selector 定位] idBySelector 是后加原语：旧库没有它，且它的实现会迭代修正。
+    //   就地覆盖（不判断是否存在），保证页面跑的是当前磁盘版本；
+    //   它只调用 norm/visible/idOf 等纯函数 + 写 data-wb-k，不碰 ids/seq，覆盖安全。
+    window.__wb.idBySelector = idBySelector;
     return;
   }
   var ids = new WeakMap();
@@ -581,6 +587,23 @@ const PAGE_LIB = `(function () {
 
   function idByRef(ref) { var el = byRef(ref); return el ? idOf(el) : null; }
 
+  // [selector 定位] 按 CSS 选择器定位元素，返回 { id } 或 { id: null, hits, visHits }
+  // 命中多个时**不做猜测**：index 为 0 且命中数 > 1 一律返回歧义，由调用方显式给 index。
+  function idBySelector(sel, index) {
+    sel = String(sel == null ? '' : sel);
+    if (!norm(sel)) return { id: null, hits: 0, visHits: 0, bad: false };
+    var all;
+    try { all = Array.prototype.slice.call(document.querySelectorAll(sel)); } catch (e) { return { id: null, hits: 0, visHits: 0, bad: true }; }
+    var vis = [];
+    for (var i = 0; i < all.length; i++) { if (visible(all[i])) vis.push(all[i]); }
+    // 可见命中为 0 时不回退到隐藏元素：写操作点隐藏元素会「报告成功但实际无效」。
+    if (!vis.length) return { id: null, hits: all.length, visHits: 0, bad: false };
+    var use = vis;
+    var want = Number(index) > 0 ? Math.trunc(Number(index)) : (use.length === 1 ? 1 : 0);
+    if (want < 1 || want > use.length) return { id: null, hits: all.length, visHits: vis.length, bad: false };
+    return { id: idOf(use[want - 1]), hits: all.length, visHits: vis.length, bad: false };
+  }
+
   function anchorOf(el) {
     return {
       name: cut(nameOf(el), 160),
@@ -751,6 +774,7 @@ const PAGE_LIB = `(function () {
     content: content,
     assignRefs: assignRefs,
     idByRef: idByRef,
+    idBySelector: idBySelector,
     idByAnchor: idByAnchor,
     anchorOf: anchorOf,
     anchorOfById: anchorOfById,
@@ -1592,6 +1616,28 @@ class ChromiumDriver implements BrowserDriver {
     try {
       const id = await this.callPage<string | null>("idByRef", ref);
       return id ? { ok: true, value: id } : dFail("not_found", `页面中已找不到 ${ref} 对应元素`);
+    } catch (err) {
+      return this.fail(err);
+    }
+  }
+
+  async locateBySelector(sel: string, index: number): Promise<DriverResult<string>> {
+    try {
+      const r = await this.callPage<{ id: string | null; hits: number; visHits: number; bad: boolean } | null>(
+        "idBySelector",
+        sel,
+        index,
+      );
+      if (!r) return dFail("not_found", `选择器 ${sel} 未命中任何元素`);
+      if (r.bad) return dFail("not_found", `选择器语法非法：${sel}`);
+      if (r.id) return { ok: true, value: r.id };
+      if (r.hits > 1) {
+        return dFail(
+          "not_found",
+          `选择器 ${sel} 命中 ${r.hits} 个元素（可见 ${r.visHits} 个），未指定 index 时不做猜测；请给出 index（1 起）或改用更精确的选择器`,
+        );
+      }
+      return dFail("not_found", `选择器 ${sel} 未命中任何元素`);
     } catch (err) {
       return this.fail(err);
     }

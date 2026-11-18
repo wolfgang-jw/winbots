@@ -22,13 +22,13 @@ const REF_RULE =
 const ACTION_FIELD_DESC =
     "动作类型：" +
     "nav=导航到 url；" +
-    "click=点击 ref；" +
-    "fill=向 ref 输入 text；" +
+    "click=点击 ref（或 selector 指定的元素）；" +
+    "fill=向 ref（或 selector）输入 text；" +
     "press=按键（当前焦点）；" +
     "scroll=滚动页面；" +
     "drag=把 ref 拖到 toRef；" +
-    "hover=把指针移到 ref；" +
-    "select=按 text 选中下拉项；" +
+    "hover=把指针移到 ref（或 selector）；" +
+    "select=按 text 选中下拉项（目标用 ref 或 selector）；" +
     "wait=等待 ms 毫秒；" +
     "switchTab=切换活动标签（用 tab 指定序号或 prev/next；本次调用只能有这一个动作）";
 
@@ -39,6 +39,15 @@ const ACTION_ITEM: Record<string, unknown> = {
         action: { type: "string", description: ACTION_FIELD_DESC, enum: ["nav", "click", "fill", "press", "scroll", "drag", "hover", "select", "wait", "switchTab"] },
         url: { type: "string", description: "仅 nav 使用：含 host 的 http/https 地址；不得包含用户名或密码" },
         ref: { type: "string", description: `适用于 click / fill / drag / hover / select。${REF_DESC}` },
+        selector: {
+            type: "string",
+            description:
+                "适用于 click / fill / drag / hover / select，与 ref 二选一（互斥）。CSS 选择器，用于目标元素没有 ref 的情况（例如只有 addEventListener 的列表项）；命中多个时必须配 index，不做自动猜测。同一个动作里不要同时给 ref 和 selector。",
+        },
+        index: {
+            type: "number",
+            description: "仅配合 selector 使用：命中多个时取第几个（1 起）；0 或不传 = 仅当唯一命中时自动取，命中多个则报歧义错误",
+        },
         toRef: { type: "string", description: "仅 drag 使用：拖拽终点元素，规则同 ref，且不能与 ref 相同" },
         text: { type: "string", description: "fill 要输入的文本（上限 4000 字符）；select 要选中的选项文本（需精确匹配）" },
         mode: { type: "string", description: "仅 fill 使用：assign=直接赋值（默认，适合 React 等受控组件）；type=逐字输入（适合联想框）", enum: ["assign", "type"] },

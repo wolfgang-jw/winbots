@@ -66,6 +66,10 @@ export interface ActAction {
   action: ActionName;
   url?: string;
   ref?: string;
+  /** [selector 定位] 与 ref 互斥；用于点击/悬停/填写等无法取得 ref 的元素（如仅有 addEventListener 的列表项） */
+  selector?: string;
+  /** [selector 定位] 命中多个时的序号（1 起）；0 = 仅当唯一命中时自动取 */
+  index?: number;
   toRef?: string;
   text?: string;
   mode?: "assign" | "type";
@@ -248,21 +252,50 @@ export function validateActArgs(raw: unknown): ValidationResult {
     const needRef: ActionName[] = ["click", "fill", "drag", "hover", "select"];
     if (needRef.includes(action)) {
       const ref = typeof o.ref === "string" ? o.ref.trim() : "";
-      if (!ref) {
+      const sel = typeof o.selector === "string" ? o.selector.trim() : "";
+      if (ref && sel) {
         return {
           ok: false,
           code: "invalid_request",
-          message: `第 ${at} 个动作（${action}）缺少 ref。ref 只能取自上一次工具返回的元素清单，例如 {"action":"${action}","ref":"e12"}。`,
+          message: `第 ${at} 个动作（${action}）的 ref 与 selector 只能给一个：ref 取自元素清单（如 e12），selector 是 CSS 选择器。`,
         };
       }
-      if (!REF_PATTERN.test(ref)) {
+      if (!ref && !sel) {
         return {
           ok: false,
           code: "invalid_request",
-          message: `第 ${at} 个动作（${action}）的 ref 格式非法：${previewText(ref, 20)}。ref 形如 e12，只能取自上一次工具返回的元素清单，不要自行编写选择器。`,
+          message: `第 ${at} 个动作（${action}）缺少 ref 或 selector。ref 取自上一次工具返回的元素清单（如 e12）；若目标元素不在清单里，可改用 selector（CSS 选择器，如 .history-item[data-id="x"]），命中多个时配合 index（1 起）。`,
         };
       }
-      a.ref = ref;
+      if (ref) {
+        if (!REF_PATTERN.test(ref)) {
+          return {
+            ok: false,
+            code: "invalid_request",
+            message: `第 ${at} 个动作（${action}）的 ref 格式非法：${previewText(ref, 20)}。ref 形如 e12，只能取自上一次工具返回的元素清单；若要按选择器定位，请改用 selector 字段。`,
+          };
+        }
+        a.ref = ref;
+      } else {
+        if (sel.length > 500) {
+          return {
+            ok: false,
+            code: "invalid_request",
+            message: `第 ${at} 个动作（${action}）的 selector 过长：${sel.length} 字符，上限 500。`,
+          };
+        }
+        a.selector = sel;
+        const rawIdx = o.index;
+        const idx = rawIdx === undefined || rawIdx === null ? 0 : intOf(rawIdx);
+        if (idx === null || idx < 0) {
+          return {
+            ok: false,
+            code: "invalid_request",
+            message: `第 ${at} 个动作（${action}）的 index 非法：${previewText(String(rawIdx), 10)}。合法取值：≥0 的整数（0 = 仅当唯一命中时自动取，1 起 = 指定第几个）。`,
+          };
+        }
+        a.index = idx;
+      }
     }
 
     if (action === "drag") {
@@ -711,40 +744,49 @@ async function execOne(
     };
   }
 
-  // 其余动作都需要 ref
+  // 其余动作都需要 ref 或 selector（两者互斥，校验层已保证只有一个）
   const ref = a.ref ?? "";
-  const loc = await locate(s, d, ref);
+  const sel = a.selector ?? "";
+  let loc: { ok: true; id: string } | { ok: false; reason: string };
+  if (sel) {
+    const r = await d.locateBySelector(sel, a.index ?? 0);
+    loc = r.ok ? { ok: true, id: r.value } : { ok: false, reason: r.reason };
+  } else {
+    loc = await locate(s, d, ref);
+  }
+  const refLabel = sel ? `selector(${previewText(sel, 40)}${a.index ? `#${a.index}` : ""})` : ref;
   if (!loc.ok) {
-    return { ok: false, code: "element_not_found", reason: loc.reason, logFields: `${tag}｜ref=${ref}` };
+    return { ok: false, code: "element_not_found", reason: loc.reason, logFields: `${tag}｜ref=${refLabel}` };
   }
   const id = loc.id;
-  const meta = roleTagOf(s, ref);
+  // selector 路径下没有 refTable 条目，meta 取空（脚本点击降级随之停用，属预期）
+  const meta = sel ? { tag: "", inputType: "" } : roleTagOf(s, ref);
 
   if (a.action === "hover") {
     const pt = await preparePoint(d, id);
-    if (!pt.ok) return { ok: false, code: pt.code, reason: pt.reason, logFields: `${tag}｜ref=${ref}` };
+    if (!pt.ok) return { ok: false, code: pt.code, reason: pt.reason, logFields: `${tag}｜ref=${refLabel}` };
     const mv = await d.movePointer(pt.x, pt.y);
-    if (!mv.ok) return { ok: false, code: mapKind(mv.kind, "step"), reason: mv.reason, logFields: `${tag}｜ref=${ref}` };
+    if (!mv.ok) return { ok: false, code: mapKind(mv.kind, "step"), reason: mv.reason, logFields: `${tag}｜ref=${refLabel}` };
     const ch = await detectChange(s, d);
     return {
       ok: true,
-      line: `hover ${ref} → 已移入${ch.changed ? "（页面已变化）" : "（页面未变化）"}`,
+      line: `hover ${refLabel} → 已移入${ch.changed ? "（页面已变化）" : "（页面未变化）"}`,
       changed: ch.changed,
       navigated: ch.navigated,
       degraded: false,
       wantFullSnapshot: false,
-      logFields: `${tag}｜ref=${ref}`,
+      logFields: `${tag}｜ref=${refLabel}`,
     };
   }
 
   if (a.action === "click") {
     const pt = await preparePoint(d, id);
-    if (!pt.ok) return { ok: false, code: pt.code, reason: pt.reason, logFields: `${tag}｜ref=${ref}` };
+    if (!pt.ok) return { ok: false, code: pt.code, reason: pt.reason, logFields: `${tag}｜ref=${refLabel}` };
     const button = a.button ?? "left";
     const count = a.clickCount ?? 1;
     const c = await d.clickAt(pt.x, pt.y, button, count);
     if (!c.ok) {
-      return { ok: false, code: mapKind(c.kind, "step"), reason: c.reason, logFields: `${tag}｜ref=${ref}` };
+      return { ok: false, code: mapKind(c.kind, "step"), reason: c.reason, logFields: `${tag}｜ref=${refLabel}` };
     }
     let ch = await detectChange(s, d);
     let degraded = false;
@@ -762,14 +804,14 @@ async function execOne(
     if (ch.navigated) note += "（点击导致页面跳转）";
     return {
       ok: true,
-      line: `click ${ref}${button !== "left" ? `[${button}]` : ""}${count > 1 ? `×${count}` : ""} → 已点击${
+      line: `click ${refLabel}${button !== "left" ? `[${button}]` : ""}${count > 1 ? `×${count}` : ""} → 已点击${
         ch.changed ? "（页面已变化）" : "（页面未变化）"
       }${note}`,
       changed: ch.changed,
       navigated: ch.navigated,
       degraded,
       wantFullSnapshot: ch.navigated,
-      logFields: `${tag}｜ref=${ref}｜button=${button}｜count=${count}｜degraded=${degraded ? "yes" : "no"}｜navigated=${
+      logFields: `${tag}｜ref=${refLabel}｜button=${button}｜count=${count}｜degraded=${degraded ? "yes" : "no"}｜navigated=${
         ch.navigated ? "yes" : "no"
       }`,
     };
@@ -781,7 +823,7 @@ async function execOne(
     await d.scrollIntoView(id);
     const focus = await d.focus(id);
     if (!focus.ok) {
-      return { ok: false, code: mapKind(focus.kind, "step"), reason: focus.reason, logFields: `${tag}｜ref=${ref}` };
+      return { ok: false, code: mapKind(focus.kind, "step"), reason: focus.reason, logFields: `${tag}｜ref=${refLabel}` };
     }
 
     let written = "";
@@ -790,7 +832,7 @@ async function execOne(
     if (usedMode === "assign") {
       const w = await d.fillValue(id, text);
       if (!w.ok) {
-        return { ok: false, code: mapKind(w.kind, "step"), reason: w.reason, logFields: `${tag}｜ref=${ref}` };
+        return { ok: false, code: mapKind(w.kind, "step"), reason: w.reason, logFields: `${tag}｜ref=${refLabel}` };
       }
       written = w.value;
       if (written !== text) {
@@ -803,7 +845,7 @@ async function execOne(
       await d.clearValue(id);
       const typed = await d.typeChars(text);
       if (!typed.ok) {
-        return { ok: false, code: mapKind(typed.kind, "step"), reason: typed.reason, logFields: `${tag}｜ref=${ref}` };
+        return { ok: false, code: mapKind(typed.kind, "step"), reason: typed.reason, logFields: `${tag}｜ref=${refLabel}` };
       }
       const rb = await d.readValue(id);
       written = rb.ok ? rb.value : "";
@@ -816,7 +858,7 @@ async function execOne(
         reason: isPassword
           ? "密码字段的值未能写入（页面回滚）"
           : "输入值被页面回滚（读回与期望不一致）",
-        logFields: `${tag}｜ref=${ref}｜mode=${usedMode}`,
+        logFields: `${tag}｜ref=${refLabel}｜mode=${usedMode}`,
       };
     }
 
@@ -834,14 +876,14 @@ async function execOne(
     const ch = await detectChange(s, d);
     return {
       ok: true,
-      line: `fill ${ref} → 已填写 ${text.length} 字${isPassword ? "（密码字段，值不回显）" : ""}${submitNote}${
+      line: `fill ${refLabel} → 已填写 ${text.length} 字${isPassword ? "（密码字段，值不回显）" : ""}${submitNote}${
         ch.changed ? "（页面已变化）" : "（页面未变化）"
       }`,
       changed: ch.changed,
       navigated: ch.navigated,
       degraded: usedMode === "type",
       wantFullSnapshot: ch.navigated,
-      logFields: `${tag}｜ref=${ref}｜mode=${usedMode}｜chars=${text.length}${
+      logFields: `${tag}｜ref=${refLabel}｜mode=${usedMode}｜chars=${text.length}${
         isPassword ? "｜password=yes" : `｜text=${previewText(text, 20)}`
       }`,
     };
@@ -856,18 +898,18 @@ async function execOne(
         ok: false,
         code: r.kind === "not_interactable" ? "element_not_interactable" : "element_not_found",
         reason: r.reason,
-        logFields: `${tag}｜ref=${ref}`,
+        logFields: `${tag}｜ref=${refLabel}`,
       };
     }
     const ch = await detectChange(s, d);
     return {
       ok: true,
-      line: `select ${ref} → 已选中「${previewText(r.value.value, 30)}」${ch.changed ? "（页面已变化）" : "（页面未变化）"}`,
+      line: `select ${refLabel} → 已选中「${previewText(r.value.value, 30)}」${ch.changed ? "（页面已变化）" : "（页面未变化）"}`,
       changed: ch.changed,
       navigated: ch.navigated,
       degraded: false,
       wantFullSnapshot: ch.navigated,
-      logFields: `${tag}｜ref=${ref}｜value=${previewText(r.value.value, 20)}`,
+      logFields: `${tag}｜ref=${refLabel}｜value=${previewText(r.value.value, 20)}`,
     };
   }
 
@@ -875,20 +917,20 @@ async function execOne(
   const toRef = a.toRef ?? "";
   const toLoc = await locate(s, d, toRef);
   if (!toLoc.ok) {
-    return { ok: false, code: "element_not_found", reason: toLoc.reason, logFields: `${tag}｜ref=${ref}｜toRef=${toRef}` };
+    return { ok: false, code: "element_not_found", reason: toLoc.reason, logFields: `${tag}｜ref=${refLabel}｜toRef=${toRef}` };
   }
   const toId = toLoc.id;
 
   await d.armDrag();
   const ptFrom = await preparePoint(d, id);
-  if (!ptFrom.ok) return { ok: false, code: ptFrom.code, reason: ptFrom.reason, logFields: `${tag}｜ref=${ref}` };
+  if (!ptFrom.ok) return { ok: false, code: ptFrom.code, reason: ptFrom.reason, logFields: `${tag}｜ref=${refLabel}` };
   const ptTo = await preparePoint(d, toId);
   if (!ptTo.ok) {
     return {
       ok: false,
       code: ptTo.code,
       reason: `拖拽终点不可交互：${ptTo.reason}`,
-      logFields: `${tag}｜ref=${ref}｜toRef=${toRef}`,
+      logFields: `${tag}｜ref=${refLabel}｜toRef=${toRef}`,
     };
   }
 
@@ -928,20 +970,20 @@ async function execOne(
       reason:
         "拖拽未生效（三档策略均无页面变化）。常见原因：①步数被拖拽库判定为点击；②页面用自定义拖拽库拦截了原生事件；" +
         "③无头模式下拖放行为与有头不同。建议由用户改为有头模式（BROWSER_HEADLESS=false）后重试，或改用其它操作方式",
-      logFields: `${tag}｜ref=${ref}｜toRef=${toRef}｜steps=${steps}｜strategy=none`,
+      logFields: `${tag}｜ref=${refLabel}｜toRef=${toRef}｜steps=${steps}｜strategy=none`,
     };
   }
 
   return {
     ok: true,
-    line: `drag ${ref}→${toRef}（${steps} 步，策略：${strategy}）→ 已完成${
+    line: `drag ${refLabel}→${toRef}（${steps} 步，策略：${strategy}）→ 已完成${
       ch.changed ? "（页面已变化）" : "（页面未变化，但页面侧拖放监听已触发）"
     }${degraded ? "（已使用合成事件，站点可能不完全响应）" : ""}`,
     changed: ch.changed,
     navigated: ch.navigated,
     degraded,
     wantFullSnapshot: ch.navigated,
-    logFields: `${tag}｜ref=${ref}｜toRef=${toRef}｜steps=${steps}｜strategy=${strategy}`,
+    logFields: `${tag}｜ref=${refLabel}｜toRef=${toRef}｜steps=${steps}｜strategy=${strategy}`,
   };
 }
 
