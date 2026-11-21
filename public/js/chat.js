@@ -54,7 +54,7 @@
     const CONFIG = {
         API_ENDPOINT: "/api/chat/stream",
         SESSION_ENDPOINT: "/api/chat/session",   // [US-2.1] 会话 ID 获取接口
-        MAX_HISTORY: 20, // 保留的最大消息历史数（US-2.2 起仅用于本地渲染）
+        MAX_HISTORY: 200, // 保留的最大消息历史数（US-2.2 起仅用于本地渲染）
         // [US-2.2] 请求体改为 { sessionId, message }，历史由服务端持有
         // [US-2.3] 当前活跃会话 ID 的存储键。
         // 使用 sessionStorage（标签页级隔离）而非 localStorage（跨标签页共享），

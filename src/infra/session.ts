@@ -100,7 +100,7 @@ export interface MessageMeta {
  * ⚠️ [skill / N-SK-11] 自本改动起，本上限**只约束 role <> 'system' 的行**；
  *    system 行不参与计数、不被裁剪（见 §6.4）。旧库里的 system 行因此会保留。
  */
-export const MAX_HISTORY = 20;
+export const MAX_HISTORY = 200;
 
 /** 会话标题默认值（US-4.2 将据此自动生成） */
 const DEFAULT_TITLE = "新会话";
